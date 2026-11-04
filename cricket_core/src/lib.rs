@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod link;
 pub mod modem;
+pub mod pathcheck;
 pub mod phy;
 #[cfg(feature = "std")]
 pub mod phy_legacy;
