@@ -89,6 +89,9 @@ pub enum Modulation {
     Mfsk,
     /// Biphase-mark code (LTC-style, provisional), see the module docs.
     Bmc(BmcParams),
+    /// Packet nibbles as PCM sample values (bit-transparent paths only,
+    /// experimental), see [`crate::phy::digital`].
+    Digital,
 }
 
 /// Parameters of the BMC phy. The wire parameters (spec §6.5) are

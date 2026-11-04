@@ -239,7 +239,7 @@ impl BmcRx {
     pub fn new(config: PhyConfig) -> Self {
         let params = match &config.modulation {
             Modulation::Bmc(p) => p.clone(),
-            Modulation::Mfsk => panic!("BmcRx needs a BMC PhyConfig"),
+            _ => panic!("BmcRx needs a BMC PhyConfig"),
         };
         let sr = config.sample_rate_hz;
         let bit_rate = params.bit_rate as f32;

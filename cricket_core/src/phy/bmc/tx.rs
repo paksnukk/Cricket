@@ -14,7 +14,7 @@ impl BmcTx {
     pub fn new(config: PhyConfig) -> Self {
         let params = match &config.modulation {
             Modulation::Bmc(p) => p.clone(),
-            Modulation::Mfsk => panic!("BmcTx needs a BMC PhyConfig"),
+            _ => panic!("BmcTx needs a BMC PhyConfig"),
         };
         Self { config, params }
     }

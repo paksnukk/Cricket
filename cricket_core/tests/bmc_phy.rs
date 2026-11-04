@@ -69,7 +69,7 @@ fn profile_selection() {
     for name in ["ltc", "LTC", "ltc4800"] {
         match PhyConfig::from_name(name).modulation {
             Modulation::Bmc(p) => assert_eq!(p.bit_rate, 4800),
-            Modulation::Mfsk => panic!("{name} must select BMC"),
+            _ => panic!("{name} must select BMC"),
         }
     }
     // Burst for a max-size body at 4800 bit/s: 8 + 3 + 64 + 1 + 0.5 bits.

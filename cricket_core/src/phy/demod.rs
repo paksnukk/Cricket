@@ -45,6 +45,8 @@ pub enum RxEvent {
         state: LinkState,
         confidence_db: f32,
     },
+    /// A complete frame of the digital phy (packet bytes before validation).
+    Frame(super::digital::DigitalFrame),
 }
 
 /// Joint acquisition: minimum mean expected-tone purity of a candidate

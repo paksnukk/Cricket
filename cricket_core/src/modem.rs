@@ -3,6 +3,7 @@ use crate::link::{
     fec_candidate_is_valid, interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
     SEQ_MODULUS,
 };
+use crate::phy::digital::{self, DigitalFrame, DigitalRx};
 use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
 use crate::transport::{FailSafeMonitor, MessageType, MidiOutput, MscTarget, TransportMessage};
 use alloc::collections::VecDeque;
@@ -32,8 +33,8 @@ pub enum ModemOutput {
     Stats(ModemStats),
 }
 
-/// High-level TX: transport message → repeated interleaved audio (MFSK, or
-/// the BMC (LTC) phy, per `config.modulation`).
+/// High-level TX: transport message → repeated interleaved audio (MFSK, the
+/// BMC (LTC) phy, or the digital phy, per `config.modulation`).
 pub struct CricketModemTx {
     phy: PhyTx,
     config: PhyConfig,
@@ -78,7 +79,11 @@ impl CricketModemTx {
         };
         let bytes = encode_packet_bytes(&packet).expect("valid packet");
         let mut nibbles = bytes_to_nibbles(&bytes);
-        let interleaved = if let Some(fec) = &self.fec {
+        let interleaved = if matches!(self.config.modulation, Modulation::Digital) {
+            // The digital frame carries the packet nibbles as they are: its
+            // length follows from the type nibble, there is no pad.
+            nibbles
+        } else if let Some(fec) = &self.fec {
             // FEC replaces padding + block interleave (codeword interleave).
             fec.encode_body(&nibbles)
         } else {
@@ -109,25 +114,33 @@ impl CricketModemTx {
 /// The body is [`MAX_BODY_NIBBLES`], or the coded length when FEC is enabled.
 pub fn repetition_samples(config: &PhyConfig) -> u64 {
     let body_nibbles = config.fec.body_nibbles();
-    if let Modulation::Bmc(p) = &config.modulation {
-        return p.repetition_samples(config.sample_rate_hz, body_nibbles) as u64;
+    match &config.modulation {
+        Modulation::Bmc(p) => {
+            return p.repetition_samples(config.sample_rate_hz, body_nibbles) as u64
+        }
+        // The largest frame; copies follow each other without a gap.
+        Modulation::Digital => return digital::MAX_FRAME_SAMPLES as u64,
+        Modulation::Mfsk => {}
     }
     ((config.preamble.len() + body_nibbles + 1) * config.samples_per_symbol_period()) as u64
 }
 
 /// Silence `CricketModemTx` appends after each repetition: one symbol
-/// period (MFSK) or `gap_bits` cells (BMC).
+/// period (MFSK), `gap_bits` cells (BMC) or none (digital: frames are
+/// delimited by their sync and END symbols).
 pub fn repetition_gap_samples(config: &PhyConfig) -> usize {
     match &config.modulation {
         Modulation::Mfsk => config.samples_per_symbol_period(),
         Modulation::Bmc(p) => p.gap_samples(config.sample_rate_hz),
+        Modulation::Digital => 0,
     }
 }
 
 /// Duplicate-suppression window in samples (docs/aml-v1-spec.md §4.4): one
 /// full transmission of K repetitions plus half a repetition of margin.
 /// Robust: (2 + 0.5) x 6552 = 16380 samples (~341 ms @ 48 kHz);
-/// Fast: (1 + 0.5) x 2736 = 4104 samples (~86 ms).
+/// Fast: (1 + 0.5) x 2736 = 4104 samples (~86 ms); digital: (2 + 0.5) x 21
+/// = 52 samples (~1.1 ms).
 pub fn dedup_window_samples(config: &PhyConfig) -> u64 {
     let rep = repetition_samples(config);
     rep * config.repetition_k.max(1) as u64 + rep / 2
@@ -163,8 +176,15 @@ pub struct CricketModemRx {
     /// Recently accepted packets (raw bytes, end sample) for duplicate suppression.
     recent: VecDeque<(Vec<u8>, u64)>,
     dedup_window: u64,
+    /// The same for frames of the `digital_detect` detector, whose window
+    /// is the digital profile's (its messages are far closer together).
+    recent_digital: VecDeque<(Vec<u8>, u64)>,
+    digital_dedup_window: u64,
     /// MIDI mapping and the state the fail-safe burst needs.
     midi: MidiOutput,
+    /// Digital-frame detector next to a non-digital phy
+    /// (`PhyConfig::digital_detect`).
+    digital: Option<DigitalRx>,
 }
 
 impl CricketModemRx {
@@ -175,6 +195,8 @@ impl CricketModemRx {
         let fail_safe = FailSafeMonitor::new(config.link_dead_ms, config.sample_rate_hz);
         let dedup_window = dedup_window_samples(&config);
         let fec = FecCodec::new(config.fec);
+        let digital = (config.digital_detect && !matches!(config.modulation, Modulation::Digital))
+            .then(|| DigitalRx::new(config.clone()));
         Self {
             phy,
             config,
@@ -192,7 +214,10 @@ impl CricketModemRx {
             last_link_dead_sample: None,
             recent: VecDeque::new(),
             dedup_window,
+            recent_digital: VecDeque::new(),
+            digital_dedup_window: dedup_window_samples(&PhyConfig::digital()),
             midi: MidiOutput::default(),
+            digital,
         }
     }
 
@@ -261,6 +286,7 @@ impl CricketModemRx {
         self.link_dead = true;
         self.last_link_dead_sample = Some(self.samples_processed());
         self.recent.clear();
+        self.recent_digital.clear();
         true
     }
 
@@ -268,6 +294,9 @@ impl CricketModemRx {
     /// Not used internally (flushing would make timing depend on chunking).
     pub fn reset(&mut self) {
         self.phy.reset();
+        if let Some(d) = self.digital.as_mut() {
+            d.reset();
+        }
         self.body_nibbles.clear();
         self.collecting = false;
     }
@@ -312,8 +341,19 @@ impl CricketModemRx {
                     self.body_nibbles.clear();
                     outputs.push(ModemOutput::SyncLost);
                 }
+                RxEvent::Frame(frame) => {
+                    self.try_decode_frame(&frame, false, &mut outputs);
+                }
                 RxEvent::Metrics { .. } => {}
             }
+        }
+        if let Some(mut d) = self.digital.take() {
+            for ev in d.push_samples(samples) {
+                if let RxEvent::Frame(frame) = ev {
+                    self.try_decode_frame(&frame, true, &mut outputs);
+                }
+            }
+            self.digital = Some(d);
         }
         self.poll_fail_safe(self.phy.samples_pushed(), &mut outputs);
 
@@ -332,16 +372,20 @@ impl CricketModemRx {
             self.link_dead = true;
             self.last_link_dead_sample = Some(at);
             self.recent.clear();
+            self.recent_digital.clear();
         }
     }
 
     /// Duplicate if the same packet bytes (same SEQ, type and payload) were
     /// accepted within the dedup window before `end`.
-    fn is_duplicate(&mut self, bytes: &[u8], end: u64) -> bool {
-        let window = self.dedup_window;
-        self.recent
-            .retain(|(_, at)| end.saturating_sub(*at) <= window);
-        self.recent.iter().any(|(b, _)| b.as_slice() == bytes)
+    fn is_duplicate(&mut self, bytes: &[u8], end: u64, aux: bool) -> bool {
+        let (recent, window) = if aux {
+            (&mut self.recent_digital, self.digital_dedup_window)
+        } else {
+            (&mut self.recent, self.dedup_window)
+        };
+        recent.retain(|(_, at)| end.saturating_sub(*at) <= window);
+        recent.iter().any(|(b, _)| b.as_slice() == bytes)
     }
 
     /// Decode the collected body; the last body symbol ended at stream
@@ -379,7 +423,32 @@ impl CricketModemRx {
             self.crc_fail += 1;
             return false;
         }
-        let slice = &bytes[..needed];
+        self.deliver(&bytes[..needed], end, false, outputs)
+    }
+
+    /// A complete digital frame: the packet bytes go through the same
+    /// validation (spec §4.7: CRC-16, version, type, SEQ, canonical payload)
+    /// and duplicate suppression as any other body. `aux`: it came from the
+    /// `digital_detect` detector (own duplicate history).
+    fn try_decode_frame(
+        &mut self,
+        frame: &DigitalFrame,
+        aux: bool,
+        outputs: &mut Vec<ModemOutput>,
+    ) -> bool {
+        self.deliver(frame.packet(), frame.end_sample, aux, outputs)
+    }
+
+    /// Validate the exact packet bytes `slice` (no pad) that ended at stream
+    /// position `end`, and deliver them unless they are a duplicate.
+    /// Returns whether they held a valid packet (duplicates included).
+    fn deliver(
+        &mut self,
+        slice: &[u8],
+        end: u64,
+        aux: bool,
+        outputs: &mut Vec<ModemOutput>,
+    ) -> bool {
         let decoded = decode_packet_bytes(slice).ok().and_then(|packet| {
             let msg = TransportMessage::from_type_payload(packet.msg_type, &packet.payload)?;
             Some((packet, msg))
@@ -392,10 +461,14 @@ impl CricketModemRx {
                 self.fail_safe.on_valid_packet(end);
                 self.link_dead = false;
 
-                if self.is_duplicate(slice, end) {
+                if self.is_duplicate(slice, end, aux) {
                     return true;
                 }
-                self.recent.push_back((slice.to_vec(), end));
+                if aux {
+                    self.recent_digital.push_back((slice.to_vec(), end));
+                } else {
+                    self.recent.push_back((slice.to_vec(), end));
+                }
                 self.last_seq = Some(packet.seq);
 
                 // Panic: the burst below is the only one; the phy is confirmed

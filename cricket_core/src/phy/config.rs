@@ -65,6 +65,13 @@ pub struct PhyConfig {
     pub fec: FecMode,
     /// Preamble acquisition (MFSK only, spec §3.2).
     pub acquisition: Acquisition,
+    /// Receiver only: also run the digital-frame detector next to this
+    /// profile's own receiver (profile name suffix `+digital`, e.g.
+    /// `ltc9600+digital`), so a transmitter can switch between this profile
+    /// and `digital` without reconfiguring the receiver. Always on for the
+    /// `digital` profile itself (its only receiver). Experimental, see
+    /// `docs/proposals/digital-transparent.md`.
+    pub digital_detect: bool,
 }
 
 impl Default for PhyConfig {
@@ -115,6 +122,7 @@ impl PhyConfig {
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
             acquisition: Acquisition::Joint { misses: 1 },
+            digital_detect: false,
         }
     }
 
@@ -142,6 +150,7 @@ impl PhyConfig {
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
             acquisition: Acquisition::FirstSymbol,
+            digital_detect: false,
         }
     }
 
@@ -176,6 +185,7 @@ impl PhyConfig {
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
             acquisition: Acquisition::FirstSymbol,
+            digital_detect: false,
         }
     }
 
@@ -212,11 +222,52 @@ impl PhyConfig {
         }
     }
 
+    /// **Digital** (experimental, `docs/proposals/digital-transparent.md`):
+    /// packet nibbles carried directly in PCM sample values for
+    /// bit-transparent digital paths (Dante / AES67 / MADI / AES3 without
+    /// processing, USB interfaces in bit-exact mode). A frame is 21 samples
+    /// at a peak of −57.4 dBFS, sent twice back to back (K = 2). The symbol
+    /// fields describe one sample so generic helpers stay meaningful; the
+    /// MFSK-only fields are unused.
+    pub fn digital() -> Self {
+        Self {
+            sample_rate_hz: 48_000,
+            modulation: Modulation::Digital,
+            symbol_duration_ms: 1000.0 / 48_000.0,
+            guard_gap_ms: 0.0,
+            attack_ms: 0.0,
+            release_ms: 0.0,
+            amplitude: super::digital::PEAK,
+            tone_base_hz: 0.0,
+            tone_step_hz: 0.0,
+            n_tones: 0,
+            preamble: Vec::new(),
+            min_confidence_db: 0.0,
+            min_tone_purity: 0.0,
+            min_rms_dbfs: -120.0,
+            repetition_k: 2,
+            interleave_depth: 4,
+            link_dead_ms: 2000,
+            heartbeat_interval_ms: 500,
+            fec: FecMode::None,
+            acquisition: Acquisition::FirstSymbol,
+            digital_detect: true,
+        }
+    }
+
     /// Profile by name (case-insensitive, `-` = `_`). `robust_fec` is a
     /// deprecated alias of `robust` (its former name); unknown names mean
-    /// the default, robust.
+    /// the default, robust. A `+digital` suffix (e.g. `ltc9600+digital`)
+    /// selects the profile with [`digital_detect`](Self::digital_detect) on.
     pub fn from_name(name: &str) -> Self {
-        match name.to_ascii_lowercase().replace('-', "_").as_str() {
+        let name = name.to_ascii_lowercase().replace('-', "_");
+        if let Some(base) = name.strip_suffix("+digital") {
+            let mut config = Self::from_name(base);
+            config.digital_detect = true;
+            return config;
+        }
+        match name.as_str() {
+            "digital" => Self::digital(),
             "fast" => Self::fast(),
             "robust_repeat" => Self::robust_repeat(),
             "ltc" => Self::ltc(),
@@ -242,8 +293,13 @@ impl PhyConfig {
     /// or the FEC-coded body length) + preamble.
     pub fn estimated_first_copy_ms(&self) -> f32 {
         let body_nibbles = self.fec.body_nibbles();
-        if let Modulation::Bmc(p) = &self.modulation {
-            return p.frame_ms(body_nibbles);
+        match &self.modulation {
+            Modulation::Bmc(p) => return p.frame_ms(body_nibbles),
+            Modulation::Digital => {
+                return super::digital::MAX_FRAME_SAMPLES as f32 * 1000.0
+                    / self.sample_rate_hz as f32
+            }
+            Modulation::Mfsk => {}
         }
         let symbols = self.preamble.len() + body_nibbles;
         let period_ms = self.symbol_duration_ms + self.guard_gap_ms;

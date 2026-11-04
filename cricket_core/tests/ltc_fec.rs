@@ -62,7 +62,7 @@ fn all_types() -> Vec<TransportMessage> {
 fn half_cell(config: &PhyConfig) -> f32 {
     match &config.modulation {
         Modulation::Bmc(p) => p.half_cell_samples(config.sample_rate_hz),
-        Modulation::Mfsk => panic!("BMC profile expected"),
+        _ => panic!("BMC profile expected"),
     }
 }
 
@@ -84,7 +84,7 @@ fn profile_selection() {
         assert_eq!(c.fec, FecMode::Rs16 { parity: 4 }, "{name}");
         match c.modulation {
             Modulation::Bmc(p) => assert_eq!(p.bit_rate, rate, "{name}"),
-            Modulation::Mfsk => panic!("{name} must select BMC"),
+            _ => panic!("{name} must select BMC"),
         }
     }
     // The uncoded LTC profiles are unchanged.
