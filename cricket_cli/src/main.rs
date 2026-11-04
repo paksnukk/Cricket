@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use cricket_core::pedal::{
+    BankMode, PedalCommand, PedalConfig, PedalRx, PedalTx, PresetMap, PresetState,
+};
 use cricket_core::phy::PhyConfig;
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, MscTarget, TransportMessage};
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
@@ -106,6 +109,57 @@ enum Commands {
         #[arg(long, default_value_t = LOOPBACK_NOTES)]
         notes: usize,
     },
+    /// Pedal commands (experimental, not AML): write a WAV with bank/program
+    /// commands in 20–21.5 kHz, optionally mixed into a 48 kHz recording, to
+    /// play through a real rig (docs/proposals/pedal-commands.md)
+    PedalWav {
+        /// Commands in order, comma-separated: bank-up, bank-down,
+        /// program-up, program-down
+        #[arg(long, value_delimiter = ',', required = true)]
+        commands: Vec<String>,
+        /// Output WAV (48 kHz mono, 32-bit float)
+        #[arg(long)]
+        out: String,
+        /// Mix the commands into this 48 kHz recording (first channel)
+        #[arg(long)]
+        mix_into: Option<String>,
+        /// Time from one command start to the next, ms
+        #[arg(long, default_value_t = 1000)]
+        every_ms: u32,
+        /// Peak level of the command bursts, dBFS
+        #[arg(long, default_value_t = -30.0, allow_hyphen_values = true)]
+        level_dbfs: f32,
+        /// Signal variant: standard (16 ms), three_symbols (12 ms),
+        /// short_symbols (12 ms); both ends must match
+        #[arg(long, default_value = "standard")]
+        variant: String,
+    },
+    /// Pedal commands (experimental, not AML): find commands in a 48 kHz WAV
+    /// recording and print the MIDI a pedal-side decoder would send
+    PedalScan {
+        /// Input WAV (48 kHz; first channel)
+        #[arg(long = "in", value_name = "WAV")]
+        input: String,
+        /// Signal variant, as for pedal-wav
+        #[arg(long, default_value = "standard")]
+        variant: String,
+        /// Symbols per command that may show no tone (dropouts); 0 or 1
+        #[arg(long, default_value_t = 0)]
+        max_misses: usize,
+        /// MIDI channel 1–16
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=16))]
+        channel: u8,
+        /// Banks on the pedal
+        #[arg(long, default_value_t = 32)]
+        banks: u8,
+        /// Presets per bank
+        #[arg(long, default_value_t = 4)]
+        programs_per_bank: u8,
+        /// Send Bank Select (CC 0) = bank and Program Change = slot, instead
+        /// of Program Change = bank × programs_per_bank + slot
+        #[arg(long)]
+        bank_select: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -154,6 +208,44 @@ fn main() -> Result<()> {
         Commands::Loopback { profiles, notes } => {
             run_loopback_metrics(profiles, *notes)?;
         }
+        Commands::PedalWav {
+            commands,
+            out,
+            mix_into,
+            every_ms,
+            level_dbfs,
+            variant,
+        } => {
+            run_pedal_wav(
+                commands,
+                out,
+                mix_into.as_deref(),
+                *every_ms,
+                *level_dbfs,
+                variant,
+            )?;
+        }
+        Commands::PedalScan {
+            input,
+            variant,
+            max_misses,
+            channel,
+            banks,
+            programs_per_bank,
+            bank_select,
+        } => {
+            let map = PresetMap {
+                channel: channel - 1,
+                banks: *banks,
+                programs_per_bank: *programs_per_bank,
+                mode: if *bank_select {
+                    BankMode::BankSelect
+                } else {
+                    BankMode::Flat
+                },
+            };
+            run_pedal_scan(input, variant, *max_misses, map)?;
+        }
     }
 
     Ok(())
@@ -199,6 +291,123 @@ fn list_all_devices() -> Result<()> {
     for (i, name) in midi::list_outputs()?.iter().enumerate() {
         println!("{}: {}", i, name);
     }
+    Ok(())
+}
+
+fn pedal_config(variant: &str) -> Result<PedalConfig> {
+    PedalConfig::from_name(variant).ok_or_else(|| {
+        anyhow!(
+            "unknown variant {:?} (standard, three_symbols, short_symbols)",
+            variant
+        )
+    })
+}
+
+fn run_pedal_wav(
+    commands: &[String],
+    out: &str,
+    mix_into: Option<&str>,
+    every_ms: u32,
+    level_dbfs: f32,
+    variant: &str,
+) -> Result<()> {
+    let config = pedal_config(variant)?;
+    let rate = config.sample_rate_hz;
+    let cmds = commands
+        .iter()
+        .map(|c| PedalCommand::from_name(c).ok_or_else(|| anyhow!("unknown command {:?}", c)))
+        .collect::<Result<Vec<_>>>()?;
+    let every = (every_ms as u64 * rate as u64 / 1000) as usize;
+    if every < config.total_samples() {
+        return Err(anyhow!(
+            "--every-ms must be at least {:.0} ms",
+            config.total_samples() as f32 * 1000.0 / rate as f32
+        ));
+    }
+    let mut samples = match mix_into {
+        Some(path) => {
+            let (r, s) = read_wav_f32(path).map_err(|e| anyhow!(e))?;
+            if r != rate {
+                return Err(anyhow!(
+                    "{} is {} Hz; pedal commands need {} Hz",
+                    path,
+                    r,
+                    rate
+                ));
+            }
+            s
+        }
+        None => Vec::new(),
+    };
+    let first = rate as usize / 2;
+    let needed = first + (cmds.len().max(1) - 1) * every + config.total_samples() + first;
+    if samples.len() < needed {
+        samples.resize(needed, 0.0);
+    }
+    let gain = 10f32.powf(level_dbfs / 20.0) / config.amplitude;
+    let tx = PedalTx::new(config);
+    for (i, &c) in cmds.iter().enumerate() {
+        let start = first + i * every;
+        for (k, v) in tx.synthesize(c).iter().enumerate() {
+            samples[start + k] += gain * v;
+        }
+        println!("{:8.3} s  {}", start as f32 / rate as f32, c.name());
+    }
+    write_wav_f32(out, rate, &samples).map_err(|e| anyhow!(e))?;
+    println!(
+        "Wrote {} commands ({} samples @ {} Hz) to {}",
+        cmds.len(),
+        samples.len(),
+        rate,
+        out
+    );
+    Ok(())
+}
+
+fn run_pedal_scan(input: &str, variant: &str, max_misses: usize, map: PresetMap) -> Result<()> {
+    let config = PedalConfig {
+        max_misses,
+        ..pedal_config(variant)?
+    };
+    config.validate().map_err(|e| anyhow!(e))?;
+    let (rate, samples) = read_wav_f32(input).map_err(|e| anyhow!(e))?;
+    if rate != config.sample_rate_hz {
+        return Err(anyhow!(
+            "{} is {} Hz; pedal commands need {} Hz (at 44.1 kHz there is no room above 20 kHz)",
+            input,
+            rate,
+            config.sample_rate_hz
+        ));
+    }
+    let mut state = PresetState::new(map).map_err(|e| anyhow!(e))?;
+    let mut rx = PedalRx::new(config);
+    let detections = rx.push_samples(&samples);
+    for d in &detections {
+        let midi: Vec<String> = state
+            .apply(d.command)
+            .iter()
+            .map(|m| {
+                let (kind, payload) = format_message(m);
+                format!("{} {}", kind, payload)
+            })
+            .collect();
+        println!(
+            "{:8.3} s  {:<12}  preset {:3} (bank {}, slot {})  -> {}",
+            d.at_sample as f64 / rate as f64,
+            d.command.name(),
+            state.index(),
+            state.bank(),
+            state.slot(),
+            midi.join(", ")
+        );
+    }
+    let st = rx.stats();
+    println!(
+        "{} commands in {:.1} s; {:.2} % of symbol windows showed a tone",
+        detections.len(),
+        samples.len() as f64 / rate as f64,
+        100.0 * st.gated_windows as f64 / st.windows.max(1) as f64
+    );
     Ok(())
 }
 

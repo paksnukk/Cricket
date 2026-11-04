@@ -115,6 +115,25 @@ The measurements behind all profiles are in [docs/proposals/fec.md](docs/proposa
 being played *and released*. Real audio interfaces add their own buffering on top. Run the measurement
 yourself rather than trusting this table.
 
+## Experimental: pedal commands
+
+A separate prototype, not part of AML v1: four commands (bank up/down, program up/down) sent as
+16 ms tone signatures at **20–21.5 kHz**, above guitar, bass and keys, on the instrument signal itself.
+The receiving end filters the music out, recognizes the signature about 16 ms after it starts, and
+sends absolute Program Change (and optionally Bank Select). In the simulator they arrive under a
+full band mix with the commands 30–50 dB below the music, with no false commands from music, clicks
+or noise. The receiver should come first in the chain: a digital fuzz before it, or a bright, aliasing
+synth on the same signal, costs commands. The whole chain must run at 48 kHz (44.1 kHz leaves no room
+above 20 kHz). Design and measurements: [docs/proposals/pedal-commands.md](docs/proposals/pedal-commands.md).
+
+```sh
+# Mix commands into a 48 kHz recording, play it through your rig, record the result
+cargo run -p cricket_cli -- pedal-wav --commands program-up,program-up,bank-down \
+    --mix-into guitar.wav --out guitar+commands.wav
+# What would the pedal have done?
+cargo run -p cricket_cli -- pedal-scan --in recorded.wav
+```
+
 ## Quick start
 
 You need a Rust toolchain. On Linux you also need ALSA headers (`libasound2-dev`). The GUI additionally needs
@@ -163,7 +182,7 @@ rate, sync losses), the TX queue and its latency, alarms for missing or stalled 
 
 | Crate | What lives there |
 |---|---|
-| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, the LTC phy, packets, CRC, Reed–Solomon FEC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy prototype phy. |
+| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, the LTC phy, packets, CRC, Reed–Solomon FEC, interleaving, TX scheduler, fail-safe; the experimental pedal commands (`pedal`). Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy prototype phy. |
 | [`cricket_engine`](cricket_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
 | [`cricket_cli`](cricket_cli) | Command-line front end. |
 | [`cricket_gui`](cricket_gui) | Tauri 2 desktop app (TypeScript + Rust). |
@@ -186,6 +205,8 @@ every push.
 
 - [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol, all profiles and test vectors.
 - [`docs/v1.1-plan.md`](docs/v1.1-plan.md): what v1.1 set out to fix, and how.
+- [`docs/proposals/pedal-commands.md`](docs/proposals/pedal-commands.md): the experimental pedal
+  commands above the music.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed.
 
 ## Status
