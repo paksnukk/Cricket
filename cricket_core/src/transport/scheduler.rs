@@ -208,6 +208,11 @@ pub struct TxScheduler {
     refresh: VecDeque<RefreshEntry>,
 
     last_emit_sample: Option<u64>,
+    /// Least time between NoteOff refreshes, start to start, counted from
+    /// the user NoteOff too (0: every free packet, as spec §5.5 describes).
+    refresh_spacing_samples: u64,
+    /// When the last NoteOff (user or refresh) was emitted.
+    last_refresh_sample: Option<u64>,
     /// Set when a queued NoteOn was dropped because the queue exceeded its
     /// airtime budget. The caller reports and clears it.
     pub note_on_dropped: bool,
@@ -227,8 +232,32 @@ impl TxScheduler {
             sounding: NoteSet::default(),
             refresh: VecDeque::new(),
             last_emit_sample: None,
+            refresh_spacing_samples: 0,
+            last_refresh_sample: None,
             note_on_dropped: false,
         }
+    }
+
+    /// Space NoteOff refreshes at least `samples` apart (start to start,
+    /// counted from the user NoteOff too). For profiles whose messages are
+    /// a few samples long (`digital`), where back-to-back refreshes would
+    /// all fall into one short dropout; 0 (the default) sends one in every
+    /// free packet. Heartbeats still wait until the refresh list is empty.
+    pub fn with_refresh_spacing(mut self, samples: u64) -> Self {
+        self.refresh_spacing_samples = samples;
+        self
+    }
+
+    /// While NoteOff refreshes are pending, the earliest sample the next one
+    /// may start at (`None`: no refresh pending).
+    pub fn next_refresh_sample(&self) -> Option<u64> {
+        if self.refresh.is_empty() {
+            return None;
+        }
+        Some(
+            self.last_refresh_sample
+                .map_or(0, |t| t + self.refresh_spacing_samples),
+        )
     }
 
     /// Messages waiting to be sent (held NoteOffs count).
@@ -387,7 +416,13 @@ impl TxScheduler {
             return None;
         }
 
+        if let Some(due) = self.next_refresh_sample() {
+            if now_samples < due {
+                return None;
+            }
+        }
         if let Some(msg) = self.take_refresh() {
+            self.last_refresh_sample = Some(now_samples);
             return Some(self.emit(msg, now_samples, false));
         }
 
@@ -424,6 +459,7 @@ impl TxScheduler {
     }
 
     fn push_refresh(&mut self, channel: u8, note: u8, velocity: u8, emitted_at: u64) {
+        self.last_refresh_sample = Some(emitted_at);
         self.cancel_refresh(channel, note);
         if self.refresh.len() >= REFRESH_CAPACITY {
             self.refresh.pop_front();
@@ -765,6 +801,38 @@ mod tests {
         let hb = s.heartbeat_interval_samples;
         let t = play_and_release(&mut s, 60, 0);
         assert_eq!(s.poll(t + s.refresh_lifetime_samples + hb), Some(Heartbeat));
+    }
+
+    /// With a refresh spacing (digital profile), refreshes keep that distance
+    /// from the user NoteOff and from each other, a NoteOn still goes at
+    /// once, and no heartbeat fills the gaps.
+    #[test]
+    fn refresh_spacing_spreads_the_repeats() {
+        let config = PhyConfig::digital();
+        let spacing = crate::modem::refresh_spacing_samples(&config, 48_000);
+        assert_eq!(spacing, 960);
+        assert_eq!(
+            crate::modem::refresh_spacing_samples(&PhyConfig::fast(), 48_000),
+            0
+        );
+        let mut s = scheduler(&config).with_refresh_spacing(spacing);
+        let msg = s.message_samples;
+        let t = play_and_release(&mut s, 60, 0);
+        assert_eq!(s.next_refresh_sample(), Some(t + spacing));
+        for k in 1..=REFRESH_MAX_REPEATS as u64 {
+            let due = t + k * spacing;
+            assert_eq!(s.poll(due - spacing + msg), None, "repeat {k}");
+            assert_eq!(s.poll(due - 1), None, "repeat {k}");
+            assert_eq!(s.poll(due), Some(off(60)), "repeat {k}");
+        }
+        assert_eq!(s.next_refresh_sample(), None);
+        let end = t + REFRESH_MAX_REPEATS as u64 * spacing;
+        assert_eq!(s.poll(end + s.heartbeat_interval_samples), Some(Heartbeat));
+        // User traffic is not held back by the spacing.
+        let hb = s.heartbeat_interval_samples;
+        let t = play_and_release(&mut s, 61, end + hb + msg);
+        s.push(on(62), t + msg);
+        assert_eq!(s.poll(t + msg), Some(on(62)));
     }
 
     /// Each release costs a bounded number of repeats, then heartbeats resume.

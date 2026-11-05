@@ -11,11 +11,13 @@
 //!
 //! `DIGITAL_SECONDS` sets the audio per false-accept signal (default 60).
 
-use cricket_core::modem::{CricketModemRx, CricketModemTx, ModemOutput};
+use cricket_core::modem::{
+    refresh_spacing_samples, repetition_samples, CricketModemRx, CricketModemTx, ModemOutput,
+};
 use cricket_core::pathcheck::{self, PathImpairment, Rng, Verdict};
 use cricket_core::phy::digital::{self, DigitalRx, CODE_SCALE, STEP, SYNC, TOLERANCE};
 use cricket_core::phy::{Modulation, PhyConfig};
-use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
+use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage, TxScheduler};
 use std::time::Instant;
 
 const RATE: usize = 48_000;
@@ -167,6 +169,83 @@ fn second_copy_is_suppressed_and_bridges_a_hit_first_copy() {
         hit[k] = 0.3;
         assert_eq!(decode(&config, &hit, 64), vec![msg.clone()], "sample {k}");
     }
+}
+
+/// A note struck and released through the scheduler the way the encoder
+/// drives it (polled every 1 ms while idle), with refreshes spaced
+/// `spacing` samples apart. Returns the audio and where the user NoteOff
+/// starts.
+fn release_stream(spacing: u64) -> (Vec<f32>, usize) {
+    let config = PhyConfig::digital();
+    let msg = repetition_samples(&config) * config.repetition_k as u64;
+    let mut s = TxScheduler::new(48_000, 24_000, msg).with_refresh_spacing(spacing);
+    let mut tx = CricketModemTx::new(config);
+    let note = |on: bool| {
+        let (channel, note, velocity) = (3, 64, 90);
+        if on {
+            TransportMessage::NoteOn {
+                channel,
+                note,
+                velocity,
+            }
+        } else {
+            TransportMessage::NoteOff {
+                channel,
+                note,
+                velocity,
+            }
+        }
+    };
+    let mut audio = vec![0.0f32; 480];
+    let mut script = vec![(480usize, note(true)), (5_280, note(false))];
+    let mut off_at = None;
+    while audio.len() < RATE {
+        let now = audio.len();
+        while script.first().is_some_and(|(at, _)| *at <= now) {
+            s.push(script.remove(0).1, now as u64);
+        }
+        match s.poll(now as u64) {
+            Some(m) => {
+                if matches!(m, TransportMessage::NoteOff { .. }) && off_at.is_none() {
+                    off_at = Some(now);
+                }
+                audio.extend(if m == TransportMessage::Heartbeat {
+                    tx.encode_heartbeat()
+                } else {
+                    tx.encode_message(&m)
+                });
+            }
+            None => audio.extend([0.0; 48]),
+        }
+    }
+    (audio, off_at.expect("NoteOff sent"))
+}
+
+/// Whether the note of [`release_stream`] is released after `mute_ms` of
+/// silence from its NoteOff on (a dropout, e.g. lost network packets).
+fn released_after_dropout(spacing: u64, mute_ms: usize) -> bool {
+    let (mut audio, off_at) = release_stream(spacing);
+    audio[off_at..off_at + mute_ms * RATE / 1000].fill(0.0);
+    let got = decode(&PhyConfig::digital(), &audio, 256);
+    assert!(matches!(got.first(), Some(TransportMessage::NoteOn { .. })));
+    got.iter()
+        .any(|m| matches!(m, TransportMessage::NoteOff { note: 64, .. }))
+}
+
+/// A release is sent 7 times (the NoteOff and 6 refreshes, K = 2 copies
+/// each). Back to back (spec §5.5 pacing) that is 6 ms on air, all lost in
+/// one 10 ms dropout; spaced 20 ms apart (the digital profile's encoder
+/// setting) it survives a 100 ms dropout.
+#[test]
+fn spaced_refresh_survives_a_dropout() {
+    let spacing = refresh_spacing_samples(&PhyConfig::digital(), 48_000);
+    assert_eq!(spacing, 960);
+    assert!(released_after_dropout(0, 0));
+    assert!(!released_after_dropout(0, 10));
+    for mute_ms in [0, 10, 50, 100] {
+        assert!(released_after_dropout(spacing, mute_ms), "{mute_ms} ms");
+    }
+    assert!(!released_after_dropout(spacing, 130));
 }
 
 /// Conditions of the fail-safe table and what the receiver must do.

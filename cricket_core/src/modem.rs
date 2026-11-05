@@ -125,6 +125,17 @@ pub fn repetition_samples(config: &PhyConfig) -> u64 {
     ((config.preamble.len() + body_nibbles + 1) * config.samples_per_symbol_period()) as u64
 }
 
+/// Least spacing of NoteOff refreshes for `config` at `sample_rate_hz`
+/// (for [`crate::transport::TxScheduler::with_refresh_spacing`]): 0 (every
+/// free packet, spec §5.5) except for the digital profile
+/// ([`digital::REFRESH_SPACING_MS`]).
+pub fn refresh_spacing_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
+    match config.modulation {
+        Modulation::Digital => sample_rate_hz as u64 * digital::REFRESH_SPACING_MS as u64 / 1000,
+        _ => 0,
+    }
+}
+
 /// Silence `CricketModemTx` appends after each repetition: one symbol
 /// period (MFSK), `gap_bits` cells (BMC) or none (digital: frames are
 /// delimited by their sync and END symbols).

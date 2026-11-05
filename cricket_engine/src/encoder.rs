@@ -11,7 +11,7 @@ use crate::events::{format_message, AlarmKind, EngineEvent};
 use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::Result;
-use cricket_core::modem::{repetition_samples, CricketModemTx};
+use cricket_core::modem::{refresh_spacing_samples, repetition_samples, CricketModemTx};
 use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::{midi_input, MidiInput, TransportMessage, TxScheduler};
 use std::collections::VecDeque;
@@ -247,7 +247,8 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     }
 
     let mut tx = CricketModemTx::new(config.clone());
-    let mut scheduler = TxScheduler::new(stream_sample_rate, heartbeat_samples, message_samples);
+    let mut scheduler = TxScheduler::new(stream_sample_rate, heartbeat_samples, message_samples)
+        .with_refresh_spacing(refresh_spacing_samples(&config, stream_sample_rate));
     let stream_start = Instant::now();
     let mut note_idx = 0usize;
     let scale = [0u8, 2, 4, 5, 7, 9, 11, 12];

@@ -91,6 +91,11 @@ pub const PEAK_SYMBOL: i32 = 11;
 pub const PEAK: f32 = (PEAK_SYMBOL * STEP) as f32 / CODE_SCALE;
 /// Largest packet (Midi / Msc) in bytes.
 pub const MAX_PACKET_BYTES: usize = 7;
+/// Least time between NoteOff refreshes (start to start): a message is
+/// under 1 ms on air, so back-to-back refreshes (spec §5.5) would all fall
+/// into one short dropout. Spaced, the 6 refreshes of a release span about
+/// 120 ms (Fast: ~350 ms).
+pub const REFRESH_SPACING_MS: u32 = 20;
 
 /// Samples of one frame carrying `packet_bytes` bytes.
 pub const fn frame_samples(packet_bytes: usize) -> usize {
