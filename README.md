@@ -68,7 +68,7 @@ losing the message (the LTC profiles send the same packets as a timecode-like sq
 - **Panic** (the GUI button): All Notes Off everywhere.
 
 **Not carried, on purpose:** other System Exclusive, MIDI Clock and the other real-time messages
-(Start/Stop/Continue, Active Sensing), and MIDI Time Code. A packet takes 8–273 ms of airtime
+(Start/Stop/Continue, Active Sensing), and MIDI Time Code. A packet takes 1–273 ms of airtime
 depending on the profile; clock and timecode need a steady stream with sub-millisecond timing, so they
 would arrive useless and would delay every note and cue behind them. Run timecode as LTC on its own
 audio channel instead. Large SysEx dumps would block the line for seconds.
@@ -103,9 +103,9 @@ in software, but not yet proven on real show chains, so a later revision may cha
 
 | Profile | What it is | Measured NoteOn latency\* | Needs |
 |---|---|---|---|
-| `ltc_fec` | 4800 bit/s with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~26 ms, p95 ~30 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter |
-| `ltc` | 4800 bit/s, uncoded (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | As `ltc_fec`, and no dropouts or clicks |
-| `ltc14400_fec` | **Experimental, fastest:** 14400 bit/s with the coded body (also uncoded `ltc14400`); 7.0 ms (5.4 ms) per message, a 4-note chord in 29 ms (22 ms); repairs dropouts up to ~0.5 ms | mean ~12 ms, p95 ~16 ms | A digital line (Dante, MADI, AES) at 48 or 96 kHz: ≥ 16 kHz bandwidth, ≥ 15 dB SNR |
+| `ltc_fec` | 4800 bit/s with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~21 ms, p95 ~22–24 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter |
+| `ltc` | 4800 bit/s, uncoded (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~16 ms (`ltc9600`: ~8 ms) | As `ltc_fec`, and no dropouts or clicks |
+| `ltc14400_fec` | **Experimental, fastest LTC:** 14400 bit/s with the coded body (also uncoded `ltc14400`); 7.0 ms (5.4 ms) per message, a 4-note chord in 29 ms (22 ms); repairs dropouts up to ~0.5 ms | mean ~7 ms, p95 ~7.5 ms (`ltc14400`: ~5.5 ms) | A digital line (Dante, MADI, AES) at 48 or 96 kHz: ≥ 16 kHz bandwidth, ≥ 15 dB SNR |
 
 An EQ boost inside the signal band breaks them (+12 dB at 3 kHz stops 4800 bit/s; 2400 bit/s survives
 it but not a 1 kHz high-pass), and 9600 bit/s needs more than ~6 kHz of bandwidth (digital lines only).
@@ -115,6 +115,29 @@ clock error, at 48 and 96 kHz, but fail below ~16 kHz of bandwidth, e.g. through
 low-pass at 12 kHz.
 The measurements behind all profiles are in [docs/proposals/fec.md](docs/proposals/fec.md) and
 [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md).
+
+### Digital (bit-transparent) — experimental
+
+For paths that deliver samples **unchanged** (Dante / AES67 / MADI / AES3 routed without processing, a
+USB interface's digital I/O in a bit-exact mode), `--profile digital` writes the packet straight into
+the sample values, one nibble per sample, like SMPTE ST 337 carries data in AES3: a message is 21
+samples, sent twice (0.9 ms on air), at −57.4 dBFS peak.
+
+| | `digital` |
+|---|---|
+| Measured NoteOn latency\* | mean ~0.5–0.7 ms, p95 ~0.6–0.8 ms; 4-note chord complete after ~3.3 ms |
+| Throughput | ~1,150 messages/s |
+| Survives | 16-bit truncation, ±1 LSB of dither, 32767 / 2²³−1 scaling, polarity inversion, gain within ±0.1 dB, noise ≤ −100 dBFS |
+| Fails (safely: no MIDI, never wrong MIDI) | any other gain, EQ, dynamics, sample-rate conversion, unlocked clocks, mixing, analog |
+
+**Check the path first** with `cricket pathcheck` (below): it plays a test pattern, records the far end
+and tells you whether the path is bit-exact and, if not, what it does (gain, word length, dither,
+SRC / drift, polarity, offset, noise). On Windows, Cricket currently uses WASAPI shared mode, which goes
+through the Windows mixer: run the path check, and prefer macOS / Linux (ALSA `hw:` device) until
+exclusive mode / ASIO are supported. A decoder profile with `+digital` (e.g. `ltc9600+digital`) also
+accepts digital frames. Design, false-accept analysis (worst case ~10¹⁰ years per false message), the
+fail-safe table and path requirements: [docs/proposals/digital-transparent.md](docs/proposals/digital-transparent.md).
+Not part of the spec yet, and not in the GUI.
 
 \* MIDI in → MIDI out through the engine, in-process (`cricket loopback`, 20–60 notes), while notes are
 being played *and released*. Real audio interfaces add their own buffering on top. Run the measurement
@@ -145,6 +168,15 @@ cargo run -p cricket_cli -- encode --simulate
 # How fast is it, really? (no hardware needed; default: fast,robust)
 cargo run --release -p cricket_cli -- loopback
 cargo run --release -p cricket_cli -- loopback --profiles robust,robust_repeat,fast,ltc,ltc_fec --notes 40
+cargo run --release -p cricket_cli -- loopback --profiles digital,ltc9600 --chords 20 --throughput 100
+
+# Is this path bit-transparent (for --profile digital)? Sender, then receiver:
+cricket pathcheck send --audio-out-name "Dante TX 1-2"
+cricket pathcheck receive --audio-in-name "Dante RX 1-2" --seconds 5
+cricket pathcheck sim                     # simulated paths, no hardware
+
+# Lower device latency (default: the host's buffer; ALSA uses 100 ms)
+cricket --profile digital --buffer-frames 128 decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
 ```
 
 The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).
@@ -191,6 +223,8 @@ every push.
 
 - [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol, all profiles and test vectors.
 - [`docs/v1.1-plan.md`](docs/v1.1-plan.md): what v1.1 set out to fix, and how.
+- [`docs/proposals/digital-transparent.md`](docs/proposals/digital-transparent.md): the experimental
+  `digital` profile, `cricket pathcheck`, and the engine latency audit.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed.
 
 ## Status

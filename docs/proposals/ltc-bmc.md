@@ -941,6 +941,10 @@ also wait behind a NoteOff repeat. With the fast profiles `ltc14400_fec` costs o
 `ltc14400` end to end. Shorter engine polling is the next step for lower latency (all profiles). The
 chord numbers of §10.6 show the phy's share without the engine.
 
+*Update:* the engine no longer polls: the encoder wakes on MIDI input and the decoder on the audio
+callback (`digital-transparent.md` §9.1). Same loopback, 60 notes: `ltc14400` 5.5 ms, `ltc14400_fec`
+7.2 ms, `ltc9600` 8.2 ms mean, jitter < 0.1 ms; each profile now arrives one airtime after the note.
+
 Receiver CPU (host, release, one thread, ns per input sample, best of 5 passes over 10 s; traffic =
 20 NoteOns at 30 dB SNR, noise = search only; `ltc_fast_cpu`):
 
