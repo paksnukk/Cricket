@@ -614,7 +614,7 @@ pub fn analyze(samples: &[f32], sample_rate_hz: u32) -> PathReport {
     }
 
     // Sample-by-sample comparison.
-    let (mut sxy, mut sxx) = (0.0f64, 0.0f64);
+    let (mut sx, mut sy, mut sxy, mut sxx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut low_bits = 0i64;
     let mut quant: [[usize; 3]; 2] = [[0; 3]; 2]; // [16, 20] x [trunc, round, tpdf-like]
     let mut quant_n = 0usize;
@@ -631,6 +631,8 @@ pub fn analyze(samples: &[f32], sample_rate_hz: u32) -> PathReport {
         if diff.abs() == 1.0 {
             report.lsb24_errors += 1;
         }
+        sx += want;
+        sy += got;
         sxy += got * want;
         sxx += want * want;
         match class(i - start + best_lag) {
@@ -659,14 +661,17 @@ pub fn analyze(samples: &[f32], sample_rate_hz: u32) -> PathReport {
             _ => {}
         }
     }
-    let gain = if sxx > 0.0 { sxy / sxx } else { 1.0 };
-    report.gain_db = 20.0 * libm::log10(gain.abs().max(1e-12));
+    // Gain and DC offset fitted jointly (a word-length cut by truncation
+    // is an offset, not a gain change).
     let n = report.compared as f64;
-    let mut dc = 0.0;
-    for (i, &got) in y.iter().enumerate().take(end).skip(start) {
-        dc += got - gain * expected(i);
-    }
-    dc /= n;
+    let var = n * sxx - sx * sx;
+    let gain = if var > 0.0 {
+        (n * sxy - sx * sy) / var
+    } else {
+        1.0
+    };
+    report.gain_db = 20.0 * libm::log10(gain.abs().max(1e-12));
+    let dc = if n > 0.0 { (sy - gain * sx) / n } else { 0.0 };
     report.dc_codes = dc;
     let mut e2 = 0.0;
     for (i, &got) in y.iter().enumerate().take(end).skip(start) {
@@ -826,13 +831,19 @@ impl PathReport {
                     )),
                 }
             }
-            if self.gain_db.abs() >= 0.0005 {
+            // Gain and offset are only meaningful while the alignment holds.
+            // After a detected requantization every sample is within ±1 LSB
+            // of the word length (so any gain is below ~0.07 dB) and the
+            // fitted gain is the requantization's bias (e.g. truncation
+            // toward zero shrinks small values), not a fader.
+            let aligned = self.drift_ppm.is_none() && self.correlation >= 0.99;
+            if aligned && self.requantize.is_none() && self.gain_db.abs() >= 0.0005 {
                 findings.push(format!(
                     "Gain change: {:+.3} dB (fader, trim or volume not at unity)",
                     self.gain_db
                 ));
             }
-            if self.dc_codes.abs() >= 0.5 && self.requantize.is_none() {
+            if aligned && self.dc_codes.abs() >= 0.5 && self.requantize.is_none() {
                 findings.push(format!(
                     "DC offset: {:+.1} (24-bit LSB) = {:+.2} LSB of 16 bits",
                     self.dc_codes,
