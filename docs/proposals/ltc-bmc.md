@@ -11,6 +11,9 @@ prototype is in `cricket_core/src/phy/bmc/` and is selected with `PhyConfig::ltc
 The robust and fast profiles behave exactly as before. Since the first prototype the receiver makes
 soft decisions and produces erasures, and `ltc_fec` adds Reed–Solomon body FEC (§9).
 
+§10 adds the experimental fast profiles `ltc14400` and `ltc14400_fec` for digital lines (5.4 / 7.0 ms
+per message); they are not in the spec yet (candidate for §6.5).
+
 ## 1. Motivation
 
 On a clean, dedicated line (Dante/MADI channel, analog XLR tie line) the MFSK profiles spend most of
@@ -63,7 +66,8 @@ All parameters scale with the bit rate. The three candidates at 48 kHz:
 | 9600 | 2.5 samples | 8.0 ms | 4.8–9.6 kHz | digital lines only; fails with < ~6 kHz bandwidth, ≥ 97 % down to 5 dB SNR |
 
 The half cell does not have to be a whole number of samples. TX and RX work in fractional samples, and
-the tests pass at 44.1 kHz (4.59 samples per half cell at 4800) and at 96 kHz.
+the tests pass at 44.1 kHz (4.59 samples per half cell at 4800) and at 96 kHz. Rates above 9600 bit/s
+for digital lines (14400 bit/s, 1.67 samples per half cell) are in §10.
 
 ### 2.4 Waveform shaping
 
@@ -384,6 +388,8 @@ GF(16) RS decodes), not per sample. The TX is unchanged and cheap: per sample it
 * `cricket_core/tests/stuck_notes.rs`: `ltc_back_to_back_report` (ignored).
 * `cricket_core/tests/support/mod.rs`: `clicks` (impulse noise).
 * `cricket_cli/src/main.rs`: global `--profile`, `loopback --profiles`.
+* `cricket_core/tests/ltc_fast.rs`, `cricket_core/tests/ltc_fast_ab.rs`: the fast profiles of §10
+  (regression tests; A/B tables, chords, phy diagnostics and CPU as ignored tests).
 
 ## 9. LTC + FEC
 
@@ -654,3 +660,354 @@ LTC_AB_TRIALS=1000 LTC_AB_PROFILES=ltc,ltc_fec2,ltc_fec4,ltc2400,ltc2400_fec4,lt
 cargo test --release -p cricket_core --test stuck_notes ltc_back_to_back_report -- --ignored --nocapture
 cargo run --release -p cricket_cli -- loopback --profiles ltc,ltc_fec,ltc2400,fast --notes 60
 ```
+
+## 10. Fast profiles for digital lines (`ltc14400`, `ltc14400_fec`)
+
+Status: **experimental profiles in the reference implementation, candidate for spec §6.5** (not in the
+spec; the decision is open). The profiles of §2–§9 are unchanged on the wire and in the receiver
+(`BmcParams::new`; a regression test checks every parameter).
+
+Goal: the lowest latency a dependable BMC link can reach on a **clean digital path** (Dante, MADI, AES,
+a virtual loop), where SNR is large but the band is limited by converter and sample-rate-converter
+anti-alias filters (flat to ~20 kHz, ~0.45 fs, at 48 kHz, often several in series), sometimes by an
+analog leg, and where the clock may be resampled. Noise tolerance may be traded for speed: ≥ 15–20 dB
+SNR is acceptable.
+
+### 10.1 The limit: bandwidth, not noise
+
+An all-ones BMC stretch (the preamble) is a square wave **at the bit rate**; zeros put their fundamental
+at half the bit rate. With `edge_frac` = 1 (sinusoidal transitions one half cell wide) the preamble is
+an almost pure tone at the bit rate and the body's energy sits between ½ and 1 × the bit rate. At 48 kHz
+that leaves little room: 14.4 kHz at 14400 bit/s, 16 kHz at 16000, and 19.2 kHz at 19200, which would
+already sit in the converter filter's transition band. What breaks first is not the amplitude response
+but the **group delay of minimum-phase converter filters** near their band edge: two cascaded
+"low-latency" (minimum-phase) filters skew the 16 kHz components against the 8 kHz ones by a fraction
+of a half cell (1.5 samples at 16000 bit/s) and the bit decisions fail, while linear-phase filters with
+the same passband pass 16000 bit/s at 100 %.
+
+Rates tested: 12000, 14400 and 16000 bit/s at 48 kHz (2.0, 1.67, 1.5 samples per half cell), and
+9600, 14400, 19200, 24000 and 28800 bit/s at 96 kHz.
+
+### 10.2 What the fast profiles change
+
+`BmcParams::fast(bit_rate)`, used by `ltc14400` and `ltc14400_fec` (`PhyConfig::ltc_fast_with_bit_rate`,
+`ltc_fast_fec_with_bit_rate`):
+
+| | `ltc9600` and the other LTC profiles | fast profiles | why |
+|---|---|---|---|
+| `edge_frac` (wire) | 0.5 | **1.0** | Sinusoidal edges keep the burst inside a 20 kHz passband. With 0.5 edges two minimum-phase converter filters cut exact bodies from 100 % to 88 % (§10.4). |
+| postamble (wire) | 1 bit | **none** | The transition into the tail half cell already terminates the last body bit. |
+| gap (wire) | 4 cells | **1 cell** | Bursts can follow each other almost directly (§10.3, §10.6). |
+| preamble (wire) | 8 bits | 8 bits | 4 bits saves 0.27 ms but locks worse (§10.3). |
+| sync boxes (RX) | rounded to whole samples | **exact half-cell integrals** at fractional delays (`sync_fractional`) | See below. |
+| rate gain (RX) | 0.02 | **0.01** | Less rate jitter from noisy zero-crossing times at 1.67 samples per half cell (sweep below). |
+| post-body guard (RX) | off | **on** (`post_body_guard`) | See below. |
+| RX low-pass | 1.5 × bit rate | same (21.6 kHz at 14400 bit/s; clamped to 0.45 fs at 48 kHz) | Lower cut-offs (1.0, 1.2 or 1.35 × bit rate) were worse on steep converter filters. |
+
+**Fractional sync boxes.** At 9600 bit/s and below, box sums of a whole number of samples at
+whole-sample delays reproduce the template well. At 1.67 samples per half cell, rounding to 2-sample
+boxes at rounded delays smears the template: real syncs then score lower than the replacement rule
+needs (≥ 0.95 replaces any lock), so a false lock on the end of one burst hid the next note of a chord.
+The fast receiver integrates each half cell exactly (2–3 weighted samples per box at fractional
+delays) and, at a peak candidate, also evaluates the two half-sample points next to it (the
+correlation peak is only ~2 samples wide). Real syncs at 40 dB SNR, random sub-sample phase (`rho` =
+normalized correlation):
+
+| receiver | median `rho` | 10th percentile |
+|---|---|---|
+| 9600 bit/s, rounded boxes (unchanged profiles) | 0.964 | 0.935 |
+| 14400 bit/s, rounded boxes | 0.916 | 0.823 |
+| 14400 bit/s, linearly interpolated box sums (first attempt) | 0.926 | 0.852 |
+| 14400 bit/s, exact fractional boxes + half-sample peak search | 0.965 | 0.954 |
+
+**Post-body guard.** The end of a burst (last body bits, tail, fade into silence) can correlate like a
+sync (`rho` up to ~0.85 at 14400 bit/s). With a one-cell gap the next burst's sync follows within a
+few half cells, and a false lock taken there must not block it. After a completed body the receiver
+therefore holds new syncs to the in-body replacement rule until the earliest time the next burst's
+sync can arrive. With the fractional correlator it is mostly a safety margin: chords are unchanged
+without it on the uncoded profile, and `ltc14400_fec` delivers 1–1.5 points more of its chords at
+±1 % drift with it (§10.6).
+
+**Timing loop at 1.67 samples per half cell.** The grid is continuous (fractional) and transitions
+are interpolated zero crossings, so resolution is not limited by the sample grid; noise on the
+zero-crossing times is. Sweeps over phase gain (0.2–0.45), rate gain (0.01–0.04), capture window,
+window taper, integration trims and Schmitt hysteresis changed nothing except the rate gain: 0.04
+raised the bit error rate on two minimum-phase filters from 0 to 7.5 × 10⁻³, 0.01 was best. Bit error
+rate in delivered bodies (phy diagnostics, 1000 trials per cell) is ≤ 0.1 × 10⁻³ at 10 dB SNR, on every
+converter model and at ±1 % drift, and 1.2 × 10⁻³ through a 2-pole 12 kHz low-pass.
+
+Receiver ablation, `ltc14400`, exact bodies % (phy level, 1000 trials, SNR 20 dB unless noted):
+
+| condition | fast profile | rounded sync boxes | rate gain 0.02 | edges 0.5 |
+|---|---|---|---|---|
+| SNR 10 dB | 99 | 98 | 100 | 100 |
+| AD/DA min-phase ×2 (ellip 10, 0.452 fs) | 100 | 97 | 99 | 88 |
+| AD/DA min-phase (Chebyshev 8, flat 20 kHz) | 100 | 98 | 99 | 95 |
+| 4-pole LP 16 kHz | 100 | 92 | 100 | 100 |
+| 2-pole LP 12 kHz | 74 | 44 | 74 | 84 |
+| drift +1 % (linear interpolation) | 100 | 98 | 100 | 100 |
+
+### 10.3 Airtime and overhead
+
+At 14400 bit/s a half cell is 34.7 µs: the 8-bit preamble costs 0.56 ms, the sync 0.21 ms, the body
+4.44 ms (16 nibbles) or 6.11 ms (22 coded nibbles), the postamble 0.07 ms, the tail 0.03 ms, the gap
+0.28 ms (4 cells) or 0.07 ms (1 cell).
+
+| profile | half cell @ 48 kHz | burst | burst + gap (airtime per message) |
+|---|---|---|---|
+| `ltc9600` | 2.5 samples | 7.97 ms | 8.44 ms |
+| `ltc9600_fec` | 2.5 samples | 10.47 ms | 10.94 ms |
+| 12000 bit/s, fast parameters | 2.0 samples | 6.29 ms | 6.44 ms |
+| **`ltc14400`** | 1.67 samples | **5.24 ms** | **5.38 ms** (−36 %) |
+| **`ltc14400_fec`** | 1.67 samples | **6.91 ms** | **7.04 ms** (−36 %) |
+| 16000 bit/s, fast parameters | 1.5 samples | 4.72 ms | 4.83 ms |
+| 14400 bit/s, original framing (post 1, gap 4) | 1.67 samples | 5.31 ms | 5.65 ms |
+| 14400 bit/s, 4-bit preamble | 1.67 samples | 4.97 ms | 5.08 ms |
+
+The shorter postamble and gap save 0.27 ms per message (5 %) and 0.8 ms on a 4-note chord, with no
+measurable cost (delivery equal in every cell of §10.4, better at +1 % drift on chords, §10.6). The
+cost is on the false-accept side: a misconfigured uncoded transmitter produces more FEC candidates
+(§10.7), still far inside the target.
+
+**Shorter preamble.** A 4-bit preamble saves another 0.27–0.3 ms but costs 0.1–0.7 points of delivery
+in most cells (SNR 30 dB: 99.9 %, 2 minimum-phase filters: 99.3 %, 12 dB: 99.6 %, 8 dB: 94.5 % against
+96.6 %). The cause is false locks: with an 8 + 6 half-cell template body data correlates much better,
+and the receiver completes and gates ~1 false body per message (phy diagnostics: 94–107 false bodies
+per 100 trials in every condition, against 0–5 with the 8-bit preamble and 15–20 with 6 bits, i.e.
+~40× more false locks). The
+gates and the replacement rule catch them, but each one is a chance to lose the real packet and a
+candidate for the CRC. Keeping 8 bits is the better trade for 0.27 ms.
+
+### 10.4 Delivery at 48 kHz
+
+`ltc_fast_ab.rs` `ltc_fast_ab_table`: single messages (NoteOn, or MSC GO every 4th), random start
+offset, random sub-sample phase on paths with an analog leg or SRC, 64-sample chunks, 1000 trials per
+cell; % delivered (exactly the message and nothing else). Filters are applied to the transmitted audio,
+then AWGN at the SNR (relative to the signal RMS, full band). Converter models: linear-phase FIR flat
+to 20 kHz and ≥ 100 dB down from 23 kHz (delay removed; DA → AD = ×2, plus an SRC pair = ×4); 10th-order
+elliptic minimum-phase, 0.01 dB ripple to 0.452 fs, 100 dB stop band (the "low-latency" filter of
+many converters), ×1 and ×2; 8th-order Chebyshev I minimum-phase, flat to 20 kHz; and softer
+Butterworth low-passes. "SRC" is a band-limited windowed-sinc resampler (a real SRC or wrong clock);
+"drift" is the simulator's linear-interpolation resampler of the older tables, which also low-passes the
+signal by up to 4.6 dB at 0.3 fs.
+
+| channel | ltc9600 | ltc9600_fec | 12000¹ | **ltc14400** | **ltc14400_fec** | 16000¹ | 16000 FEC¹ |
+|---|---|---|---|---|---|---|---|
+| SNR 30 / 25 / 20 / 18 / 16 / 14 dB | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 12 dB | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 10 dB | 100 | 100 | 99.8 | 99.7 | 100 | 97.6 | 97.8 |
+| SNR 8 dB | 100 | 99.8 | 99.0 | 96.6 | 99.4 | 82.3 | 86.4 |
+| SNR 6 dB | 99.0 | 99.5 | 88.8 | 77.0 | 96.5 | 38.8 | 61.3 |
+| AD/DA linear-phase ×2 (flat 20 kHz) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| AD/DA linear-phase ×4 + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| AD/DA min-phase ×1 (ellip, 0.452 fs) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| AD/DA min-phase ×2 (ellip, 0.452 fs) + SNR 20 | 100 | 100 | 100 | 99.8 | 100 | 37.7 | 25.4 |
+| AD/DA min-phase (Chebyshev 8, 20 kHz) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 46.6 | 41.1 |
+| 4-pole LP 18 kHz + SNR 20 | 100 | 100 | 100 | 100 | 100 | 98.7 | 99.1 |
+| 4-pole LP 16 kHz + SNR 20 | 100 | 100 | 100 | 99.9 | 100 | 45.9 | 53.9 |
+| 2-pole LP 16 kHz + SNR 20 | 100 | 100 | 100 | 100 | 100 | 91.5 | 91.7 |
+| 2-pole LP 12 kHz + SNR 20 | 100 | 100 | 100 | 76.7 | 76.5 | 10.3 | 10.5 |
+| clean | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| SRC ±0.1 % + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| SRC ±1 % + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| drift +1 % (linear interp.) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 99.8 | 99.8 |
+| drift −1 % (linear interp.) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| AD/DA ×2 + SRC +0.1 % / −1 % + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| inverted + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| level −30 dB + SNR 20, −50 dB + SNR 30 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| dropout 1 ms + SNR 30 | 2.6 | 94.3 | 0.2 | 0.1 | 91.0 | 0.0 | 92.0 |
+| dropout 3 ms + SNR 30 | 0.0 | 81.8 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| clicks 20/s @ 0 dB + SNR 30 | 100 | 100 | 100 | 99.6 | 100 | 99.1 | 99.5 |
+| clicks 200/s @ +6 dB + SNR 30 | 65.7 | 93.2 | 67.4 | 67.3 | 92.1 | 68.8 | 89.6 |
+| mean start → delivery | 8.6 ms | 11.1 ms | 7.0 ms | 6.0 ms | 7.6 ms | 5.4 ms | 6.9 ms |
+
+¹ `BmcParams::fast` at that bit rate (no profile name). No false message in any cell.
+
+* **14400 bit/s is the fastest rate that passes every converter model**, including two cascaded
+  minimum-phase filters and soft low-passes down to 16 kHz, with 100 % down to 12 dB SNR (uncoded) and
+  10 dB (FEC). It needs ~16 kHz of bandwidth: a 2-pole 12 kHz low-pass, which no digital path has,
+  delivers 77 %.
+* **16000 bit/s is not dependable**: 25–47 % through minimum-phase converter filters and a 4-pole
+  16 kHz low-pass. 12000 bit/s passes everything at 48 kHz, including the 12 kHz low-pass, for 1.1 ms
+  more per message; it is the fallback for chains with analog stages, but has no profile name.
+* The **noise floor moves up by ~3 dB** against `ltc9600` (95 % delivered at ~8 dB SNR uncoded and
+  ~6 dB with FEC; `ltc9600` stays at 99 % at 6 dB), which is irrelevant on a digital line.
+* Dropouts: the FEC repairs any 0.5 ms dropout in the body (`ltc_fast.rs`) and 91 % of 1 ms dropouts
+  anywhere in the burst (the rest hit the preamble or sync); 3 ms (43 bits, ~11 nibbles) is beyond the code. A line with dropouts of
+  several ms needs `ltc9600_fec` or slower.
+
+### 10.5 96 kHz paths
+
+Same harness at 96 kHz (`FAST_AB_SET=all96`, 1000 trials per cell). Rates up to 28800 bit/s keep at
+least 1.67 samples per half cell. Native 96 kHz converters: linear-phase flat to 40 kHz (≥ 100 dB from
+46 kHz) and the elliptic minimum-phase filter at 0.452 fs (43.4 kHz). A 48 kHz device or SRC in the
+chain: linear-phase flat to 20 kHz, or the elliptic minimum-phase filter with its edge at 21.7 kHz.
+
+| channel | ltc9600 | **ltc14400** | **ltc14400_fec** | 19200¹ | 19200 FEC¹ | 24000¹ | 28800¹ |
+|---|---|---|---|---|---|---|---|
+| airtime per message | 8.43 ms | 5.36 ms | 7.03 ms | 4.02 ms | 5.27 ms | 3.22 ms | 2.69 ms |
+| SNR 30 … 12 dB | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 10 dB | 100 | 100 | 100 | 100 | 100 | 99.9 | 99.6 |
+| SNR 8 dB | 100 | 99.9 | 99.9 | 99.1 | 99.7 | 98.7 | 97.0 |
+| SNR 6 dB | 100 | 99.3 | 99.7 | 95.3 | 99.3 | 89.3 | 74.0 |
+| native AD/DA linear-phase ×2 (flat 40 kHz) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| native AD/DA min-phase ×2 (ellip, 0.452 fs) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 99.9 |
+| 48 kHz hop, linear-phase ×2 (flat 20 kHz) + SNR 20 | 100 | 100 | 100 | 100 | 100 | 0 | 0 |
+| 48 kHz hop, min-phase ×1 (ellip, 21.7 kHz) + SNR 20 | 100 | 100 | 100 | 8.8 | 2.8 | 0 | 0 |
+| 48 kHz hop, min-phase ×2 (ellip, 21.7 kHz) + SNR 20 | 100 | 57.3 | 66.9 | 0.4 | 0 | 0 | 0 |
+| 4-pole LP 32 kHz + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| 4-pole LP 24 kHz + SNR 20 | 100 | 100 | 100 | 100 | 100 | 99.9 | 0 |
+| 4-pole LP 18 kHz + SNR 20 | 100 | 100 | 100 | 99.8 | 99.8 | 0 | 0 |
+| 4-pole LP 16 kHz + SNR 20 | 100 | 100 | 100 | 43.7 | 45.5 | 0 | 0 |
+| clean, SRC ±0.1 % / ±1 %, drift ±1 %, inverted, level −30 / −50 dB | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| dropout 1 ms + SNR 30 | 3.4 | 0.1 | 91.4 | 0 | 91.0 | 0 | 0 |
+| clicks 200/s @ +6 dB + SNR 30 | 86.7 | 81.0 | 97.2 | 81.8 | 96.3 | 82.4 | 81.5 |
+| mean start → delivery | 8.6 ms | 6.0 ms | 7.6 ms | 4.7 ms | 5.9 ms | 3.8 ms | 3.3 ms |
+
+¹ `BmcParams::fast` at that bit rate (no profile name). No false message in any cell.
+
+* `ltc14400` and `ltc14400_fec` work at 96 kHz as at 48 kHz (3.33 samples per half cell, more noise
+  margin). The one weak case is a 96 kHz signal through **two** minimum-phase 48 kHz filters (57–67 %):
+  at 96 kHz the burst has content above 21.7 kHz that such a hop removes, which a 48 kHz transmitter
+  never produces. A 48 kHz hop through a linear-phase SRC is fine.
+* On a **pure 96 kHz path** the limit scales with the sample rate: **28800 bit/s** (1.67 samples per
+  half cell, 2.7 ms per message) behaves like `ltc14400` at 48 kHz. Any 48 kHz device or SRC, or a
+  4-pole low-pass at 24 kHz, stops it completely; 24000 bit/s survives the 24 kHz low-pass but no
+  48 kHz hop, and 19200 bit/s does not survive a single minimum-phase 48 kHz hop either.
+
+### 10.6 Chords and back-to-back messages
+
+`ltc_fast_chord_table`: 4-note chords (4 NoteOns encoded back to back, as the engine sends them),
+1000 trials per cell; % of chords with all four notes delivered (mean ms from the first sample to the
+last note's delivery, i.e. the last-note latency without engine buffering):
+
+| channel | ltc9600 | ltc9600_fec | ltc_fec | **ltc14400** | **ltc14400_fec** | 14400, 4-bit preamble | 14400, original post/gap | ltc14400 no guard | ltc14400_fec no guard |
+|---|---|---|---|---|---|---|---|---|---|
+| clean | 100 (33.9) | 100 (43.9) | 100 (87.1) | 100 (22.1) | 100 (28.8) | 100 (21.0) | 100 (22.9) | 100 (22.1) | 100 (28.8) |
+| SNR 20 dB | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| AD/DA linear-phase ×2 + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| AD/DA min-phase ×2 (ellip) + SNR 20 | 100 | 100 | 100 | 99.2 | 99.8 | 98.8 | 99.8 | 99.2 | 99.0 |
+| AD/DA ×2 + SRC +0.1 % + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 99.9 |
+| SRC +1 % + SNR 20 | 100 | 99.9 | 100 | 100 | 100 | 100 | 100 | 100 | 99.9 |
+| SRC −1 % + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 99.9 |
+| drift +1 % (linear interp.) + SNR 20 | 100 | 99.3 | 100 | 100 | 97.3 | 99.8 | 96.5 | 100 | 95.7 |
+| drift −1 % (linear interp.) + SNR 20 | 100 | 100 | 100 | 99.9 | 99.7 | 100 | 100 | 99.9 | 98.4 |
+
+A 4-note chord completes in **22 ms** (`ltc14400`) or **29 ms** (`ltc14400_fec`), against 34 / 44 ms at
+9600 bit/s and 87 ms for `ltc_fec`. No false message in any cell.
+
+### 10.7 False messages
+
+`fec_false_accept.rs` `false_accept_report`, 600 s per signal (method and target: `fec.md` §9; target
+≤ 1 false message per 10 years of continuous worst-case audio):
+
+| profile | signal | false bodies / min | candidates / min | years per false message |
+|---|---|---|---|---|
+| ltc14400_fec | MFSK traffic | 0.2 | 0 | ∞ (no candidate) |
+| ltc14400_fec | white noise, clicks, music, speech, SMPTE LTC | 0 | 0 | ∞ (no false body) |
+| ltc14400_fec | uncoded LTC (misconfigured TX, `ltc14400`) | 155 | 15.9 | **940** |
+| ltc9600_fec (same run) | uncoded LTC (`ltc9600`) | 6,470 | 243 | 62 |
+
+The misconfigured transmitter is the worst case, as for the other LTC FEC profiles, and it is 94× inside
+the target (15× better than `ltc9600_fec`): with a one-cell gap the next burst's sync replaces the lock
+before an uncoded 16-nibble burst can be read as a 22-nibble coded body, so false bodies are 40× rarer.
+White noise never decodes on either fast profile (`bmc_phy.rs`, `ltc_fec.rs`), MFSK and LTC audio of
+other rates never decode on them and vice versa (`ltc_fast.rs`, `mfsk_and_bmc_do_not_cross_decode`), and the fast budget test `worst_case_audio_rarely_reaches_the_crc`
+now covers uncoded LTC into `ltc14400_fec`. No false message was observed in any measurement of this
+section. (An earlier version of the receiver, before the fractional sync boxes, let 5,000 false bodies
+and 570 candidates per minute through on the same signal: 26 years.)
+
+### 10.8 Latency and CPU
+
+`cricket loopback --profiles ltc14400,ltc14400_fec,ltc9600,ltc9600_fec,ltc_fec --notes 60` (release,
+MIDI in → MIDI out through the engine, in-process, notes played and released):
+
+| profile | mean | p95 | jitter |
+|---|---|---|---|
+| **ltc14400** | **11.6 ms** | 15.2 ms | 2.4 ms |
+| **ltc14400_fec** | **12.0 ms** | 15.2 ms | 2.6 ms |
+| ltc9600 | 12.5 ms | 17.4 ms | 2.7 ms |
+| ltc9600_fec | 15.8 ms | 19.5 ms | 2.5 ms |
+| ltc_fec | 26.5 ms | 30.7 ms | 3.0 ms |
+
+A second run with 200 notes each: `ltc14400` 11.6 / 15.5 / 2.6 ms, `ltc14400_fec` 11.8 / 15.6 / 2.6,
+`ltc9600` 12.5 / 15.6 / 2.2, `ltc9600_fec` 16.2 / 20.1 / 2.9 (mean / p95 / jitter).
+
+The phy saves 2.7 ms (uncoded) and 3.6 ms (FEC) of decode delay against 9600 bit/s. The coded profile
+gains it fully (16 → 12 ms); the uncoded one gains less than its airtime, because the engine's own
+scheduling now dominates: the encoder and the decoder poll every 5 ms (`TICK`, `IDLE_SLEEP`), so a
+NoteOn waits up to 5 ms to be encoded and the decoded burst up to 5 ms to be read, and a NoteOn may
+also wait behind a NoteOff repeat. With the fast profiles `ltc14400_fec` costs only ~0.2 ms more than
+`ltc14400` end to end. Shorter engine polling is the next step for lower latency (all profiles). The
+chord numbers of §10.6 show the phy's share without the engine.
+
+Receiver CPU (host, release, one thread, ns per input sample, best of 5 passes over 10 s; traffic =
+20 NoteOns at 30 dB SNR, noise = search only; `ltc_fast_cpu`):
+
+| profile | traffic | noise |
+|---|---|---|
+| ltc_fec | 37 | 37 |
+| ltc9600 / ltc9600_fec | 42 / 39 | 33 / 40 |
+| **ltc14400 / ltc14400_fec** | **86 / 74** | **75 / 73** |
+| ltc14400 / ltc14400_fec at 96 kHz | 97 / 93 | 97 / 100 |
+| 19200 bit/s at 96 kHz | 84 | 84 |
+
+The fractional correlator doubles the receiver cost: 22 boxes of 2–3 weighted samples (~60
+multiply-adds) instead of one running box sum and 22 look-ups. That is still ~0.4 % of one host core
+at 48 kHz and, counted as in §5 (≈ 100 multiply-adds per sample), ~5 MHz of a Cortex-M33 (~3 % of
+150 MHz). Box integrals taken from a running prefix sum could bring the correlator back to ~25
+operations per sample if an MCU needs it.
+
+### 10.9 Recommendation
+
+* **48 kHz (Dante, MADI, AES): `ltc14400_fec`** — 7.0 ms airtime per message, ~12 ms mean / 15 ms p95
+  MIDI-in → MIDI-out, 29 ms for a 4-note chord; 100 % through every converter model, SRC ±1 % and
+  soft low-passes down to 16 kHz at 20 dB SNR, down to 10 dB SNR on white noise; repairs 0.5 ms
+  dropouts (91 % of 1 ms); false messages ≥ 940 years in the worst case. **`ltc14400`** (5.4 ms,
+  ~11.6 ms mean, 22 ms chord) where the line has no dropouts or clicks. Use `ltc9600_fec` or slower if
+  the chain has an analog stage below ~16 kHz, several-ms dropouts, or less than ~15 dB SNR.
+* **96 kHz: also `ltc14400` / `ltc14400_fec`**, which keep their numbers at 96 kHz and survive a
+  48 kHz device or SRC in the chain (except two minimum-phase 48 kHz hops). On a path that is known to
+  run at 96 kHz end to end, **28800 bit/s** (2.7 ms per message, half the latency of `ltc14400`)
+  measures as `ltc14400` does at 48 kHz; it is a candidate for an `ltc28800` profile restricted to
+  ≥ 88.2 kHz, not added, because one 48 kHz hop or a 24 kHz low-pass stops it completely and a profile
+  that only works at some sample rates would need a new rule in the spec. 24000 bit/s (3.2 ms) is the
+  middle ground: it survives a 24 kHz 4-pole low-pass but no 48 kHz hop.
+* Not worth it: 16000 bit/s at 48 kHz (fails steep minimum-phase converter filters), and the 4-bit
+  preamble (−0.27 ms for ~40× more false locks and 0.1–0.7 points of delivery).
+* Before the spec: hardware runs through real Dante / MADI / AES converters and SRC, both directions,
+  48 and 96 kHz.
+
+**Candidate spec text (§6.5, not normative):** profiles `ltc14400` (16 nibbles) and `ltc14400_fec`
+(22 coded nibbles, §4.6): bit rate 14400 bit/s; preamble 8 `1` bits; sync `V V`; body MSB first; **no
+postamble** (the burst is `16 + 6 + 8 · nibbles + 1` half cells: 151 / 199; the transition into the
+tail half cell terminates the last body bit); transitions raised-cosine steps of **`w = 1`** half cell
+(`t = (n − 0.5 · h) / h`, `n = 0 … ceil((H + 1) · h)`); **1 bit cell of silence** after each burst
+(`round(2 · h)` samples). Burst 5.24 / 6.91 ms, burst + gap 5.38 / 7.04 ms at 48 kHz. Receiver (SHOULD,
+in addition to §6.5.3): sync boxes that integrate exactly one half cell at fractional delays, the
+correlation also evaluated half a sample either side of a peak candidate, rate gain 0.01, and after a
+completed body the replacement rule applied to new syncs until the next burst's sync can first arrive.
+Requirement on the line: ≥ 16 kHz bandwidth at 48 kHz or more (44.1 kHz, 1.53 samples per half cell,
+is only loopback-tested).
+
+Reproduce:
+
+```sh
+FAST_AB_TRIALS=1000 FAST_AB_PROFILES=ltc9600,ltc9600_fec,ltc12000/fast=1,ltc14400,ltc14400_fec,ltc14400/pre=4,ltc14400/post=1/gap=4,ltc16000/fast=1,ltc16000_fec/fast=1 \
+  cargo test --release -p cricket_core --test ltc_fast_ab ltc_fast_ab_table -- --ignored --nocapture
+FAST_AB_TRIALS=1000 FAST_AB_SET=all96 FAST_AB_PROFILES=ltc9600@96,ltc14400@96,ltc14400_fec@96,ltc19200@96/fast=1,ltc19200_fec@96/fast=1,ltc24000@96/fast=1,ltc28800@96/fast=1 \
+  cargo test --release -p cricket_core --test ltc_fast_ab ltc_fast_ab_table -- --ignored --nocapture
+FAST_AB_TRIALS=1000 cargo test --release -p cricket_core --test ltc_fast_ab ltc_fast_chord_table -- --ignored --nocapture
+FAST_AB_TRIALS=1000 FAST_AB_PROFILES=ltc9600,ltc14400,ltc14400/pre=4,ltc14400/frac=0,ltc14400/ki=0.02,ltc14400/edge=0.5 \
+  cargo test --release -p cricket_core --test ltc_fast_ab ltc_fast_phy_diag -- --ignored --nocapture
+cargo test --release -p cricket_core --test ltc_fast_ab ltc_fast_cpu -- --ignored --nocapture
+FALSE_SECONDS=600 FALSE_PROFILES=ltc14400_fec,ltc9600_fec \
+  cargo test --release -p cricket_core --test fec_false_accept false_accept_report -- --ignored --nocapture
+cargo run --release -p cricket_cli -- loopback --profiles ltc14400,ltc14400_fec,ltc9600,ltc9600_fec,ltc_fec --notes 60
+```
+
+Files: `cricket_core/src/phy/bmc/{mod,rx}.rs` (`BmcParams::fast`, `sync_fractional`,
+`post_body_guard`), `cricket_core/src/phy/config.rs` (profiles), `cricket_core/tests/ltc_fast.rs`
+(regression tests), `cricket_core/tests/ltc_fast_ab.rs` (the tables of this section: converter / SRC
+filter models, `FAST_AB_TRIALS`, `FAST_AB_PROFILES` with `name[@khz][/param=value…]` keys,
+`FAST_AB_SET`).

@@ -105,9 +105,14 @@ in software, but not yet proven on real show chains, so a later revision may cha
 |---|---|---|---|
 | `ltc_fec` | 4800 bit/s with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~26 ms, p95 ~30 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter |
 | `ltc` | 4800 bit/s, uncoded (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | As `ltc_fec`, and no dropouts or clicks |
+| `ltc14400_fec` | **Experimental, fastest:** 14400 bit/s with the coded body (also uncoded `ltc14400`); 7.0 ms (5.4 ms) per message, a 4-note chord in 29 ms (22 ms); repairs dropouts up to ~0.5 ms | mean ~12 ms, p95 ~16 ms | A digital line (Dante, MADI, AES) at 48 or 96 kHz: ≥ 16 kHz bandwidth, ≥ 15 dB SNR |
 
 An EQ boost inside the signal band breaks them (+12 dB at 3 kHz stops 4800 bit/s; 2400 bit/s survives
 it but not a 1 kHz high-pass), and 9600 bit/s needs more than ~6 kHz of bandwidth (digital lines only).
+`ltc14400` and `ltc14400_fec` are not in the spec yet (a candidate for §6.5): in simulation they pass
+converter anti-alias filters (also two minimum-phase ones in series), sample-rate converters and ±1 %
+clock error, at 48 and 96 kHz, but fail below ~16 kHz of bandwidth, e.g. through analog stages with a
+low-pass at 12 kHz.
 The measurements behind all profiles are in [docs/proposals/fec.md](docs/proposals/fec.md) and
 [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md).
 
