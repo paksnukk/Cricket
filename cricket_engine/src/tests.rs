@@ -56,6 +56,7 @@ fn memory_decoder(source: testing::MemorySource, rec: &RecordingMidiSink) -> Dec
         profile: "fast".into(),
         link_dead_ms: None,
         msc: MscTarget::default(),
+        audio: AudioOptions::default(),
     })
     .unwrap()
 }
@@ -73,6 +74,7 @@ fn loopback_midi_in_to_midi_out() {
         midi_in: MidiIn::Custom(Box::new(midi_in)),
         profile: "fast".into(),
         simulate: false,
+        audio: AudioOptions::default(),
     })
     .unwrap();
 
@@ -172,6 +174,7 @@ fn simulated_scale_reaches_decoder() {
         midi_in: MidiIn::None,
         profile: "fast".into(),
         simulate: false,
+        audio: AudioOptions::default(),
     })
     .unwrap();
     let ok = wait_for(Duration::from_secs(15), || {
@@ -192,6 +195,7 @@ fn stop_joins_worker_and_ends_with_stopped() {
         midi_in: MidiIn::None,
         profile: "fast".into(),
         simulate: true,
+        audio: AudioOptions::default(),
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -243,6 +247,7 @@ fn audio_open_error_is_logged_and_worker_ends() {
         profile: "robust".into(),
         link_dead_ms: None,
         msc: MscTarget::default(),
+        audio: AudioOptions::default(),
     })
     .unwrap();
     let logs = log_lines(&expect_stopped_then_closed(dec.events()));
@@ -261,6 +266,7 @@ fn audio_open_error_is_logged_and_worker_ends() {
         midi_in: MidiIn::None,
         profile: "robust".into(),
         simulate: false,
+        audio: AudioOptions::default(),
     })
     .unwrap();
     let logs = log_lines(&expect_stopped_then_closed(enc.events()));
@@ -317,6 +323,7 @@ fn stall_decoder(source: testing::MemorySource, rec: &RecordingMidiSink) -> Deco
         profile: "fast".into(),
         link_dead_ms: Some(TEST_LINK_DEAD_MS as u32),
         msc: MscTarget::default(),
+        audio: AudioOptions::default(),
     })
     .unwrap()
 }
@@ -504,6 +511,7 @@ fn device_errors_become_alarms() {
         midi_in: MidiIn::None,
         profile: "fast".into(),
         simulate: false,
+        audio: AudioOptions::default(),
     })
     .unwrap();
 

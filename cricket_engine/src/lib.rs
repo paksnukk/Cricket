@@ -12,12 +12,14 @@
 //!     profile: "robust".into(),
 //!     link_dead_ms: None,
 //!     msc: MscTarget::default(),
+//!     audio: AudioOptions::default(),
 //! })?;
 //! let enc = EncoderHandle::start(EncoderConfig {
 //!     audio_out: AudioOut::Device(DeviceSelector::Default),
 //!     midi_in: MidiIn::None,
 //!     profile: "robust".into(),
 //!     simulate: false,
+//!     audio: AudioOptions { buffer_frames: Some(256), ..Default::default() },
 //! })?;
 //! enc.send(TransportMessage::Panic);
 //! for ev in dec.events().try_iter() { println!("{:?}", ev); }
@@ -36,6 +38,7 @@ pub mod events;
 pub mod loopback;
 pub mod memory;
 pub mod midi;
+pub mod pathcheck;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 #[cfg(test)]
@@ -45,7 +48,8 @@ mod tests;
 mod loopback_tests;
 
 pub use audio::{
-    AudioIn, AudioOut, AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink, OpenAudioSource,
+    AudioIn, AudioOptions, AudioOut, AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink,
+    OpenAudioSource, SampleFormatPref,
 };
 pub use cricket_core::transport::{MscTarget, TransportMessage};
 pub use decoder::{DecoderConfig, DecoderHandle};
@@ -53,7 +57,8 @@ pub use devices::DeviceSelector;
 pub use encoder::{EncoderConfig, EncoderHandle};
 pub use events::{format_message, link_state_name, AlarmKind, EngineEvent, LinkStats};
 pub use loopback::{
-    jitter_ms, mean_ms, measure_midi_loopback, percentile_nearest_rank_ms, LatencySummary,
+    jitter_ms, mean_ms, measure_chord_loopback, measure_midi_loopback, measure_midi_loopback_with,
+    measure_throughput, percentile_nearest_rank_ms, ChordSummary, LatencySummary, Pacing,
 };
 pub use midi::{MidiCallback, MidiIn, MidiInputGuard, MidiOut, MidiSink, MidiSource};
 

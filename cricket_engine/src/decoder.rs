@@ -18,18 +18,22 @@
 //!
 //! Device errors reported by the source (cpal's error callback) are polled
 //! every loop iteration and emitted as `Alarm { AudioDeviceError }`.
+//!
+//! Latency: the worker sleeps in [`crate::AudioSource::wait`], which the cpal input
+//! callback (and the in-memory sources) end as soon as samples arrive, so a
+//! packet is decoded within microseconds of the callback that delivered its
+//! last sample; decoded MIDI goes to the sink immediately.
 
-use crate::audio::AudioIn;
+use crate::audio::{AudioIn, AudioOptions};
 use crate::events::{AlarmKind, EngineEvent, LinkStats};
 use crate::midi::{self, MidiOut, MidiSink};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::Result;
 use cricket_core::modem::{CricketModemRx, ModemOutput, ModemStats};
-use cricket_core::phy::{LinkState, PhyConfig};
+use cricket_core::phy::{LinkState, Modulation, PhyConfig};
 use cricket_core::transport::{MscTarget, TransportMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// Decoder settings.
@@ -45,6 +49,8 @@ pub struct DecoderConfig {
     /// Device ID and command format of the MSC SysEx sent to MIDI out
     /// (spec §5.4; default all-call `0x7F`, Lighting (General) `0x01`).
     pub msc: MscTarget,
+    /// Device buffer size and sample format (cpal devices only).
+    pub audio: AudioOptions,
 }
 
 /// A running decoder worker. Dropping it stops the worker.
@@ -94,8 +100,9 @@ impl Drop for DecoderHandle {
 
 /// Samples per pull from the source.
 const CHUNK: usize = 512;
-/// Sleep when no input is buffered.
-const IDLE_SLEEP: Duration = Duration::from_millis(5);
+/// Longest wait for input before the loop checks the stop flag and the
+/// stall watchdog again (arriving samples end the wait at once).
+const IDLE_WAIT: Duration = Duration::from_millis(5);
 /// Minimum interval between `Stats` events.
 const STATS_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -125,10 +132,13 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
         MidiOut::Custom(sink) => Some(sink),
     };
 
-    let mut source = match cfg
-        .audio_in
-        .open(preferred_sample_rate, preferred_sample_rate as usize * 2)
-    {
+    let mut audio = cfg.audio.clone();
+    audio.digital = matches!(config.modulation, Modulation::Digital);
+    let mut source = match cfg.audio_in.open(
+        preferred_sample_rate,
+        preferred_sample_rate as usize * 2,
+        &audio,
+    ) {
         Ok(s) => s,
         Err(e) => {
             ev.log(format!("Audio input error: {}", e));
@@ -137,10 +147,16 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     };
     let stream_sample_rate = source.sample_rate();
 
+    let details = source.describe();
     ev.log(format!(
-        "Audio in {} Hz, {} ch (ch0). est latency {:.0} ms.",
+        "Audio in {} Hz, {} ch (ch0){}. est latency {:.1} ms.",
         stream_sample_rate,
         source.channels(),
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", details)
+        },
         est_latency
     ));
     if stream_sample_rate != preferred_sample_rate {
@@ -246,7 +262,7 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
                     ev.log(message);
                 }
             }
-            thread::sleep(IDLE_SLEEP);
+            source.wait(IDLE_WAIT);
             continue;
         }
 

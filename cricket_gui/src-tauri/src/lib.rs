@@ -16,9 +16,9 @@ pub mod settings;
 
 use cricket_core::phy::PhyConfig;
 use cricket_engine::{
-    audio, format_message, link_state_name, midi, AudioIn, AudioOut, DecoderConfig, DecoderHandle,
-    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, MscTarget,
-    TransportMessage,
+    audio, format_message, link_state_name, midi, AudioIn, AudioOptions, AudioOut, DecoderConfig,
+    DecoderHandle, DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
+    MscTarget, TransportMessage,
 };
 use settings::{load_settings, save_settings, AppSettings};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -326,6 +326,7 @@ fn start_decoder(
         profile,
         link_dead_ms: None,
         msc,
+        audio: AudioOptions::default(),
     })
     .map_err(|e| e.to_string())?;
     let run = Run {
@@ -370,6 +371,7 @@ fn start_encoder(
         },
         profile,
         simulate,
+        audio: AudioOptions::default(),
     })
     .map_err(|e| e.to_string())?;
     let run = Run {

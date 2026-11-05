@@ -1,14 +1,17 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use cricket_core::pathcheck::{self, PathImpairment, PathReport, Verdict};
 use cricket_core::phy::PhyConfig;
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, MscTarget, TransportMessage};
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
-use cricket_engine::measure_midi_loopback;
 use cricket_engine::{
-    audio, format_message, midi, AlarmKind, AudioIn, AudioOut, DecoderConfig, DecoderHandle,
-    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
+    audio, format_message, measure_chord_loopback, measure_midi_loopback_with, measure_throughput,
+    midi, AlarmKind, AudioIn, AudioOptions, AudioOut, DecoderConfig, DecoderHandle, DeviceSelector,
+    EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, Pacing, SampleFormatPref,
 };
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = None)]
@@ -20,9 +23,22 @@ struct Cli {
     /// dedicated clean line without EQ: ltc (4800 bit/s), ltc2400, ltc4800,
     /// ltc9600, and with Reed–Solomon body FEC ltc_fec, ltc2400_fec,
     /// ltc9600_fec; for digital lines only (Dante, MADI, AES; >= 48 kHz)
-    /// ltc14400 and ltc14400_fec
+    /// ltc14400 and ltc14400_fec; or (experimental) digital, packets in the
+    /// sample values of a bit-transparent digital path (check it with
+    /// `cricket pathcheck` first). A `+digital` suffix (e.g.
+    /// ltc9600+digital) makes a decoder also accept digital-profile frames
     #[arg(long, global = true, default_value = "robust")]
     profile: String,
+
+    /// Audio device buffer size in frames, e.g. 64–512 (default: the host's;
+    /// ALSA uses 100 ms). Smaller is faster, too small drops out
+    #[arg(long, global = true, value_name = "FRAMES")]
+    buffer_frames: Option<u32>,
+
+    /// Audio sample format: auto (device default; the digital profile
+    /// prefers i32, then f32, then i16), f32, i16 or i32
+    #[arg(long, global = true, value_name = "FORMAT", default_value = "auto")]
+    sample_format: SampleFormatPref,
 
     #[command(subcommand)]
     command: Commands,
@@ -100,18 +116,102 @@ enum Commands {
     /// Encode→decode loopback with latency measurement (in-process)
     Loopback {
         /// Profiles to measure, comma-separated (e.g.
-        /// `robust,robust_repeat,fast,ltc_fec`)
+        /// `robust,robust_repeat,fast,ltc_fec,digital`)
         #[arg(long, value_delimiter = ',', default_value = "fast,robust")]
         profiles: Vec<String>,
         /// NoteOns per profile
         #[arg(long, default_value_t = LOOPBACK_NOTES)]
         notes: usize,
+        /// Also strike this many chords (all notes at once) and report the
+        /// latency of their first and last note
+        #[arg(long, default_value_t = 0)]
+        chords: usize,
+        /// Notes per chord
+        #[arg(long, default_value_t = 4)]
+        chord_size: usize,
+        /// Also send this many Program Changes at once and report messages/s
+        #[arg(long, default_value_t = 0)]
+        throughput: usize,
+        /// Deliver audio to the decoder as soon as it is written instead of
+        /// at the sample rate: the engine's own overhead, without airtime
+        #[arg(long, default_value_t = false)]
+        zero_airtime: bool,
+    },
+    /// Is an audio path bit-transparent? (for the `digital` profile)
+    ///
+    /// Run `pathcheck send` on the sending machine and `pathcheck receive`
+    /// on the receiving one (or `pathcheck loop` when both ends are on one
+    /// machine). The receiver reports whether every sample arrived
+    /// unchanged and, if not, what the path did (gain, word length, dither,
+    /// sample-rate conversion, polarity, offset, noise). The test signal
+    /// peaks at -48 dBFS. `pathcheck sim` runs simulated paths in-process.
+    Pathcheck {
+        #[command(subcommand)]
+        action: PathcheckAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PathcheckAction {
+    /// Play the test pattern (until Ctrl-C, or for --seconds)
+    Send {
+        /// Output audio device index (default device if neither is given)
+        #[arg(short, long)]
+        audio_out: Option<usize>,
+        /// Output audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_out")]
+        audio_out_name: Option<String>,
+        /// Stop after this many seconds
+        #[arg(long)]
+        seconds: Option<f64>,
+        /// Write the pattern to a 32-bit float WAV file instead of playing it
+        #[arg(long, value_name = "FILE")]
+        wav_out: Option<String>,
+    },
+    /// Record the far end of the path and analyse it
+    Receive {
+        /// Input audio device index (default device if neither is given)
+        #[arg(short, long)]
+        audio_in: Option<usize>,
+        /// Input audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_in")]
+        audio_in_name: Option<String>,
+        /// Seconds to record
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f64,
+        /// Analyse this WAV recording instead of recording a device
+        #[arg(long, value_name = "FILE")]
+        wav_in: Option<String>,
+    },
+    /// Send and receive at once on this machine (output -> path -> input)
+    Loop {
+        #[arg(short, long)]
+        audio_out: Option<usize>,
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_out")]
+        audio_out_name: Option<String>,
+        #[arg(short = 'i', long)]
+        audio_in: Option<usize>,
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_in")]
+        audio_in_name: Option<String>,
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f64,
+    },
+    /// Simulated paths, in-process (no hardware): `all` for the table, or
+    /// one of the names it lists for the full report
+    Sim {
+        #[arg(default_value = "all")]
+        path: String,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let profile = cli.profile.as_str();
+    let audio = AudioOptions {
+        buffer_frames: cli.buffer_frames,
+        sample_format: cli.sample_format,
+        digital: false,
+    };
 
     match &cli.command {
         Commands::Encode {
@@ -126,6 +226,7 @@ fn main() -> Result<()> {
                 selector(*audio_out, audio_out_name),
                 *simulate,
                 profile,
+                &audio,
             )?;
         }
         Commands::Decode {
@@ -144,6 +245,7 @@ fn main() -> Result<()> {
                     command_format: *msc_format,
                 },
                 profile,
+                &audio,
             )?;
         }
         Commands::ListDevices => {
@@ -152,9 +254,22 @@ fn main() -> Result<()> {
         Commands::Test { wav_out, wav_in } => {
             run_test_mode(wav_out.as_deref(), wav_in.as_deref(), profile)?;
         }
-        Commands::Loopback { profiles, notes } => {
-            run_loopback_metrics(profiles, *notes)?;
+        Commands::Loopback {
+            profiles,
+            notes,
+            chords,
+            chord_size,
+            throughput,
+            zero_airtime,
+        } => {
+            let pacing = if *zero_airtime {
+                Pacing::Instant
+            } else {
+                Pacing::RealTime
+            };
+            run_loopback_metrics(profiles, *notes, *chords, *chord_size, *throughput, pacing)?;
         }
+        Commands::Pathcheck { action } => run_pathcheck(action, &audio)?,
     }
 
     Ok(())
@@ -274,10 +389,31 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>, profile: &str) -> 
 
 const LOOPBACK_NOTES: usize = 20;
 
-fn run_loopback_metrics(profiles: &[String], notes: usize) -> Result<()> {
-    println!("Cricket engine loopback latency (paced MIDI in → MIDI out)...");
+fn run_loopback_metrics(
+    profiles: &[String],
+    notes: usize,
+    chords: usize,
+    chord_size: usize,
+    throughput: usize,
+    pacing: Pacing,
+) -> Result<()> {
+    println!(
+        "Cricket engine loopback latency ({} MIDI in → MIDI out)...",
+        match pacing {
+            Pacing::RealTime => "paced",
+            Pacing::Instant => "zero-airtime",
+        }
+    );
+    // Sub-millisecond results need more digits.
+    let ms = |v: f64| {
+        if v < 10.0 {
+            format!("{:.2}", v)
+        } else {
+            format!("{:.1}", v)
+        }
+    };
     for profile in profiles {
-        let s = measure_midi_loopback(profile, notes)?;
+        let s = measure_midi_loopback_with(profile, notes, pacing)?;
         if s.n < notes {
             return Err(anyhow!(
                 "{}: only {} of {} NoteOns delivered",
@@ -287,10 +423,191 @@ fn run_loopback_metrics(profiles: &[String], notes: usize) -> Result<()> {
             ));
         }
         println!(
-            "{}: n={} mean={:.1} ms p95={:.1} ms jitter={:.1} ms",
-            profile, s.n, s.mean_ms, s.p95_ms, s.jitter_ms
+            "{}: n={} mean={} ms p95={} ms jitter={} ms",
+            profile,
+            s.n,
+            ms(s.mean_ms),
+            ms(s.p95_ms),
+            ms(s.jitter_ms)
+        );
+        if chords > 0 {
+            let c = measure_chord_loopback(profile, chords, chord_size)?;
+            println!(
+                "{}: {}-note chords n={} first note mean={} ms, last note mean={} ms p95={} ms",
+                profile,
+                chord_size,
+                c.last.n,
+                ms(c.first.mean_ms),
+                ms(c.last.mean_ms),
+                ms(c.last.p95_ms)
+            );
+        }
+        if throughput > 0 {
+            let rate = measure_throughput(profile, throughput)?;
+            println!(
+                "{}: throughput {:.0} messages/s ({} Program Changes)",
+                profile, rate, throughput
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_report(report: &PathReport) {
+    for line in report.lines() {
+        println!("  {}", line);
+    }
+}
+
+fn stream_line(what: &str, info: &cricket_engine::pathcheck::StreamInfo) -> String {
+    format!(
+        "{} {} Hz, {} ch{}",
+        what,
+        info.0,
+        info.1,
+        if info.2.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", info.2)
+        }
+    )
+}
+
+/// Exit status 1 when the digital profile would not work.
+fn finish_pathcheck(report: &PathReport) -> Result<()> {
+    if matches!(report.verdict, Verdict::NoSignal | Verdict::Unusable) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<()> {
+    use cricket_engine::pathcheck as engine_pc;
+    match action {
+        PathcheckAction::Send {
+            audio_out,
+            audio_out_name,
+            seconds,
+            wav_out,
+        } => {
+            if let Some(path) = wav_out {
+                let secs = seconds.unwrap_or(10.0);
+                let periods = (secs * 48_000.0 / pathcheck::PERIOD as f64).ceil() as usize;
+                write_wav_f32(path, 48_000, &pathcheck::pattern_samples(periods))
+                    .map_err(|e| anyhow!(e))?;
+                println!(
+                    "Wrote {:.1} s of the path-check pattern (48 kHz, 32-bit float) to {}",
+                    periods as f64 * pathcheck::PERIOD as f64 / 48_000.0,
+                    path
+                );
+                return Ok(());
+            }
+            let stop = AtomicBool::new(false);
+            engine_pc::play_pattern(
+                AudioOut::Device(selector(*audio_out, audio_out_name)),
+                options,
+                seconds.map(Duration::from_secs_f64),
+                &stop,
+                |info| {
+                    println!(
+                        "Cricket path check: playing the test pattern ({}; peak -48 dBFS, \
+                         mono on every channel). Ctrl-C to stop.",
+                        stream_line("output", info)
+                    );
+                },
+            )?;
+        }
+        PathcheckAction::Receive {
+            audio_in,
+            audio_in_name,
+            seconds,
+            wav_in,
+        } => {
+            let report = if let Some(path) = wav_in {
+                let (rate, samples) = read_wav_f32(path).map_err(|e| anyhow!(e))?;
+                println!(
+                    "Cricket path check: analysing {} ({} samples at {} Hz, channel 1)",
+                    path,
+                    samples.len(),
+                    rate
+                );
+                pathcheck::analyze(&samples, rate)
+            } else {
+                println!("Cricket path check: recording {:.1} s ...", seconds);
+                let (samples, info) = engine_pc::capture(
+                    AudioIn::Device(selector(*audio_in, audio_in_name)),
+                    options,
+                    Duration::from_secs_f64(*seconds),
+                )?;
+                println!("  {} (channel 1)", stream_line("input", &info));
+                pathcheck::analyze(&samples, info.0)
+            };
+            print_report(&report);
+            finish_pathcheck(&report)?;
+        }
+        PathcheckAction::Loop {
+            audio_out,
+            audio_out_name,
+            audio_in,
+            audio_in_name,
+            seconds,
+        } => {
+            println!(
+                "Cricket path check: loop through this machine, {:.1} s ...",
+                seconds
+            );
+            let (samples, out_info, in_info) = engine_pc::loop_check(
+                AudioOut::Device(selector(*audio_out, audio_out_name)),
+                AudioIn::Device(selector(*audio_in, audio_in_name)),
+                options,
+                Duration::from_secs_f64(*seconds),
+            )?;
+            println!("  {}", stream_line("output", &out_info));
+            println!("  {} (channel 1)", stream_line("input", &in_info));
+            let report = pathcheck::analyze(&samples, in_info.0);
+            print_report(&report);
+            finish_pathcheck(&report)?;
+        }
+        PathcheckAction::Sim { path } => run_pathcheck_sim(path)?,
+    }
+    Ok(())
+}
+
+fn run_pathcheck_sim(name: &str) -> Result<()> {
+    let presets = PathImpairment::presets();
+    let pattern = pathcheck::pattern_samples(30);
+    if name != "all" {
+        let Some((n, path)) = presets.iter().find(|(n, _)| *n == name) else {
+            let names: Vec<&str> = presets.iter().map(|(n, _)| *n).collect();
+            return Err(anyhow!(
+                "unknown path {:?}; one of: all, {}",
+                name,
+                names.join(", ")
+            ));
+        };
+        println!("Cricket path check, simulated path `{}` ({:?}):", n, path);
+        let report = pathcheck::analyze(&pathcheck::simulate(path, &pattern), 48_000);
+        print_report(&report);
+        return Ok(());
+    }
+    println!("Cricket path check, simulated paths (3 s of pattern each):");
+    println!(
+        "{:<24} {:<10} {:>10} {:>12} {:>8}",
+        "path", "verdict", "bit-exact", "symbols ok", "probes"
+    );
+    for (n, path) in &presets {
+        let r = pathcheck::analyze(&pathcheck::simulate(path, &pattern), 48_000);
+        println!(
+            "{:<24} {:<10} {:>9.2}% {:>11.4}% {:>4}/{:<3}",
+            n,
+            format!("{:?}", r.verdict),
+            100.0 * r.exact as f64 / r.compared.max(1) as f64,
+            100.0 * r.symbols_ok as f64 / r.symbols.max(1) as f64,
+            r.probes_ok,
+            r.probes_expected
         );
     }
+    println!("Details: cricket pathcheck sim <path>");
     Ok(())
 }
 
@@ -322,6 +639,7 @@ fn run_decoder(
     midi_out: DeviceSelector,
     msc: MscTarget,
     profile: &str,
+    audio: &AudioOptions,
 ) -> Result<()> {
     println!("Initializing Cricket decoder...");
     let midi_out = match midi_out {
@@ -338,6 +656,7 @@ fn run_decoder(
         profile: profile.into(),
         link_dead_ms: None,
         msc,
+        audio: audio.clone(),
     })?;
     print_events(dec.events(), "Decoder")
 }
@@ -347,6 +666,7 @@ fn run_encoder(
     audio_out: DeviceSelector,
     simulate: bool,
     profile: &str,
+    audio: &AudioOptions,
 ) -> Result<()> {
     println!("Initializing Cricket encoder...");
     let midi_in = match midi_in {
@@ -365,6 +685,7 @@ fn run_encoder(
         midi_in,
         profile: profile.into(),
         simulate,
+        audio: audio.clone(),
     })?;
     print_events(enc.events(), "Encoder")
 }

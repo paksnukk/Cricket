@@ -1,17 +1,23 @@
 //! TX worker: MIDI in / injected messages → `CricketModemTx` → audio out.
+//!
+//! Latency: MIDI input and [`EncoderHandle::send`] wake the worker through a
+//! condition variable (no polling interval), and the worker encodes every
+//! queued user message whose audio fits below the refill threshold at once,
+//! so a chord goes out back to back in the next audio callback. The device
+//! buffer ([`AudioOptions::buffer_frames`]) is then the main delay.
 
-use crate::audio::{AudioOut, AudioSink};
+use crate::audio::{AudioOptions, AudioOut, AudioSink};
 use crate::events::{format_message, AlarmKind, EngineEvent};
 use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::Result;
 use cricket_core::modem::{repetition_samples, CricketModemTx};
-use cricket_core::phy::PhyConfig;
+use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::{midi_input, MidiInput, TransportMessage, TxScheduler};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,11 +26,13 @@ pub struct EncoderConfig {
     pub audio_out: AudioOut,
     pub midi_in: MidiIn,
     /// PHY profile name (see `PhyConfig::from_name`: "robust", "robust_repeat",
-    /// "fast", "ltc", "ltc_fec", …; unknown names mean robust).
+    /// "fast", "ltc", "ltc_fec", "digital", …; unknown names mean robust).
     pub profile: String,
     /// Send a C-major scale (one note per second). Also on when `midi_in`
     /// is [`MidiIn::None`].
     pub simulate: bool,
+    /// Device buffer size and sample format (cpal devices only).
+    pub audio: AudioOptions,
 }
 
 /// What the MIDI callback and [`EncoderHandle::send`] hand to the worker.
@@ -34,7 +42,37 @@ enum Incoming {
     Rejected(String),
 }
 
-type Pending = Arc<Mutex<VecDeque<Incoming>>>;
+/// Messages for the worker and the condition variable that wakes it.
+#[derive(Default)]
+struct PendingQueue {
+    queue: Mutex<VecDeque<Incoming>>,
+    arrived: Condvar,
+}
+
+impl PendingQueue {
+    fn push(&self, item: Incoming) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.push_back(item);
+            self.arrived.notify_one();
+        }
+    }
+
+    /// Everything queued; waits up to `timeout` for something if empty.
+    fn take(&self, timeout: Duration) -> Vec<Incoming> {
+        let Ok(mut q) = self.queue.lock() else {
+            return Vec::new();
+        };
+        if q.is_empty() && !timeout.is_zero() {
+            q = match self.arrived.wait_timeout(q, timeout) {
+                Ok((q, _)) => q,
+                Err(_) => return Vec::new(),
+            };
+        }
+        q.drain(..).collect()
+    }
+}
+
+type Pending = Arc<PendingQueue>;
 
 /// A running encoder worker. Dropping it stops the worker.
 pub struct EncoderHandle {
@@ -48,7 +86,7 @@ impl EncoderHandle {
     /// this call; they are reported as `Log` events, after which the worker
     /// either continues without MIDI in or ends with `Stopped`.
     pub fn start(config: EncoderConfig) -> Result<Self> {
-        let pending: Pending = Arc::new(Mutex::new(VecDeque::new()));
+        let pending: Pending = Arc::new(PendingQueue::default());
         let pending_w = pending.clone();
         let (worker, events) = Worker::spawn("cricket-encoder", move |ev, stop| {
             run(config, pending_w, ev, stop)
@@ -62,9 +100,7 @@ impl EncoderHandle {
 
     /// Queue a message for transmission (same queue as MIDI input).
     pub fn send(&self, msg: TransportMessage) {
-        if let Ok(mut q) = self.pending.lock() {
-            q.push_back(Incoming::Message(msg));
-        }
+        self.pending.push(Incoming::Message(msg));
     }
 
     /// The worker's event channel.
@@ -96,12 +132,15 @@ impl Drop for EncoderHandle {
     }
 }
 
-/// Loop period.
+/// Longest sleep of the loop (heartbeats, simulated notes, status events and
+/// the stop flag are checked at least this often; MIDI input wakes it at once).
 const TICK: Duration = Duration::from_millis(5);
+/// Shortest sleep while waiting for buffered audio to drain.
+const MIN_WAIT: Duration = Duration::from_micros(500);
 /// Simulated note interval.
 const SIM_INTERVAL: Duration = Duration::from_millis(1000);
-/// Buffered audio below which the next message is encoded. Above `TICK`, so
-/// back-to-back messages play without a gap.
+/// Buffered audio below which the next user message is encoded (spec
+/// §5.5). Above `TICK`, so back-to-back messages play without a gap.
 const REFILL_MS: u64 = 10;
 /// Minimum interval between `TxStatus` events.
 const STATUS_INTERVAL: Duration = Duration::from_millis(200);
@@ -126,9 +165,7 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
                     MidiInput::Rejected(e) => Incoming::Rejected(format!("{} — not sent", e)),
                     MidiInput::Ignored => return,
                 };
-                if let Ok(mut q) = pending.lock() {
-                    q.push_back(incoming);
-                }
+                pending.push(incoming);
             })
         }
     };
@@ -157,12 +194,20 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         },
     };
 
-    let ring_floor = (preferred_sample_rate as u64 * 5 / 1000).max(1) as usize;
+    // The ring holds the refill threshold plus one message, and at least two
+    // messages (5 ms minimum).
+    let ring_floor = (preferred_sample_rate as u64 * 5 / 1000).max(1);
     let est_msg = repetition_samples(&config) * config.repetition_k.max(1) as u64;
-    let ring_samples = (est_msg * 2).max(ring_floor as u64) as usize;
+    let refill_est = preferred_sample_rate as u64 * REFILL_MS / 1000;
+    let ring_samples = (est_msg * 2).max(refill_est + est_msg).max(ring_floor) as usize;
 
     let drops = AtomicU64::new(0);
-    let mut sink = match cfg.audio_out.open(preferred_sample_rate, ring_samples) {
+    let mut audio = cfg.audio.clone();
+    audio.digital = matches!(config.modulation, Modulation::Digital);
+    let mut sink = match cfg
+        .audio_out
+        .open(preferred_sample_rate, ring_samples, &audio)
+    {
         Ok(s) => s,
         Err(e) => {
             ev.log(format!("Audio output error: {}", e));
@@ -171,10 +216,16 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     };
     let stream_sample_rate = sink.sample_rate();
 
+    let details = sink.describe();
     ev.log(format!(
-        "Audio out {} Hz, {} ch. est latency {:.0} ms.",
+        "Audio out {} Hz, {} ch{}. est latency {:.1} ms.",
         stream_sample_rate,
         sink.channels(),
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", details)
+        },
         est_latency
     ));
     if stream_sample_rate != preferred_sample_rate {
@@ -183,7 +234,12 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     let message_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
     let heartbeat_samples =
         config.sample_rate_hz as u64 * config.heartbeat_interval_ms as u64 / 1000;
-    let refill_samples = config.sample_rate_hz as u64 * REFILL_MS / 1000;
+    // User messages are encoded while less than 10 ms is buffered (spec
+    // §5.5); refreshes and heartbeats only when less than one message is,
+    // so with short messages (LTC at high rates, digital) a note arriving
+    // meanwhile waits behind at most one of them.
+    let refill_user = config.sample_rate_hz as u64 * REFILL_MS / 1000;
+    let refill_idle = refill_user.min(message_samples);
 
     if let Err(e) = sink.start() {
         ev.log(format!("Failed to play output: {}", e));
@@ -199,14 +255,15 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     let mut sim_sounding: Option<u8> = None;
     let mut last_status = Instant::now();
     let sink = sink.as_mut();
+    let rate = f64::from(stream_sample_rate.max(1));
+    let mut wait = Duration::ZERO;
 
     while !stop.load(Ordering::SeqCst) {
-        let tx_time = (stream_start.elapsed().as_secs_f64() * f64::from(stream_sample_rate)) as u64;
-
-        let incoming: Vec<Incoming> = pending
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default();
+        let incoming = pending.take(wait);
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let tx_time = (stream_start.elapsed().as_secs_f64() * rate) as u64;
         for item in incoming {
             match item {
                 Incoming::Message(msg) => scheduler.push(msg, tx_time),
@@ -251,23 +308,33 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
             last_sim = Instant::now();
         }
 
-        // Choose the next message only when the current one has nearly
-        // played out, so a note that arrives meanwhile does not wait behind an
-        // already encoded refresh or heartbeat.
-        let buffered = sink.buffered() as u64;
-        if buffered < refill_samples {
-            if let Some(result) = scheduler.poll_detailed(tx_time + buffered) {
-                if result.user {
-                    let (kind, payload) = format_message(&result.msg);
-                    ev.log(format!("TX {} {}", kind, payload).trim_end().to_string());
-                }
-                let audio = if matches!(result.msg, TransportMessage::Heartbeat) {
-                    tx.encode_heartbeat()
-                } else {
-                    tx.encode_message(&result.msg)
-                };
-                let _ = push_audio(sink, &audio, stop, &drops);
+        // Choose the next message only when the audio ahead of it has nearly
+        // played out, so a note that arrives meanwhile does not wait behind
+        // an already encoded refresh or heartbeat; encode all user messages
+        // that fit at once (a chord leaves in one audio callback).
+        loop {
+            let buffered = sink.buffered() as u64;
+            let limit = if scheduler.queued() > 0 {
+                refill_user
+            } else {
+                refill_idle
+            };
+            if buffered >= limit {
+                break;
             }
+            let Some(result) = scheduler.poll_detailed(tx_time + buffered) else {
+                break;
+            };
+            if result.user {
+                let (kind, payload) = format_message(&result.msg);
+                ev.log(format!("TX {} {}", kind, payload).trim_end().to_string());
+            }
+            let audio = if matches!(result.msg, TransportMessage::Heartbeat) {
+                tx.encode_heartbeat()
+            } else {
+                tx.encode_message(&result.msg)
+            };
+            push_audio(sink, &audio, stop, &drops);
         }
 
         while let Some(err) = sink.take_error() {
@@ -293,14 +360,26 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
             last_status = Instant::now();
         }
 
-        thread::sleep(TICK);
+        // Sleep until MIDI arrives, the buffer has drained to the refill
+        // threshold, or the next tick.
+        let buffered = sink.buffered() as u64;
+        let limit = if scheduler.queued() > 0 {
+            refill_user
+        } else {
+            refill_idle
+        };
+        wait = if buffered >= limit {
+            Duration::from_secs_f64((buffered - limit + 1) as f64 / rate).clamp(MIN_WAIT, TICK)
+        } else {
+            TICK
+        };
     }
 
     ev.log("Encoder stopped.");
 }
 
-/// Queue `samples`, waiting up to ~2 s per sample while the sink is full
-/// (then counting a drop). Returns the number of samples actually queued.
+/// Queue `samples`, waiting up to ~2 s while the sink is full (then counting
+/// the rest as dropped). Returns the number of samples actually queued.
 fn push_audio(
     sink: &mut dyn AudioSink,
     samples: &[f32],
@@ -308,23 +387,20 @@ fn push_audio(
     drops: &AtomicU64,
 ) -> usize {
     let mut pushed = 0usize;
-    for &sample in samples {
-        if stop.load(Ordering::Relaxed) {
+    let mut attempts = 0;
+    while pushed < samples.len() {
+        let n = sink.push(&samples[pushed..]);
+        pushed += n;
+        if pushed == samples.len() {
             break;
         }
-        let mut attempts = 0;
-        while sink.is_full() {
-            if stop.load(Ordering::Relaxed) || attempts > 2000 {
-                drops.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        if stop.load(Ordering::Relaxed) || attempts > 2000 {
+            drops.fetch_add((samples.len() - pushed) as u64, Ordering::Relaxed);
+            break;
+        }
+        if n == 0 {
             thread::sleep(Duration::from_millis(1));
             attempts += 1;
-        }
-        if sink.push(std::slice::from_ref(&sample)) == 0 {
-            drops.fetch_add(1, Ordering::Relaxed);
-        } else {
-            pushed += 1;
         }
     }
     pushed
