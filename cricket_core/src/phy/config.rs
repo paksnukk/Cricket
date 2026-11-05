@@ -193,6 +193,25 @@ impl PhyConfig {
         }
     }
 
+    /// Fast LTC profile for clean digital lines (Dante, MADI, AES; not part
+    /// of spec §6.5 yet): BMC at `bit_rate` with [`BmcParams::fast`],
+    /// uncoded 16-nibble body. `ltc14400` is 14400 bit/s.
+    pub fn ltc_fast_with_bit_rate(bit_rate: u32) -> Self {
+        Self {
+            modulation: Modulation::Bmc(BmcParams::fast(bit_rate)),
+            ..Self::ltc_with_bit_rate(bit_rate)
+        }
+    }
+
+    /// [`ltc_fast_with_bit_rate`](Self::ltc_fast_with_bit_rate) with the
+    /// RS16 parity-4 body (`ltc14400_fec`).
+    pub fn ltc_fast_fec_with_bit_rate(bit_rate: u32) -> Self {
+        Self {
+            fec: FecMode::Rs16 { parity: 4 },
+            ..Self::ltc_fast_with_bit_rate(bit_rate)
+        }
+    }
+
     /// Profile by name (case-insensitive, `-` = `_`). `robust_fec` is a
     /// deprecated alias of `robust` (its former name); unknown names mean
     /// the default, robust.
@@ -207,6 +226,8 @@ impl PhyConfig {
             "ltc_fec" | "ltc4800_fec" => Self::ltc_fec(),
             "ltc2400_fec" => Self::ltc_fec_with_bit_rate(2400),
             "ltc9600_fec" => Self::ltc_fec_with_bit_rate(9600),
+            "ltc14400" => Self::ltc_fast_with_bit_rate(14400),
+            "ltc14400_fec" => Self::ltc_fast_fec_with_bit_rate(14400),
             // "robust", its deprecated alias "robust_fec", and unknown names.
             _ => Self::robust(),
         }

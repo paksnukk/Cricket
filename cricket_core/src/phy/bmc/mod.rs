@@ -33,7 +33,9 @@
 //! * **Body** — the link-layer nibbles, MSB first (exactly what the MFSK phy
 //!   would send as tones), 4 bits per nibble.
 //! * **Postamble** — one `1` bit: terminates the last body bit with a
-//!   transition (its length could not be measured otherwise).
+//!   transition (its length could not be measured otherwise). The fast
+//!   profiles (`ltc14400`, [`BmcParams::fast`]) send none: the transition
+//!   into the tail half cell already terminates the last bit.
 //! * **Tail** — one half cell at the last level, then a shaped fade to 0.
 //!
 //! The burst is followed by `gap_bits` of silence before the next repetition
@@ -70,7 +72,9 @@
 //!
 //! Per-sample cost: the filters, envelope and Schmitt trigger as before,
 //! one box-sum update (`half cell` adds), and the correlator (22 multiply-
-//! adds plus 22 squares); per bit, two half-cell integrals.
+//! adds plus 22 squares); per bit, two half-cell integrals. With
+//! `sync_fractional` (fast profiles) each of the 22 boxes is an exact
+//! half-cell integral of 2-3 weighted samples instead (~60 multiply-adds).
 
 mod rx;
 mod tx;
@@ -124,6 +128,17 @@ pub struct BmcParams {
     /// A sync whose correlation reaches this replaces any lock (body data
     /// cannot exceed 0.82 on a clean line).
     pub resync_certain: f32,
+    /// Sync correlator boxes exactly one half cell long, at exact
+    /// (interpolated) half-cell delays, instead of rounded to whole samples.
+    /// Needed when a half cell is only ~1.5-2.5 samples (bit rates above
+    /// 9600 at 48 kHz); off for the original profiles (unchanged receiver).
+    pub sync_fractional: bool,
+    /// After a completed body, hold syncs to the replacement rule (as if
+    /// the body were still being read) until the next burst's sync could
+    /// first arrive. The end of a burst can correlate like a sync (~0.85);
+    /// when real syncs score only ~0.9 (bit rates above 9600 at 48 kHz)
+    /// such a false lock would otherwise hide the next packet of a chord.
+    pub post_body_guard: bool,
     /// A transition within this many half cells of the sync correlation
     /// peak sets the body start (0 = use the peak).
     pub sync_snap: f32,
@@ -182,6 +197,8 @@ impl BmcParams {
             sync_snap: 0.5,
             resync_margin: 0.05,
             resync_certain: 0.95,
+            sync_fractional: false,
+            post_body_guard: false,
             max_rate_error: 0.05,
             rx_window_trim: 0.15,
             rx_window_outer_trim: 0.15,
@@ -194,6 +211,26 @@ impl BmcParams {
             min_body_margin: 0.3,
             min_on_grid: 0.6,
             erase_margin: 0.0,
+        }
+    }
+
+    /// Parameters of the fast profiles for clean digital lines (`ltc14400`,
+    /// `ltc14400_fec`; docs/proposals/ltc-bmc.md §10), where a half cell is
+    /// only ~1.7 samples at 48 kHz. Wire: full-width (sinusoidal) edges,
+    /// so an all-ones preamble is a pure tone at the bit rate and the burst
+    /// stays inside a 20 kHz converter passband; no postamble (the tail
+    /// half cell terminates the last bit); one cell of silence between
+    /// bursts. Receiver: fractional sync boxes, a slower rate loop and the
+    /// post-body sync guard.
+    pub fn fast(bit_rate: u32) -> Self {
+        Self {
+            postamble_bits: 0,
+            gap_bits: 1,
+            edge_frac: 1.0,
+            pll_rate_gain: 0.01,
+            sync_fractional: true,
+            post_body_guard: true,
+            ..Self::new(bit_rate)
         }
     }
 

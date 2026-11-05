@@ -1,5 +1,5 @@
 //! Experimental LTC (BMC) profiles with Reed–Solomon body FEC (`ltc_fec`,
-//! `ltc2400_fec`, `ltc9600_fec`) and the soft-decision BMC receiver they
+//! `ltc2400_fec`, `ltc9600_fec`, `ltc14400_fec`) and the soft-decision BMC receiver they
 //! rely on: loopback, sync sweep, erasure repair, false-lock recovery and
 //! noise rejection. Measurements live in `ltc_fec_ab.rs`.
 
@@ -18,6 +18,7 @@ fn fec_profiles() -> Vec<(&'static str, PhyConfig)> {
         ("ltc2400_fec", PhyConfig::from_name("ltc2400_fec")),
         ("ltc_fec", PhyConfig::ltc_fec()),
         ("ltc9600_fec", PhyConfig::from_name("ltc9600_fec")),
+        ("ltc14400_fec", PhyConfig::from_name("ltc14400_fec")),
     ]
 }
 
@@ -26,6 +27,7 @@ fn all_profiles() -> Vec<(&'static str, PhyConfig)> {
         ("ltc2400", PhyConfig::ltc_with_bit_rate(2400)),
         ("ltc", PhyConfig::ltc()),
         ("ltc9600", PhyConfig::ltc_with_bit_rate(9600)),
+        ("ltc14400", PhyConfig::from_name("ltc14400")),
     ];
     v.extend(fec_profiles());
     v
@@ -76,6 +78,7 @@ fn profile_selection() {
         ("ltc4800_fec", 4800),
         ("ltc2400_fec", 2400),
         ("ltc9600_fec", 9600),
+        ("ltc14400_fec", 14400),
     ] {
         let c = PhyConfig::from_name(name);
         assert_eq!(c.fec, FecMode::Rs16 { parity: 4 }, "{name}");

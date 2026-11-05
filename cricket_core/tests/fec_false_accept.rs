@@ -1,5 +1,5 @@
 //! False-accept analysis for the FEC profiles (`ltc_fec`, `ltc2400_fec`,
-//! `ltc9600_fec`, `robust`): how often non-Cricket audio turns into a
+//! `ltc9600_fec`, `ltc14400_fec`, `robust`): how often non-Cricket audio turns into a
 //! message. See `docs/proposals/fec.md` §9 for the analysis and target.
 //!
 //! A false message needs (1) a false lock whose body survives the phy gates
@@ -16,7 +16,7 @@
 //!
 //! Environment: `FALSE_SECONDS` (audio per signal, default 120),
 //! `FALSE_PROFILES` (comma-separated: ltc_fec, ltc2400_fec, ltc9600_fec,
-//! robust), `FALSE_RANDOM_BODIES` (simulated random bodies per row,
+//! ltc14400_fec, robust), `FALSE_RANDOM_BODIES` (simulated random bodies per row,
 //! default 200000). Results are recorded in `docs/proposals/fec.md` §9.
 
 mod support;
@@ -550,9 +550,9 @@ fn random_bodies_rarely_reach_the_crc() {
 
 /// Worst cases measured for the false-accept analysis, a few seconds each:
 /// MFSK traffic into `ltc2400_fec`, and transmitters without FEC on the
-/// same phy (uncoded LTC into `ltc_fec`, uncoded Robust repeat / Fast
-/// into `robust`). Before the weight bound and the whitening these reached
-/// the CRC with 1.7 / 1.8 / 2.3 candidates per false body.
+/// same phy (uncoded LTC into `ltc_fec` and `ltc14400_fec`, uncoded Robust
+/// repeat / Fast into `robust`). Before the weight bound and the whitening
+/// these reached the CRC with 1.7 / 1.8 / 2.3 candidates per false body.
 #[test]
 fn worst_case_audio_rarely_reaches_the_crc() {
     let ltc_fec = PhyConfig::ltc_fec();
@@ -578,6 +578,14 @@ fn worst_case_audio_rarely_reaches_the_crc() {
             ltc_fec,
             bmc_traffic(&uncoded, 2.0, 22),
             0.15,
+        ),
+        (
+            "uncoded LTC -> ltc14400_fec",
+            PhyConfig::from_name("ltc14400_fec"),
+            // Fewer false bodies per second (the next burst's sync
+            // replaces most false locks), so more audio.
+            bmc_traffic(&PhyConfig::from_name("ltc14400"), 20.0, 24),
+            0.4,
         ),
         (
             "robust_repeat/fast -> robust",
@@ -606,7 +614,10 @@ fn false_accept_report() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120.0);
-    let keys = env_list("FALSE_PROFILES", "ltc_fec,ltc2400_fec,ltc9600_fec,robust");
+    let keys = env_list(
+        "FALSE_PROFILES",
+        "ltc_fec,ltc2400_fec,ltc9600_fec,ltc14400_fec,robust",
+    );
     let (a_len, a_strict) = analytic_struct();
     for t in TYPES {
         println!("{t:?}: {} canonical payloads", canonical_payloads(t));

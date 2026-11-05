@@ -182,16 +182,49 @@ pub struct BmcRx {
     box_len: usize,
     /// Template taps: (delay in samples, sign), newest half cell first.
     taps: Vec<(usize, f32)>,
+    /// `sync_fractional`: the template as weights over history delays, for
+    /// boxes ending 0, 1/2 and 3/2 samples before the end of the newest
+    /// sample ([`FRAC_BACKS`]). In each set box `j` (same order as `taps`)
+    /// is the exact half-cell integral `j` to `j + 1` half cells before
+    /// that end (sample `d` covers `[d, d + 1]` samples before the newest
+    /// sample's end). Empty otherwise.
+    frac_boxes: Vec<Vec<Vec<(usize, f32)>>>,
     /// Last two squared normalized correlations.
     rho1: f32,
     rho2: f32,
     pending: Option<SyncPeak>,
+    /// `post_body_guard`: until this position (where the next burst's sync
+    /// can first be), syncs are held to the replacement rule against the
+    /// last body's sync correlation (the second field), as if that body were
+    /// still being read.
+    guard: Option<(Pos, f32)>,
     // Decoder
     body: Option<Body>,
     link_state: LinkState,
     expected_body_nibbles: usize,
     max_erasures: usize,
     last_confidence_db: f32,
+}
+
+/// Box end offsets of [`BmcRx::frac_boxes`] (samples back from the newest
+/// sample's end): the per-sample output, and the half-sample points either
+/// side of the sample before it (a peak candidate).
+const FRAC_BACKS: [f32; 3] = [0.0, 0.5, 1.5];
+
+/// Sample weights of a box `len` samples long that ends `start` samples
+/// before the end of the newest sample (delay `d` covers `[d, d + 1]`).
+fn box_weights(start: f32, len: f32) -> Vec<(usize, f32)> {
+    let end = start + len;
+    let mut w = Vec::new();
+    let mut d = libm::floorf(start) as usize;
+    while (d as f32) < end {
+        let overlap = (d as f32 + 1.0).min(end) - (d as f32).max(start);
+        if overlap > 1e-6 {
+            w.push((d, overlap));
+        }
+        d += 1;
+    }
+    w
 }
 
 /// Nibble reliability in dB from a bit margin `m` in `0..=1`
@@ -239,6 +272,26 @@ impl BmcRx {
             .collect();
         let box_len = (libm::roundf(half_nominal) as usize).max(1);
         let boxes_len = (taps[n_taps - 1].0 + 1).next_power_of_two();
+        // Rounded boxes and taps are exact at 4800 and 2400 bit/s (48 kHz)
+        // but smear the template when a half cell is only 1.5-2.5 samples.
+        let frac_boxes: Vec<Vec<Vec<(usize, f32)>>> = if params.sync_fractional {
+            FRAC_BACKS
+                .iter()
+                .map(|&back| {
+                    (0..n_taps)
+                        .map(|j| box_weights(back + j as f32 * half_nominal, half_nominal))
+                        .collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let frac_span = (n_taps as f32 * half_nominal + FRAC_BACKS[2]) as usize + 3;
+        let history_len = if params.sync_fractional {
+            history_len.max(frac_span.next_power_of_two())
+        } else {
+            history_len
+        };
         Self {
             config,
             params,
@@ -261,9 +314,11 @@ impl BmcRx {
             boxes: vec![0.0; boxes_len],
             box_len,
             taps,
+            frac_boxes,
             rho1: 0.0,
             rho2: 0.0,
             pending: None,
+            guard: None,
             body: None,
             link_state: LinkState::Search,
             expected_body_nibbles: 16,
@@ -297,6 +352,7 @@ impl BmcRx {
     pub fn reset(&mut self) {
         self.body = None;
         self.pending = None;
+        self.guard = None;
         self.rho1 = 0.0;
         self.rho2 = 0.0;
         self.link_state = LinkState::Search;
@@ -406,28 +462,35 @@ impl BmcRx {
     /// Sync correlator, one output per sample (see the type docs).
     fn correlate(&mut self, index: u64, active: bool, events: &mut Vec<RxEvent>) {
         let hmask = self.history.len() - 1;
-        let mut b = 0.0;
-        for k in 0..self.box_len as u64 {
-            if k <= index {
-                b += self.history[(index - k) as usize & hmask];
-            }
-        }
-        let bmask = self.boxes.len() - 1;
-        self.boxes[index as usize & bmask] = b;
-
+        let fractional = self.params.sync_fractional;
         let mut rho = 0.0;
-        if active {
-            let mut c = 0.0;
-            let mut energy = 0.0;
-            for &(delay, sign) in &self.taps {
-                let v = self.boxes[(index as usize).wrapping_sub(delay) & bmask];
-                c += sign * v;
-                energy += v * v;
+        if fractional {
+            if active {
+                rho = self.frac_rho(index, 0);
             }
-            // Normalized correlation, squared: c^2 / (N sum v^2) <= 1.
-            let norm = self.taps.len() as f32 * energy;
-            if norm > 1e-12 {
-                rho = c * c / norm;
+        } else {
+            let mut b = 0.0;
+            for k in 0..self.box_len as u64 {
+                if k <= index {
+                    b += self.history[(index - k) as usize & hmask];
+                }
+            }
+            let bmask = self.boxes.len() - 1;
+            self.boxes[index as usize & bmask] = b;
+
+            if active {
+                let mut c = 0.0;
+                let mut energy = 0.0;
+                for &(delay, sign) in &self.taps {
+                    let v = self.boxes[(index as usize).wrapping_sub(delay) & bmask];
+                    c += sign * v;
+                    energy += v * v;
+                }
+                // Normalized correlation, squared: c^2 / (N sum v^2) <= 1.
+                let norm = self.taps.len() as f32 * energy;
+                if norm > 1e-12 {
+                    rho = c * c / norm;
+                }
             }
         }
 
@@ -456,6 +519,15 @@ impl BmcRx {
                     frac: t,
                 }
             };
+            // With fractional boxes the peak can fall between two samples,
+            // where it is up to ~0.1 higher at 1.7 samples per half cell:
+            // also evaluate the two half-sample points next to it, so a real
+            // sync scores ~0.95 or more (needed by the replacement rules).
+            let r1 = if fractional {
+                r1.max(self.frac_rho(index, 1)).max(self.frac_rho(index, 2))
+            } else {
+                r1
+            };
             if self.pending.is_none_or(|p| r1 > p.rho) {
                 self.pending = Some(SyncPeak { rho: r1, at });
             }
@@ -469,6 +541,29 @@ impl BmcRx {
                 self.pending = None;
                 self.on_sync(peak, events);
             }
+        }
+    }
+
+    /// Squared normalized sync correlation (`sync_fractional`) for boxes
+    /// ending `FRAC_BACKS[set]` samples before the end of sample `index`.
+    fn frac_rho(&self, index: u64, set: usize) -> f32 {
+        let hmask = self.history.len() - 1;
+        let mut c = 0.0;
+        let mut energy = 0.0;
+        for (w, &(_, sign)) in self.frac_boxes[set].iter().zip(&self.taps) {
+            let mut v = 0.0;
+            for &(d, wt) in w {
+                v += wt * self.history[(index as usize).wrapping_sub(d) & hmask];
+            }
+            c += sign * v;
+            energy += v * v;
+        }
+        // Normalized correlation, squared: c^2 / (N sum v^2) <= 1.
+        let norm = self.taps.len() as f32 * energy;
+        if norm > 1e-12 {
+            c * c / norm
+        } else {
+            0.0
         }
     }
 
@@ -504,14 +599,20 @@ impl BmcRx {
     }
 
     fn on_sync(&mut self, peak: SyncPeak, events: &mut Vec<RxEvent>) {
-        if let Some(body) = &self.body {
-            // Inside a body only a clearly stronger sync, or one that body
-            // data cannot produce, takes over.
+        // Inside a body (or its trailing guard) only a clearly stronger
+        // sync, or one that body data cannot produce, takes over.
+        let held = match (&self.body, self.guard) {
+            (Some(body), _) => Some(body.sync_rho),
+            (None, Some((until, rho))) if peak.at.since(until) < 0.0 => Some(rho),
+            _ => None,
+        };
+        if let Some(lock_rho) = held {
             let certain = self.params.resync_certain * self.params.resync_certain;
-            if peak.rho < body.sync_rho + self.params.resync_margin && peak.rho < certain {
+            if peak.rho < lock_rho + self.params.resync_margin && peak.rho < certain {
                 return;
             }
         }
+        self.guard = None;
         // The body starts at the nominal rate; a rate error is left to the
         // timing loop (a preamble estimate is too noisy at low SNR).
         let half = self.half_nominal;
@@ -662,6 +763,22 @@ impl BmcRx {
         if done {
             let mean = body.margin_sum / body.nibbles as f32;
             let on_grid = body.edges_on_grid as f32 / body.edges.max(1) as f32;
+            // Where the next burst's sync can first be (`post_body_guard`):
+            // the end of a burst (last body bits, postamble, tail, fade into
+            // silence) can look like a sync to the correlator.
+            let p = &self.params;
+            let units = (2 * p.postamble_bits + 2 * p.gap_bits + 2 * p.preamble_bits + 7) as f32
+                + p.edge_frac
+                - 2.0;
+            let t = body.grid(2 * body.bit) + units * body.half;
+            let whole = libm::floorf(t);
+            let guard = (
+                Pos {
+                    index: body.base + whole as u64,
+                    frac: t - whole,
+                },
+                body.sync_rho,
+            );
             self.body = None;
             if mean < self.params.min_body_margin || on_grid < self.params.min_on_grid {
                 // Noise-like body: a false lock (noise, MFSK tones). Dropping
@@ -671,6 +788,9 @@ impl BmcRx {
                 return;
             }
             self.last_confidence_db = margin_db(mean);
+            if self.params.post_body_guard {
+                self.guard = Some(guard);
+            }
             // Packet complete; stay Locked (as the MFSK receiver does).
         }
         events.push(RxEvent::BodyNibble {
