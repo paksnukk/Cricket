@@ -254,6 +254,9 @@ function profileDescription(profile: string): string {
     case "ltc2400_fec":
     case "ltc9600_fec":
       return "LTC FEC — biphase-mark code with error correction; survives short dropouts and clicks. Dedicated line, no EQ (9600: digital lines only).";
+    case "ltc14400":
+    case "ltc14400_fec":
+      return "LTC 14400 — fastest biphase-mark profile, for digital lines only (Dante, MADI, AES at 48 kHz or more): needs ≥ 16 kHz of bandwidth and ≥ 15 dB SNR. The FEC variant also survives dropouts up to ~0.5 ms.";
     default:
       return "Robust (default) — error-corrected, one copy per message; cues and notes over a chain you don't fully trust.";
   }

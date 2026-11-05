@@ -19,7 +19,8 @@ struct Cli {
     /// dedicated line), or the LTC-style biphase-mark profiles for a
     /// dedicated clean line without EQ: ltc (4800 bit/s), ltc2400, ltc4800,
     /// ltc9600, and with Reed–Solomon body FEC ltc_fec, ltc2400_fec,
-    /// ltc9600_fec
+    /// ltc9600_fec; for digital lines only (Dante, MADI, AES; >= 48 kHz)
+    /// ltc14400 and ltc14400_fec
     #[arg(long, global = true, default_value = "robust")]
     profile: String,
 
