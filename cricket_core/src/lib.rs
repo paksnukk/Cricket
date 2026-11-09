@@ -4,6 +4,7 @@
 //! default `std` feature adds WAV file I/O (`wav`) and the legacy prototype phy (`phy_legacy`).
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 

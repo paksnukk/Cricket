@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -1108,3 +1109,12 @@ setInterval(updateLight, 250);
 bindEvents()
   .then(() => loadDevices())
   .catch((e) => console.error(e));
+
+// The version shown in the header comes from the Cargo/Tauri package version
+// (one source of truth in the workspace Cargo.toml), not from a string here.
+getVersion()
+  .then((v) => {
+    const el = document.getElementById("app-version");
+    if (el) el.textContent = `v${v}`;
+  })
+  .catch(() => {});
