@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Protocol** | AML (AudioMIDI Link) version **1**: header version nibble `1` (§4.1) |
-| **Document** | AML v1 — revision **r3**, 2026-11-09 |
+| **Document** | AML v1 — revision **r4**, 2026-11-09 |
 | **Status** | Pre-release draft. §3–§5 and §6.1–§6.4 are complete and tested in software; §6.5 is **provisional**. Nothing has been proven on a real show chain yet (see §7). The first tagged release of the reference implementation (Cricket **v0.2.0**) freezes the wire format of the stable sections under the policy below. |
 | **Reference implementation** | Cricket (`cricket_core`), <https://github.com/paksnukk/Cricket>; test vectors in §9 are asserted by its test suite |
 | **Informative material** | `docs/proposals/fec.md`, `docs/proposals/ltc-bmc.md` (adopted), `docs/proposals/digital-transparent.md` (experimental, not part of v1) |
@@ -15,6 +15,7 @@
 | r1 | 2026-10-14 | First text under the name AML v1 (the project's "V2" bitstream-modem draft of 2026-07-29, with level-independent detection, rewind-and-resync, single link-dead authority, windowed duplicate suppression and the TX scheduler folded in). MFSK-16 phy, packet format, Robust / Robust repeat / Fast, fail-safe, observability. |
 | r2 | 2026-10-15 | **Wire changes:** body FEC (Reed–Solomon over GF(16), whitening) and the packet validation rules (§4.6–§4.7); joint preamble acquisition (§3.2.2); all MIDI 1.0 channel messages and full MSC (§5.1–§5.4); `SEQ` as a 2-bit counter; controller coalescing and scheduler priorities (§5.5); Robust becomes the coded single-copy profile, Robust repeat the two-copy one (§6); LTC biphase-mark profiles as provisional (§6.5); test vectors (§9). |
 | r3 | 2026-11-09 | This header (status, revision log, errata, versioning policy); §7 renamed from "Release assumptions (v1.0)" to "Release assumptions"; title aligned with the README. Same day: the transmit amplitude becomes a SHOULD of 0.25 (−12 dBFS peak, was 0.8; §3.1, §6, §6.5.2), the §5.5 queue bounds are rewritten (1 s airtime cap on order-3 messages; the "bounded by coalescing" claim was wrong), an unknown profile name is rejected, and the user-facing profile names are listed (informative). No wire-format change: receivers are level-independent and the packet format is untouched. |
+| r4 | 2026-11-09 | **Wire change: orthogonal tone spacing.** The MFSK tone step becomes 1 / symbol duration (§3.1): Robust and Robust repeat 166⅔ Hz (tones 2500 … 5000 Hz, was 100 Hz / 2500 … 4000 Hz), Fast 333⅓ Hz (2500 … 7500 Hz, was 200 Hz / 2500 … 5500 Hz); the line bandwidth each profile needs is now a MUST (§6). Receiver (SHOULD, §3.2): tone-band input filter, purity gate 0.20 for every profile (was 0.25 / 0.30), the joint-acquisition contradiction bar at the gate purity, uncoded bodies keep the best guess instead of aborting, body symbol clock tracking. §9 tone frequencies updated. Both ends must run r4: an r3 receiver hears nothing from an r4 transmitter and vice versa. |
 
 Revisions are numbered r1, r2, … per document; a revision id and date identify the text an
 implementation or a measurement refers to. The crate version of the reference implementation is
@@ -96,7 +97,8 @@ Used by Robust, Robust repeat and Fast. Per-profile values are in §6.
 | Parameter | Robust, Robust repeat | Fast |
 |-----------|-------|------|
 | Modulation | MFSK-16, 4 bits per symbol | same |
-| Tone of nibble `k` (0–15) | 2500 + 100 `k` Hz (2500 … 4000 Hz) | 2500 + 200 `k` Hz (2500 … 5500 Hz) |
+| Tone of nibble `k` (0–15) | 2500 + 166⅔ `k` Hz (2500 … 5000 Hz) | 2500 + 333⅓ `k` Hz (2500 … 7500 Hz) |
+| Tone step | 1 / symbol duration = 1000/6 Hz | 1000/3 Hz |
 | Symbol duration | 6.0 ms (288 samples) | 3.0 ms (144 samples) |
 | Guard gap (silence after every symbol) | 0.5 ms (24 samples) | 0 |
 | Symbol period | 6.5 ms (312 samples) | 3.0 ms (144 samples) |
@@ -118,11 +120,26 @@ followed by the guard gap of zeros. One **copy** of a packet is the preamble sym
 symbols (one per body nibble, §4.5), then **one symbol period of silence**. The preamble is not
 CRC-covered; it marks the packet start and the symbol clock and replaces a separate sync word.
 
+The tone step is exactly the reciprocal of the symbol duration (166⅔ Hz = 1000/6, 333⅓ Hz =
+1000/3; it is a property of the symbol, not of the sample rate), so the 16 tones are **orthogonal**
+over a symbol: every tone falls on a zero of every other tone's rectangular-window spectrum, and a
+symbol leaks about −26 dB into its neighbours' detector bins instead of the −5.3 dB of the former
+0.6-bin spacing. A receiver therefore sees ≳ 20 dB between the sent tone and the runner-up on a
+clean line (was ≈ 5 dB), and a sample-rate mismatch of ±1 % between the ends (a 0.2-bin frequency
+offset) no longer closes that gap. The price is bandwidth: a line MUST pass 2.5–5.0 kHz for Robust
+and Robust repeat, and 2.5–7.5 kHz for Fast (§6).
+
 ### 3.2 Receiver: detection and acquisition
 
 This section describes the reference receiver. It is **SHOULD** throughout: the transmitted signal
 does not depend on it, and a receiver MAY find and demodulate packets differently, as long as it
 applies the validation of §4.7.
+
+**Input filter.** The receiver band-passes its input to the tone band before any measurement: a
+second-order Butterworth high-pass at 0.7 × the lowest tone and a second-order Butterworth low-pass
+at 1.3 × the highest (Robust 1750–6500 Hz, Fast 1750–9750 Hz). Everything below (window RMS, energy,
+purity) is measured on the filtered signal, so hum, rumble, speech or music bleed below the band and
+hiss above it do not count against a tone. Non-finite input samples are read as zero.
 
 **Detection gate.** A Goertzel bank over the 16 tone frequencies is evaluated on a symbol window
 (`N` = symbol samples). Detection is level-independent. A window shows nibble `k` when all hold:
@@ -130,16 +147,21 @@ applies the validation of §4.7.
 1. **Silence floor:** window RMS ≥ `min_rms_dbfs` = −60 dBFS (full-scale sine = −3 dBFS). Quieter
    windows are never detected.
 2. **Tone purity:** `purity = P_k / (E · N / 2) ≥ min_tone_purity`, where `P_k` is tone `k`'s Goertzel
-   power, `k` is the strongest tone, and `E = Σ x²` the window energy. A steady sinusoid filling the
-   window gives purity ≈ 1.0 at any amplitude; ramps, misalignment, other tones and noise lower it
-   (white noise ≈ `2 / N` per bin). Thresholds: **0.25** (Robust, Robust repeat), **0.30** (Fast).
+   power, `k` is the strongest tone, and `E = Σ x²` the energy of the (filtered) window. A steady
+   sinusoid filling the window gives purity ≈ 1.0 at any amplitude; ramps, misalignment, other tones
+   and in-band noise lower it. Threshold: **0.20** for every MFSK profile.
 3. **Confidence:** `10 · log10(P_k / P_runner-up) ≥ c`, with `c = min_confidence_db` (**3.0 dB**
    Robust / Robust repeat, **2.0 dB** Fast) for the first preamble symbol under first-symbol
    acquisition, and `c = 0.5 · min_confidence_db` for every other symbol.
 
-Measured purity of synthesized symbols (both timings): ≈ 0.97 aligned, ≈ 0.91 aligned at SNR 12 dB,
-≥ 0.43 at a full search hop of misalignment; the best bin of white noise peaks at ≈ 0.09 (N = 288) /
-≈ 0.18 (N = 144). Packets decode from 0 dB down to at least −30 dB relative to the transmit level.
+Measured purity of synthesized symbols after the input filter: ≈ 0.97 aligned, ≥ 0.4 at a full
+search hop of misalignment, ≈ 0.6 for a symbol in white noise at −6 dB full-band SNR. The threshold
+was tuned on the reference implementation's simulator: 0.20 is the lowest value at which white noise
+and music-like audio produce no phy lock for any profile (at 0.15, Robust locks twice and Fast 13
+times per minute on white noise), and each 0.05 above it costs about 1 dB of noise margin. Packets
+decode from 0 dB down to at least −30 dB relative to the transmit level, and in the simulator down
+to −10 dB (Robust), −9.5 dB (Robust repeat) and −5 dB (Fast) of full-band white-noise SNR at 95 %
+delivery (the per-bin SNR is 21.6 dB (Robust) / 18.6 dB (Fast) higher).
 
 **Search** advances the window by `hop = symbol_samples / 4` (72 / 36 samples). A receiver that
 finds a preamble then fine-aligns to the symbol clock, reads the body one symbol period at a time,
@@ -179,24 +201,38 @@ At each search position `t`, with `N` preamble symbols at `t + i · period`:
    muted symbol does not decide the symbol clock.
 3. **Accept.** Run the full bank on each aligned window. A symbol is *good* when it shows the expected
    nibble and passes the gate (half confidence). It is *contradicting* when another tone wins with
-   purity ≥ `0.5 · min_tone_purity`. The preamble locks when at most `M` symbols are not good
-   (anywhere, including the first), at least one is good, and at most one is contradicting.
+   purity ≥ `min_tone_purity` (a tone that would be detected as a symbol; with the input filter the
+   best bin of a noise window routinely reaches a third of the gate). The preamble locks when at
+   most `M` symbols are not good (anywhere, including the first), at least one is good, and at most
+   one is contradicting.
 4. On a lock, body reading starts at `aligned + N · period`. A failed attempt resumes search at
    `t + hop`.
 
 Noise or a dropout can take out `M` symbols, while a stream of unrelated tones still has to match
-`N − M` preamble symbols in sequence. Measured on random MFSK symbols (other packets' bodies): ~13
-(Robust) and ~10 (Robust repeat) phy locks per minute, each rejected by the link layer.
+`N − M` preamble symbols in sequence. Measured on random MFSK symbols (other packets' bodies): ~4
+phy locks per minute for Robust and for Robust repeat, each rejected by the link layer (~13 / ~10
+with the former 0.6-bin tone spacing).
 
 #### 3.2.3 Body symbols, erasures and resync
 
-- After a lock, each body symbol is read one symbol period after the previous one and must pass the
-  gate (half confidence).
-- **Uncoded body:** the first body symbol that fails the gate abandons the attempt.
+- After a lock, each body symbol is read one symbol period after the previous one and is checked
+  against the gate (half confidence).
+- **Uncoded body:** every symbol is kept as its best guess (the strongest tone; `0` below the
+  silence floor) whether or not it passes the gate. The CRC-16 and the packet checks of §4.7 decide,
+  and a rejected body costs nothing an abort would not, since both rewind the search (below). Before
+  r4 the first failing symbol abandoned the attempt; keeping the guess moved Robust repeat's
+  simulated noise cliff by 2.5 dB and Fast's by 1 dB, and lets Fast through a noise gate whose attack
+  clips a symbol.
 - **Coded body (§4.6):** a body symbol that fails the gate is kept as an **erasure** (its best guess
   and confidence are passed on), up to `2 · parity` = 8 per body; the next failure abandons the
   attempt. Every body symbol carries its confidence (dB over the runner-up) as the reliability for
   the decoder.
+- **Symbol clock tracking (SHOULD):** for every body symbol that passed the gate, the receiver
+  measures its tone's Goertzel power in windows `hop / 2` samples early and late and moves the next
+  symbol's window by `0.75 · (N / 4) · (P_late − P_early) / P` samples (an early-late gate; at most
+  `N / 32` per symbol), so a sample-rate mismatch between the ends does not walk the windows off the
+  symbols. Two percent of mismatch moves a 6.5 ms period by 6 samples per symbol, within the ±9 the
+  gate can follow; the reference receiver delivers 100 % at ±1 % (was 0–16 %).
 - **Resync:** an abandoned attempt, and a complete body that the link layer rejects (§4.7), rewind
   the search to `t + hop` (as if the window that triggered the attempt had been rejected). Samples
   read during the attempt are kept until it resolves (at most one packet), so a real preamble that
@@ -596,13 +632,16 @@ and rejects an unknown name (it MUST NOT substitute another profile: both ends h
 User-facing names (Cricket; informative, equivalent to the identifiers above): `analog-safe` =
 `robust`, `analog-safe-repeat` = `robust_repeat`, `analog-fast` = `fast`, `clean-line` = `ltc_fec`,
 `clean-line-fast` = `ltc9600_fec`, `digital-line` = `ltc14400_fec` (not in this spec),
-`digital-bit-exact` = `digital` (not in this spec). The uncoded LTC profiles keep their identifiers.
+`digital-bit-exact` = `digital` (not in this spec), `analog-safe-fast` = `robust_fast` (experimental,
+not in this spec: Robust's preamble and coded body on 4 ms symbols with 250 Hz orthogonal tones,
+2.5–6.25 kHz, 108 ms per message). The uncoded LTC profiles keep their identifiers.
 
 | | Robust (default) | Robust repeat | Fast | LTC family (§6.5) |
 |---|---|---|---|---|
 | User-facing name | `analog-safe` | `analog-safe-repeat` | `analog-fast` | `clean-line` (`ltc_fec`), `clean-line-fast` (`ltc9600_fec`); uncoded: `ltc*` |
 | Phy | MFSK-16 (§3) | MFSK-16 | MFSK-16 | biphase mark, 2400 / 4800 / 9600 bit/s |
-| Tones | 2500 + 100 k Hz | 2500 + 100 k Hz | 2500 + 200 k Hz | — |
+| Tones | 2500 + 166⅔ k Hz (2.5–5.0 kHz) | 2500 + 166⅔ k Hz | 2500 + 333⅓ k Hz (2.5–7.5 kHz) | — |
+| Line bandwidth (MUST pass) | 2.5–5.0 kHz | 2.5–5.0 kHz | 2.5–7.5 kHz | §6.5 |
 | Symbol + guard | 6.0 + 0.5 ms | 6.0 + 0.5 ms | 3.0 + 0 ms | 4 bits per nibble |
 | Ramps | 0.3 ms | 0.3 ms | 0.15 ms | raised-cosine edges, ½ half cell |
 | Amplitude `A` (peak; SHOULD) | 0.25 (−12 dBFS) | 0.25 | 0.25 | `A` / √2 ≈ 0.177 |
@@ -614,8 +653,9 @@ User-facing names (Cricket; informative, equivalent to the identifiers above): `
 | Airtime per message | 175.5 ms | 273 ms | 57 ms | 4800: 16.8 ms / 21.8 ms coded |
 | Dedup window (§4.4) | 263 ms | 341 ms | 86 ms | one repetition × 1.5 |
 | Acquisition (RX, §3.2) | joint, 2 misses | joint, 1 miss | first symbol | sync correlator (§6.5.3) |
-| Purity / confidence gate (RX) | 0.25 / 3.0 dB | 0.25 / 3.0 dB | 0.30 / 2.0 dB | — |
-| Body erasures kept (RX) | ≤ 8 | 0 | 0 | ≤ 8 coded, unlimited uncoded |
+| Input filter (RX, §3.2) | 1750–6500 Hz | 1750–6500 Hz | 1750–9750 Hz | — |
+| Purity / confidence gate (RX) | 0.20 / 3.0 dB | 0.20 / 3.0 dB | 0.20 / 2.0 dB | — |
+| Body erasures kept (RX) | ≤ 8 | best guess kept (§3.2.3) | best guess kept | ≤ 8 coded, unlimited uncoded |
 | Heartbeat / link-dead | 500 ms / 2000 ms | same | same | same |
 
 Rows marked RX are reference receiver settings (§3.2, SHOULD); everything else is wire format (MUST),
@@ -629,10 +669,11 @@ MFSK-16 at 6.5 ms per symbol period, preamble `A 5 C 3`, the coded 22-nibble bod
 **once**. One copy is 26 symbols (169 ms); with the trailing silence a message holds the line for
 175.5 ms. Reference receiver: joint acquisition with 2 misses (§3.2.2), up to 8 body erasures.
 
-Use it when the chain is unknown or may include converters, patchbays, mild distortion or noise. In the
-channel simulator it matches or beats Robust repeat in every condition except dropouts of ≳ 50 ms
-(e.g. AWGN −3 dB: 97 % vs 46 %; 5 % wrong tones: 97 % vs 75 %; 60 ms dropout: 72 % vs 92 %), with
-36 % less airtime and ~25 % lower NoteOn latency under load (`docs/proposals/fec.md` §10).
+Use it when the chain is unknown or may include converters, patchbays, mild distortion or noise. The
+line must pass 2.5–5.0 kHz. In the channel simulator it matches or beats Robust repeat in every
+condition except dropouts of ≳ 50 ms (e.g. 95 % delivery down to −10 dB vs −9.5 dB of white-noise
+SNR; 5 % wrong tones: 96 % vs 72 %; 60 ms dropout: 75 % vs 93 %), with 36 % less airtime and ~25 %
+lower NoteOn latency under load (`docs/proposals/fec.md` §10).
 
 ### 6.2 Robust repeat
 
@@ -641,24 +682,25 @@ One copy is 20 symbols (130 ms); a message holds the line for 2 × 136.5 = 273 m
 joint acquisition with 1 miss.
 
 Use it on lines with glitches or dropouts of about 50 ms or more: a dropout that long erases more of a
-single coded body than the code can fill, while a second copy survives it (60 ms dropouts: 92 %
-delivered vs 72 % for Robust).
+single coded body than the code can fill, while a second copy survives it (60 ms dropouts: 93 %
+delivered vs 75 % for Robust). The line must pass 2.5–5.0 kHz.
 
 ### 6.3 Fast
 
-For clean dedicated chains only (no EQ / compression / limiter on the AML bus).
+For clean dedicated chains only (no EQ / compression / limiter on the AML bus) that pass 2.5–7.5 kHz.
 
 | Parameter | Value |
 |-----------|-------|
 | Symbol duration | 3.0 ms |
 | Guard gap | 0 |
 | Attack / release | 0.15 ms |
-| Tone spacing | 200 Hz (wider for the short Goertzel window) |
+| Tone spacing | 333⅓ Hz = 1 / symbol duration (orthogonal tones, 2500 … 7500 Hz) |
+| Line bandwidth | MUST pass 2.5–7.5 kHz |
 | Preamble | `A 5` (2 symbols) |
 | Body | 16 nibbles, uncoded (§4.3) |
 | Repetition K | 1 |
 | Confidence (RX) | 2.0 dB |
-| Min tone purity (RX) | 0.30 |
+| Min tone purity (RX) | 0.20 |
 | Acquisition (RX) | first symbol (§3.2.1) |
 
 One copy for any packet is 18 symbols (54 ms).
@@ -804,8 +846,9 @@ this section and the code cannot drift apart. All values hex; nibbles are listed
 list 2 in bits 18–15 and value 146 (= cue 14.5 × 10 + 1) in bits 14–0 (§5.4).
 
 On air, Robust sends the NoteOn as the 26 tones of `A 5 C 3 9 8 3 9 6 E …` (preamble, then the coded
-body): 3500, 3000, 3700, 2800, 3400, 3300, 2800, 3400, 3100, 3900 Hz, … then one symbol period of
-silence. Robust repeat sends `A 5 C 3 1 9 6 B …` twice, Fast `A 5 1 9 6 B …` (200 Hz steps) once. The
+body): 4166⅔, 3333⅓, 4500, 3000, 4000, 3833⅓, 3000, 4000, 3500, 4833⅓ Hz, … (2500 + 166⅔ k) then one
+symbol period of silence. Robust repeat sends `A 5 C 3 1 9 6 B …` twice, Fast `A 5 1 9 6 B …`
+(333⅓ Hz steps: 5833⅓, 4166⅔, 2833⅓, 5500, 4500, 6166⅔ Hz, …) once. The
 LTC profiles send the same body nibbles, MSB first, after their sync: `ltc_fec`'s first body bits for
 the NoteOn are `1001 1000 0011 1001 …`.
 

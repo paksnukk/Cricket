@@ -60,6 +60,70 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   0). The receiver is level-independent, so mixed versions still interoperate. `digital-bit-exact`
   is unchanged. The spec lists the level as a SHOULD.
 
+### MFSK receiver and tone plan
+
+- **Wire format (MFSK profiles, spec r4):** the tone step is now 1 / symbol duration, which makes
+  the 16 tones orthogonal over a symbol: `analog-safe` and `analog-safe-repeat` use 166⅔ Hz steps
+  (2.5–5.0 kHz, was 100 Hz / 2.5–4.0 kHz), `analog-fast` 333⅓ Hz (2.5–7.5 kHz, was 200 Hz /
+  2.5–5.5 kHz). Both ends must be updated together. A tone now leaks −26 dB into its neighbours'
+  detector bins instead of −5.3 dB, so the confidence margin on a clean line goes from ~5 dB to
+  ≳ 20 dB; a ±1 % sample-rate mismatch between the ends (a misconfigured sample-rate converter) no
+  longer kills the MFSK profiles (delivery at ±1 % and 6 dB SNR: 0–16 % → 100 % for all three);
+  false preamble locks on random tones fall from 13 / 10 to 4 per minute for the Robust profiles;
+  and `analog-safe` offers a misconfigured uncoded transmitter 9 instead of 53 CRC candidates per
+  minute (one false message per ~1,660 instead of ~280 years). The price is bandwidth, now a MUST
+  in the spec: the line has to pass 2.5–5.0 kHz (`analog-safe`, `analog-safe-repeat`) or 2.5–7.5 kHz
+  (`analog-fast`); through a 3.4 kHz telephone-grade low-pass `analog-fast` still delivers 92 %
+  (was 55 %), the other two 100 %.
+- **Receiver (no wire change):** the MFSK receiver band-passes its input to the tone band
+  (second-order Butterworth at 0.7 × the lowest and 1.3 × the highest tone) before any detection,
+  so the tone-purity gate normalizes by in-band energy. The old full-band purity failed at −4.8 dB
+  full-band SNR whatever the per-bin SNR, and any out-of-band energy (hum, speech or music bleed,
+  hiss, pink noise) killed detection the same way. Uncoded bodies (`analog-safe-repeat`,
+  `analog-fast`) keep the best guess for a symbol that fails the gate instead of abandoning the
+  packet (the CRC-16 and the §4.7 checks decide; a rejected body rewinds the search like a failed
+  preamble), and every gated body symbol re-centres the symbol clock with an early-late gate. The
+  purity gate is 0.20 for all MFSK profiles (was 0.25 / 0.30), the lowest value at which white noise
+  and music produce no phy lock (at 0.15, `analog-fast` locks 13 times a minute on white noise); the
+  joint-acquisition "contradicting symbol" bar is the gate purity (was half of it). A NaN or
+  infinite input sample is read as silence so it cannot poison the filter.
+- Measured on the channel simulator (400 trials per cell, `tests/fec.rs` `mfsk_ab_table`; the
+  held-out table with other parameters and seeds agrees in every cell, none got worse): 95 %
+  delivery cliff in white noise `analog-safe` −3 → −10 dB, `analog-safe-repeat` −2 → −9.5 dB,
+  `analog-fast` +0.5 → −5 dB; hum 100 Hz at +6 dB over the tones: 0 → 100 % for all three; pink
+  noise at −6 dB SNR: 0 → 100 / 100 / 98 %; `analog-fast` through a noise gate with a 5 ms attack:
+  0.2 → 99.5 %; 5 ms network packet-loss bursts twice a second: `analog-safe-repeat` 78 → 88 %. Of
+  the gain, the input filter alone is worth 6 dB for `analog-safe` and 4 dB for `analog-safe-repeat`,
+  the best guess another 2.5 dB for `analog-safe-repeat` and 1 dB for `analog-fast`, the orthogonal
+  tones 2.5 dB for `analog-fast` and the whole ±1 % drift tolerance. False-trigger rates on white
+  noise and music stay at zero, `analog-fast` on random MFSK tones at 82 locks per minute as before.
+  Receiver CPU on a host (release, ns per input sample): silence 39 → 44 (`analog-safe`), 27 → 32
+  (`-repeat`), 15 → 19 (`analog-fast`); traffic at 0 dB 60 → 70 / 60 → 72 / 55 → 69; worst case
+  (back-to-back preamble tones) 901 → 978 / 709 → 795 / 646 → 766; random tones 166 → 82 for
+  `analog-safe`. The filter is two biquads per sample, the tracking two single-tone Goertzels per
+  body symbol.
+- **Experimental profile `analog-safe-fast`** (`robust_fast`, listed with the advanced profiles):
+  `analog-safe`'s preamble, Reed–Solomon body and joint acquisition on 4 ms symbols with 250 Hz
+  orthogonal tones (2.5–6.25 kHz), 108 ms per message instead of 175.5 ms. Simulator: cliff −9 dB
+  (`analog-safe` −10 dB), 30 ms dropouts 99 % (96 %), 60 ms dropouts 75.5 % (75 %), 2 % drift 99 %
+  (6.5 %), 16 random-tone locks per minute (4). A 3 ms variant (78 ms per message) measured a −8 dB
+  cliff and 83 % on 30 ms dropouts and was not kept. `cricket loopback`: mean ~170 ms, p95 ~220 ms
+  NoteOn latency (`analog-safe` ~270 / ~350 ms, `analog-fast` ~82 / ~120 ms, `clean-line` ~21 ms,
+  all unchanged by this work). Not in the spec and not the default; both ends must select it. If it holds up in the field it is the candidate to replace `analog-safe` as
+  the default (same robustness, 38 % less airtime); it does not replace `analog-fast`, which stays
+  twice as fast.
+- Simulator (`cricket_core/tests/support`): program bleed (speech-like and music-like material at a
+  level relative to the tones), a noise gate, a compressor, a limiter, pink noise, Dante-like bursty
+  block loss, cascaded converters (steep anti-alias or slow roll-off) and a 16 kHz codec brick wall.
+  `tests/fec.rs` gains the MFSK training table, a held-out table used only for final reporting, and
+  a "distance to cliff" row (95 % AWGN cliff per profile) under every A/B table.
+- Negative results, recorded so they are not retried blind: a purity gate of 0.15 buys another dB
+  of cliff but makes `analog-fast` lock 13 times a minute on white noise; a Fast tone plan from
+  2.0 kHz (2.0–7.0 kHz) gains 5 points on a 3.4 kHz line at 104 instead of 82 random-tone locks per
+  minute; a higher confidence gate for `analog-safe` (4–6 dB) changes nothing in noise and loses
+  delivery at 2 % drift; ±3 / ±6 sample argmax clock tracking equals the early-late gate on every
+  cell (the early-late gate costs half the Goertzels).
+
 ### Added
 
 - **Provisional** AML v1 profiles (spec §6.5; may still change in a later revision): `ltc`,

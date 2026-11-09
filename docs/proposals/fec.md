@@ -7,6 +7,18 @@ now **`robust`**, the default (`robust_fec` remains an accepted alias); the K = 
 document is kept as design history: names and numbers are as they were when measured; where it differs
 from the spec, the spec applies.
 
+**2026-11 update (spec r4, "MFSK receiver and tone plan" in the CHANGELOG).** The MFSK tone step is
+now 1 / symbol duration (orthogonal tones) and the receiver band-passes its input to the tone band,
+keeps the best guess in uncoded bodies and tracks the body symbol clock (spec §3.1–§3.2). The
+acquisition thresholds this document records moved: purity gate 0.20 for every MFSK profile (§3.2
+had 0.25 / 0.30), the "contradicting symbol" bar of §10.1 is the full gate purity (was half). Random
+MFSK tones now cause ~4 phy locks per minute for `robust` and `robust_repeat` (§10.2 measured 13 /
+10). False accepts (§9, `FALSE_SECONDS=120`, canonical-payload estimate): `robust` fed uncoded
+Robust repeat / Fast traffic 9 candidates per minute, one false message per ~1,660 years (§9.7:
+58 / 260); MFSK traffic into `ltc_fec` 55 candidates per minute, 272 years (37 / 404), into
+`ltc2400_fec` 37 per minute, 404 years (77 / 196). The 10-year target holds with margin in every
+measured case. The numbers below are otherwise as they were when measured.
+
 Original status: **Phase 1, prototype + measurements.** Not part of AML v1. The `robust` and `fast` profiles are
 unchanged on the wire; the prototype is the opt-in profile `robust_fec` (`PhyConfig::robust_fec()`).
 Since the acquisition hardening (§10), `robust_fec` matches or beats `robust` in every measured channel

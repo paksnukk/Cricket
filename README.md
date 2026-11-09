@@ -118,7 +118,7 @@ still work everywhere (`--profile robust` is `analog-safe`), and `cricket profil
 |---|---|---|---|---|---|
 | `analog-safe` (default) | `robust` (`robust_fec`) | any bus you don't control: cues and notes | EQ, compression or a limiter are tolerated | 175.5 ms | mean ~0.27 s, p95 ~0.35 s |
 | `analog-safe-repeat` | `robust_repeat` | dropouts of 50 ms or more (every message is sent twice) | as `analog-safe` | 273 ms | mean ~0.35 s, p95 ~0.5 s |
-| `analog-fast` | `fast` | notes over a clean, dedicated analog line | none; no error correction | 57 ms | mean ~80 ms, p95 ~115 ms |
+| `analog-fast` | `fast` | notes over a clean, dedicated analog line that passes 7.5 kHz | none; no error correction | 57 ms | mean ~80 ms, p95 ~115 ms |
 | `clean-line` | `ltc_fec` (`ltc4800_fec`) | a dedicated line, analog or digital | none; repairs 1–3 ms dropouts and clicks | 21.8 ms | mean ~21 ms, p95 ~24 ms |
 | `clean-line-fast` | `ltc9600_fec` | a dedicated digital line (≥ 6 kHz of bandwidth) | none | 10.9 ms | mean ~11 ms |
 | `digital-line` | `ltc14400_fec` | Dante / MADI / AES at 48 or 96 kHz (≥ 16 kHz of bandwidth) | none | 7.0 ms | mean ~7 ms, p95 ~7.5 ms |
@@ -126,7 +126,11 @@ still work everywhere (`--profile robust` is `analog-safe`), and `cricket profil
 
 **Advanced, no error correction:** the uncoded `ltc` (= `ltc4800`), `ltc2400`, `ltc9600` and
 `ltc14400`, plus the coded `ltc2400_fec` for narrow analog lines, keep their wire-format names; the
-GUI lists them under "Advanced: no error correction". Every profile except `digital-bit-exact`
+GUI lists them under "Advanced: no error correction". The same group holds the **experimental**
+`analog-safe-fast` (`robust_fast`): Analog Safe's error correction on 4 ms symbols, 108 ms per
+message instead of 175.5 ms, for lines that pass 6.25 kHz; in the simulator it is within 1 dB of
+Analog Safe, and `cricket loopback` measures mean ~170 ms, p95 ~220 ms NoteOn latency (Analog Safe
+~270 / ~350 ms); not in the spec. Every profile except `digital-bit-exact`
 transmits at **−12 dBFS peak** by default (`--tx-level-db`, GUI "TX level"), which leaves headroom
 on the bus; the receiver is level-independent and decodes anything from 30 dB below that to full
 scale.
@@ -137,7 +141,8 @@ The three MFSK profiles in detail:
 |---|---|---|---|
 | Use it for | Cues and notes over a chain you don't fully trust | Lines with glitches or dropouts of ~50 ms or more | Playing notes over a clean, dedicated line (no EQ, compression or limiter) |
 | Symbol | 6 ms + 0.5 ms guard | 6 ms + 0.5 ms guard | 3 ms |
-| Tones | 16 × 100 Hz steps from 2.5 kHz | same | 16 × 200 Hz steps from 2.5 kHz |
+| Tones | 16 orthogonal tones, 166⅔ Hz apart from 2.5 kHz (2.5–5.0 kHz) | same | 16 orthogonal tones, 333⅓ Hz apart from 2.5 kHz (2.5–7.5 kHz) |
+| The line must pass | 2.5–5.0 kHz | 2.5–5.0 kHz | 2.5–7.5 kHz |
 | Body | Reed–Solomon coded (repairs wrong or missing tones) | uncoded | uncoded |
 | Copies per message | 1 | 2 | 1 |
 | Airtime per message | 175.5 ms | 273 ms | 57 ms |
@@ -145,10 +150,15 @@ The three MFSK profiles in detail:
 | Measured NoteOn latency\* | mean ~265–270 ms, p95 ~340–350 ms | mean ~345–360 ms, p95 ~475–500 ms | mean ~80 ms, p95 ~115 ms |
 
 Analog Safe finds a packet even when two of its four preamble tones are lost, and repairs up to 8
-missing or 4 wrong tones in the body. In the channel simulator it delivers as often as Analog Safe
-Repeat or more in every condition except dropouts of 50 ms and longer, where the second copy wins
-(60 ms dropouts: 92 % vs 72 % delivered). Analog Safe Repeat was the default before v1.1 (as
-`robust`); a profile name `robust_fec` from earlier builds now means Analog Safe.
+missing or 4 wrong tones in the body. In the channel simulator it delivers 95 % of messages down to
+−10 dB of white-noise SNR (Analog Safe Repeat −9.5 dB, Analog Fast −5 dB), through 100 Hz hum 6 dB
+louder than the tones, pink noise 6 dB above the tones, a noise gate, a compressor or limiter on the
+bus, and a ±1 % sample-rate mismatch between the ends; it delivers as often as Analog Safe Repeat or
+more in every condition except dropouts of 50 ms and longer, where the second copy wins (60 ms
+dropouts: 93 % vs 75 % delivered). The receiver listens to the tone band only (a 2nd-order
+band-pass), so hum, rumble and speech or music bleeding onto the channel below 2 kHz do not count
+against the tones. Analog Safe Repeat was the default before v1.1 (as `robust`); a profile name
+`robust_fec` from earlier builds now means Analog Safe.
 
 ### Clean-line and digital-line profiles (LTC-style, dedicated lines)
 
