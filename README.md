@@ -128,7 +128,7 @@ still work everywhere (`--profile robust` is `analog-safe`), and `cricket profil
 
 | Profile | Older name | Use when | Processing on the bus | Airtime per message | Measured NoteOn latency\* |
 |---|---|---|---|---|---|
-| `analog-safe` (default) | `robust` (`robust_fec`) | any bus you don't control: cues and notes | EQ, compression or a limiter are tolerated | 175.5 ms | mean ~0.27 s, p95 ~0.35 s |
+| `analog-safe` (default) | `robust` (`robust_fec`) | any bus you don't control: cues and notes | EQ, compression or a limiter are tolerated | 175.5 ms | mean ~0.21 s, p95 ~0.33 s |
 | `analog-safe-repeat` | `robust_repeat` | dropouts of 50 ms or more (every message is sent twice) | as `analog-safe` | 273 ms | mean ~0.35 s, p95 ~0.5 s |
 | `analog-fast` | `fast` | notes over a clean, dedicated analog line that passes 7.5 kHz | none; no error correction | 57 ms | mean ~80 ms, p95 ~115 ms |
 | `clean-line` | `ltc_fec` (`ltc4800_fec`) | a dedicated line, analog or digital | none; repairs 1–3 ms dropouts and clicks | 21.8 ms | mean ~21 ms, p95 ~24 ms |
@@ -159,7 +159,7 @@ The three MFSK profiles in detail:
 | Copies per message | 1 | 2 | 1 |
 | Airtime per message | 175.5 ms | 273 ms | 57 ms |
 | Comfortable rate | ~5 messages/s | ~3–4 messages/s | ~10–17 messages/s |
-| Measured NoteOn latency\* | mean ~265–270 ms, p95 ~340–350 ms | mean ~345–360 ms, p95 ~475–500 ms | mean ~80 ms, p95 ~115 ms |
+| Measured NoteOn latency\* | mean ~210 ms, p95 ~330 ms (legato: ~200 ms, p95 ~295 ms) | mean ~345–360 ms, p95 ~475–500 ms | mean ~75–80 ms, p95 ~115 ms |
 
 Analog Safe finds a packet even when two of its four preamble tones are lost, and repairs up to 8
 missing or 4 wrong tones in the body. In the channel simulator it delivers 95 % of messages down to

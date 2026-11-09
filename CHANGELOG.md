@@ -88,24 +88,29 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   first two on both). `cricket loopback --chords 10 --chord-size 6` therefore completes on
   `analog-fast` (it used to wait for the two lost notes) and still reports the sixth note as not
   delivered on `analog-safe`, whose limit is 5.
-- **Note Off refresh policy** (spec §5.5): the six repeats of a released note follow a Fibonacci
-  schedule (1, 2, 3, 5, 8, 13 message times after the Note Off; `digital` keeps its 20 ms spacing)
-  instead of filling the first six free slots back to back, so consecutive copies no longer fall
-  into one dropout and a release costs a few idle slots spread over seconds instead of a 4.2 s
-  burst for a 4-note release on Robust. On the coded profiles (Robust, `clean-line`, `digital-line`)
-  and `digital-bit-exact`, which lose few Note Offs (Robust: 0.3 % at 2 % symbol errors), a due
-  repeat also waits for one message time of idle line, so a note struck shortly after another never
-  waits behind a repeat; the uncoded profiles (Robust repeat, Fast, `ltc*`), which lose 6–23 % of
-  Note Offs at 2 % errors, keep the first free slot. While repeats are pending but not due, the
-  Heartbeat slot carries one instead of a Heartbeat. Measured in the scheduler harness
-  (`tests/tx_policy.rs`, legato: a note every 300–600 ms, released 60 ms after the next strike):
-  Robust mean Note On latency 324 → **250 ms** (p95 516 → 508), with 47 instead of 145 repeats on
-  the line and the line duty 100 → 83 %; Fast 84 → 83 ms; `ltc_fec` 22 → 23 ms. The stuck-note
-  harness (`tests/stuck_notes.rs`, 0.5–2 % symbol errors, Robust / Robust repeat / Fast) still ends
-  every run with no note stuck past link-dead time; Robust repeat at 2 % now has longer stuck
-  episodes under its 11 % Note Off loss (longest 1.8 s, was 0.7 s), the price of spacing the
-  repeats. `TxScheduler::with_refresh_quiet`, `modem::refresh_quiet_samples`,
-  `next_idle_sample`; `with_refresh_spacing` now spaces the repeats of one note.
+- **Note Off refresh policy** (spec §5.5): on the MFSK profiles the six repeats of a released note
+  follow a Fibonacci schedule (1, 2, 3, 5, 8, 13 message times after the Note Off) instead of
+  filling the first six free slots back to back, so consecutive copies no longer fall into one
+  dropout and a release costs a few idle slots spread over seconds instead of a 4.2 s burst for a
+  4-note release on Robust. On Robust (coded: 0.3 % of Note Offs lost at 2 % symbol errors, and a
+  175 ms message) a due repeat also waits for one message time of idle line, so a note struck
+  shortly after another never waits behind a repeat; Robust repeat and Fast, which lose 6–23 % of
+  Note Offs at 2 % errors, keep the first free slot. The LTC profiles and `digital-bit-exact`
+  (messages of a few ms) keep the first six free slots, as before: tried with the spread schedule,
+  `clean-line` put a repeat where the next note lands and its loopback p95 rose from 21 to 38 ms
+  (a recorded negative result). While repeats are pending but not due, the Heartbeat slot carries
+  one instead of a Heartbeat. Measured (`cricket loopback --notes 60`, in-process, before → after):
+  `analog-safe` mean 269 → **212 ms** (p95 347 → 330) detached and 486 → **199 ms** (p95 526 → 294)
+  legato (`--legato`: a note every 300–600 ms, released 60 ms after the next strike);
+  `analog-fast` 82 → 78 ms (p95 119 → 117) detached, 89 → 84 ms legato; `clean-line` (21 / 22 ms)
+  and `digital-line` (7.3 / 7.3 ms) unchanged. In the scheduler harness (`tests/tx_policy.rs`, legato) Robust goes from
+  324 to 250 ms mean with 47 instead of 145 repeats on the line (line duty 100 → 83 %). The
+  stuck-note harness (`tests/stuck_notes.rs`, 0.5–2 % symbol errors, Robust / Robust repeat / Fast)
+  still ends every run with no note stuck past link-dead time; Robust repeat at 2 % now has longer
+  stuck episodes under its 11 % Note Off loss (longest 1.8 s, was 0.7 s), the price of spacing the
+  repeats. `TxScheduler::with_refresh_schedule` / `with_refresh_quiet`, `modem::refresh_schedule` /
+  `refresh_quiet_samples`, `next_idle_sample`; `with_refresh_spacing` now spaces the repeats of one
+  note.
 - **Controller refresh:** the transmitter remembers the pedal (CC 64/66/67/69), Modulation (CC 1)
   and Pitch Bend state it sent and, in idle Heartbeat slots, re-sends one state that differs from
   the default (pedal down, modulation on, bend off centre) instead of a Heartbeat, round robin. A
@@ -119,9 +124,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   heartbeat is cheap. The rule: the heartbeat interval is a quarter to a fifth of link-dead (3–4
   heartbeats in a row must be lost for a false link-dead: at 97 % delivery one per 5–170 h on
   Robust, 2.6–86 h on `clean-line-fast`, at 99 % one per 70 h–290 d) and at least 20 message
-  airtimes, so a heartbeat in flight stays out of the p95 note latency. The 125 ms heartbeat first
-  tried on `clean-line` (17 % duty) moved its loopback p95 from 24 to 33 ms, so `clean-line` keeps
-  500 / 2000 ms. CLI `decode --link-dead-ms` overrides it (`DecoderConfig::link_dead_ms` as before).
+  airtimes, so a heartbeat in flight stays out of the p95 note latency (`clean-line`'s 21.8 ms
+  message would be 17 % of a 125 ms interval, so it keeps 500 / 2000 ms). CLI `decode
+  --link-dead-ms` overrides it (`DecoderConfig::link_dead_ms` as before).
 - **Fail-safe burst content:** the burst now starts each channel with an explicit **Note Off for
   every note this receiver turned on** and has not seen released (several soft synths and DAWs
   ignore CC123), then Sustain off, All Notes Off and the pitch-bend centre as before (spec §5.3).

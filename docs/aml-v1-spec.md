@@ -485,8 +485,8 @@ output; Panic outputs the fail-safe burst (§5.3).
   500 ms slot, p³–p⁴), per 2.6–86 h on `ltc9600_fec` (per 250 ms slot), and at 99 % per 70 h–290 d
   on `ltc9600_fec`; a line that bad is unusable for notes anyway, and a false link-dead costs one
   burst. The interval is also at least 20 message airtimes, so a heartbeat occupies at most 5 % of
-  the idle line and one in flight stays out of the p95 note latency (measured: a 125 ms heartbeat on
-  `ltc_fec`, 17 %, moved its p95 from 24 to 33 ms; hence 500 ms there).
+  the idle line and one in flight stays out of the p95 note latency (hence 500 ms on `ltc_fec`,
+  whose 21.8 ms message would be 17 % of a 125 ms interval).
   This **sample-clock** link-dead detector is timed in received
   samples: it fires at sample `end of last valid packet + link_dead_ms`, independent of how audio
   is chunked, and is reported in the processing call whose input contains that sample. It fires
@@ -655,22 +655,28 @@ else a **Heartbeat**. Any of them is a valid packet and keeps the link alive (§
 messages are pending, no Heartbeat airtime is used.
 
 **NoteOff refresh:** after a user Note Off is transmitted, it is repeated (same channel, note and
-velocity) up to **6** times within **10 s** (max **32** most recent releases). Repeat *k* (1–6) is
-sent no earlier than **1, 2, 3, 5, 8, 13 message times** after the user Note Off (a Fibonacci
-spread, so consecutive copies do not fall into one dropout and the six repeats still fit within
-link-dead time: 0.74 s on Fast, 2.3 s on Robust), and on `digital` at least 20 ms after the previous
-copy. On the **coded** profiles (Robust, `ltc*_fec`) and `digital`, which lose few Note Offs
-(Robust: 0.3 % at 2 % symbol errors), a due repeat also waits for a **quiet line**: one message
-time of idle line after the message in flight, so a note struck shortly after another never waits
-behind a repeat; under sustained playing the repeats wait for a pause or the Heartbeat slot. On the
-**uncoded** profiles (Robust repeat, Fast, `ltc*`), which lose far more (Fast: 23 % at 2 %), a due
-repeat takes the first free slot. Among due repeats the note with the **fewest** repeats so far goes
-first, then the **oldest** release. A **Note On** for that channel and note removes it from the
-refresh list. A refresh never runs ahead of a queued message. Measured against the r4 policy (six
-repeats back to back in the first free slots), legato playing on Robust (a note every 300–600 ms,
-each released 60 ms after the next strike) gains 74 ms of mean Note On latency (324 → 250 ms, one
-on-wire copy included), and no note stayed stuck past link-dead time in the stuck-note harness up to
-2 % symbol errors on Robust, Robust repeat and Fast.
+velocity) up to **6** times within **10 s** (max **32** most recent releases). On the **MFSK**
+profiles (messages of 57–273 ms) repeat *k* (1–6) is sent no earlier than **1, 2, 3, 5, 8, 13
+message times** after the user Note Off: a Fibonacci spread, so consecutive copies do not fall into
+one dropout and a release costs a few idle slots spread over seconds instead of a burst, while the
+six repeats still fit within link-dead time (0.74 s on Fast, 2.3 s on Robust). On the **LTC**
+profiles and `digital` (messages of a few ms) the repeats take the **first six free slots**: they
+are over before the next note is likely to come, and a dropout of a few ms covers at most one of
+them; `digital` keeps at least 20 ms between copies. On **Robust** (coded MFSK: few Note Offs lost,
+0.3 % at 2 % symbol errors, and a message long compared with the time between notes) a due repeat
+also waits for a **quiet line**: one message time of idle line after the message in flight, so a
+note struck shortly after another never waits behind a repeat; under sustained playing the repeats
+wait for a pause or the Heartbeat slot. On the uncoded MFSK profiles (Robust repeat, Fast), which
+lose far more Note Offs (Fast: 23 % at 2 %), a due repeat takes the first free slot. Among due
+repeats the note with the **fewest** repeats so far goes first, then the **oldest** release. A
+**Note On** for that channel and note removes it from the refresh list. A refresh never runs ahead
+of a queued message. Measured against the r4 policy (six repeats back to back in the first free
+slots), legato playing on Robust (a note every 300–600 ms, each released 60 ms after the next
+strike) gains 74 ms of mean Note On latency in the scheduler harness (324 → 250 ms, one on-wire
+copy included) and 290 ms in the in-process loopback (485 → 199 ms); Fast gains 8 ms (89 → 81);
+the LTC profiles are unchanged (with the spread schedule `ltc_fec`'s p95 rose from 21 to 38 ms,
+which is why they keep the first free slots). No note stayed stuck past link-dead time in the
+stuck-note harness up to 2 % symbol errors on Robust, Robust repeat and Fast.
 
 **Controller refresh:** the transmitter remembers, per channel, the last value it sent for the
 pedals (CC 64, 66, 67, 69), Modulation (CC 1) and Pitch Bend, until a Reset All Controllers (CC 121)

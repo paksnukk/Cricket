@@ -19,6 +19,22 @@ Robust repeat / Fast traffic 9 candidates per minute, one false message per ~1,6
 `ltc2400_fec` 37 per minute, 404 years (77 / 196). The 10-year target holds with margin in every
 measured case. The numbers below are otherwise as they were when measured.
 
+**2026-11 update (spec r5, "Link key, scheduler and fail-safe" in the CHANGELOG).** The CRC-16 init
+value is now the link key (spec §4.1); the default `0xFFFF` keeps the wire format of this document. A
+neighbouring link of the same profile with another key is a new foreign signal for §9: its clean
+bodies decode to exactly one candidate each (the neighbour's packet), which is structurally valid
+and fails the CRC **deterministically** (two keys shift the CRC by a fixed non-zero amount for a
+given length), so it cannot become a false message however often it arrives; only the GMD
+alternatives of such a body are random candidates in the sense of §9.1. Measured
+(`false_accept_report`, `FALSE_SECONDS=120`, "other-key traffic" row, back-to-back traffic at SNR
+20 dB): `robust` 652 false bodies and 636 candidates per minute, `ltc_fec` 2,550 and 2,550, i.e.
+~1 candidate per body and no random candidate beyond the neighbour's own packet in 2 minutes
+(`other_key_traffic_never_decodes` guards < 1.3 candidates per body). The report excludes the
+deterministically rejected candidates from its estimate for this row. Keying the whitening sequence
+as well (making the neighbour's body a non-codeword, ~0.04 random candidates per body as in §9.1)
+was therefore not adopted: it would add a key-dependent wire transform for no measurable gain over
+the ~0 random candidates per body measured.
+
 Original status: **Phase 1, prototype + measurements.** Not part of AML v1. The `robust` and `fast` profiles are
 unchanged on the wire; the prototype is the opt-in profile `robust_fec` (`PhyConfig::robust_fec()`).
 Since the acquisition hardening (§10), `robust_fec` matches or beats `robust` in every measured channel
