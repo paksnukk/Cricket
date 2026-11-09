@@ -214,7 +214,7 @@ jobs:
           done
 
       - name: Build and attach the bundles
-        uses: tauri-apps/tauri-action@6caf3c52bef9f7b97e6f3693cc48ba16331cdeba # v0.5.25
+        uses: tauri-apps/tauri-action@51a9f1156b33df106d827c3a78f8f894946c5faa # v0.5.25
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
