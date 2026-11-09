@@ -1,7 +1,7 @@
 # AML Legacy Prototype Protocol (Sequential Tone Symbols)
 
 > This is the original prototype protocol, kept in `cricket_core::phy_legacy` for debugging.
-> The current protocol is **AML v1**, described in [`aml-v1-spec.md`](aml-v1-spec.md).
+> The current protocol is **AML v1**, described in [`aml-v1-spec.md`](../aml-v1-spec.md).
 
 ## 1. Overview
 
