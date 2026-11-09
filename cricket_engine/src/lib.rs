@@ -176,3 +176,44 @@ impl Worker {
 pub(crate) fn closed_receiver() -> Receiver<EngineEvent> {
     channel().1
 }
+
+/// A warning when an MFSK profile's tones sit above what the stream's
+/// converter passes (0.4535 × sample rate, the passband edge of a sharp
+/// converter): the instrument profiles (19.0–21.5 kHz) on a device that
+/// opened at 44.1 kHz. `None` when the plan fits.
+pub fn hf_rate_warning(
+    config: &cricket_core::PhyConfig,
+    stream_sample_rate: u32,
+) -> Option<String> {
+    if config.n_tones == 0 {
+        return None;
+    }
+    let top = config.tone_hz(config.n_tones as u8 - 1);
+    let edge = 0.4535 * stream_sample_rate as f32;
+    (top > edge).then(|| {
+        format!(
+            "WARNING: the profile's tones reach {:.1} kHz but the audio device runs at {} Hz, whose \
+             converter passes about {:.1} kHz: the instrument profiles need a 48 kHz (or higher) \
+             device end to end. Set the device to 48 kHz.",
+            top / 1000.0,
+            stream_sample_rate,
+            edge / 1000.0
+        )
+    })
+}
+
+#[cfg(test)]
+mod hf_rate_warning_tests {
+    use super::hf_rate_warning;
+    use cricket_core::PhyConfig;
+
+    #[test]
+    fn warns_only_when_the_plan_does_not_fit() {
+        assert!(hf_rate_warning(&PhyConfig::hf_robust(), 48_000).is_none());
+        assert!(hf_rate_warning(&PhyConfig::hf_robust(), 44_100).is_some());
+        assert!(hf_rate_warning(&PhyConfig::robust(), 44_100).is_none());
+        assert!(hf_rate_warning(&PhyConfig::ltc_fec(), 44_100).is_none());
+        assert!(hf_rate_warning(&PhyConfig::hf_fast_96k(), 48_000).is_some());
+        assert!(hf_rate_warning(&PhyConfig::hf_fast_96k(), 96_000).is_none());
+    }
+}

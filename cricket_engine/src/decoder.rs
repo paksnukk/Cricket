@@ -309,6 +309,9 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
         ));
         config = config.with_sample_rate(stream_sample_rate);
     }
+    if let Some(w) = crate::hf_rate_warning(&config, stream_sample_rate) {
+        ev.log(w);
+    }
 
     if let Err(e) = source.start() {
         ev.log(format!("Failed to play input: {}", e));

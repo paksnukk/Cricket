@@ -3,9 +3,11 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use cricket_core::modem::repetition_samples;
+use cricket_core::modem::{CricketModemRx, CricketModemTx, ModemOutput};
 use cricket_core::pathcheck::{self, PathImpairment, PathReport, Verdict};
 use cricket_core::phy::{
-    PhyConfig, ProfileInfo, ProfileTier, DEFAULT_PROFILE, DEFAULT_TX_LEVEL_DBFS, PROFILES,
+    PhyConfig, ProfileInfo, ProfileTier, DEFAULT_PROFILE, DEFAULT_TX_LEVEL_DBFS, HF_TX_LEVEL_DBFS,
+    PROFILES,
 };
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, MscTarget, TransportMessage};
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
@@ -41,9 +43,10 @@ const EXIT_MARGINAL: u8 = 3;
 struct Cli {
     /// Profile, same on both ends: analog-safe (default), analog-safe-repeat,
     /// analog-fast, clean-line, clean-line-fast, digital-line,
-    /// digital-bit-exact; `cricket profiles` lists all, with the older names
-    #[arg(long, global = true, value_name = "NAME", default_value = DEFAULT_PROFILE, value_parser = parse_profile)]
-    profile: String,
+    /// digital-bit-exact, instrument; `cricket profiles` lists all, with the
+    /// older names. `hf-mix` and `hf-scan` default to `instrument`
+    #[arg(long, global = true, value_name = "NAME", value_parser = parse_profile)]
+    profile: Option<String>,
 
     /// Audio device buffer size in frames, e.g. 64–512 (default: the host's;
     /// ALSA uses 100 ms). Smaller is faster, too small drops out
@@ -64,10 +67,12 @@ struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     audio_out_channel: u16,
 
-    /// Transmit level, peak dBFS (−60 … 0). The receiver is level-independent;
-    /// −12 leaves headroom on the bus. Ignored by digital-bit-exact
-    #[arg(long, global = true, value_name = "DB", default_value_t = DEFAULT_TX_LEVEL_DBFS, allow_negative_numbers = true, value_parser = parse_tx_level)]
-    tx_level_db: f32,
+    /// Transmit level, peak dBFS (−60 … 0). Default: the profile's own
+    /// (−12 dBFS, headroom on the bus; the instrument profiles −30 dBFS,
+    /// inaudible above the music). The receiver is level-independent.
+    /// Ignored by digital-bit-exact
+    #[arg(long, global = true, value_name = "DB", allow_negative_numbers = true, value_parser = parse_tx_level)]
+    tx_level_db: Option<f32>,
 
     /// Link key, the same on both ends: `0x1234` (hex) or a passphrase
     /// (hashed to 16 bits). Packets from a Cricket link with another key
@@ -211,6 +216,54 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         legato: bool,
     },
+    /// Embed MIDI into a recording for the instrument profiles (no hardware
+    /// needed)
+    ///
+    /// Mixes the tones of --messages into --wav-in (48 kHz; the first
+    /// channel of a stereo file is used) and writes --wav-out as 32-bit
+    /// float. Play the mixed file through the rig (cable, pedals,
+    /// interface), record the far end and run `hf-scan` on the recording.
+    /// Profile: `instrument` unless --profile says otherwise; level: the
+    /// profile's −30 dBFS unless --tx-level-db says otherwise.
+    HfMix {
+        /// Input recording (WAV, PCM or float, mono or stereo)
+        #[arg(long, value_name = "FILE")]
+        wav_in: String,
+        /// Output file (32-bit float WAV, mono)
+        #[arg(long, value_name = "FILE")]
+        wav_out: String,
+        /// Messages to embed, comma-separated: `note=<ch>:<note>:<vel>`
+        /// (Note On, and a Note Off --hold-ms later), `pc=<ch>:<program>`,
+        /// `cc=<ch>:<controller>:<value>`, `go=<cue>[:<list>]` (MSC GO, cue
+        /// like 14.5), `heartbeat`, `panic`. Channels 1–16, values 0–127.
+        /// Default: a Program Change, a Note On/Off and an MSC GO
+        #[arg(long, value_delimiter = ',', value_name = "LIST")]
+        messages: Vec<String>,
+        /// Time of the first message, ms into the recording
+        #[arg(long, default_value_t = 500.0, value_name = "MS")]
+        start_ms: f32,
+        /// Spacing between messages, ms
+        #[arg(long, default_value_t = 1000.0, value_name = "MS")]
+        every_ms: f32,
+        /// Hold a note this long before its Note Off, ms (0 = no Note Off)
+        #[arg(long, default_value_t = 400.0, value_name = "MS")]
+        hold_ms: f32,
+        /// Repeat the list until the recording ends
+        #[arg(long, default_value_t = false)]
+        repeat: bool,
+    },
+    /// Decode a recording with the instrument profiles' receiver
+    ///
+    /// Lists every message with its time, then the receiver's counters
+    /// (packets passed and failed, repaired tones, other-key suspects) and
+    /// the recording's level in the tone band, so a real rig can be judged
+    /// before hardware exists. Profile: `instrument` unless --profile says
+    /// otherwise.
+    HfScan {
+        /// The recording (WAV, PCM or float, mono or stereo)
+        #[arg(long, value_name = "FILE")]
+        wav_in: String,
+    },
     /// Is an audio path bit-transparent? (for the digital-bit-exact profile)
     ///
     /// Run `pathcheck send` on the sending machine and `pathcheck receive`
@@ -292,7 +345,20 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let profile = cli.profile.as_str();
+    // The HF tools default to the instrument profile; everything else to
+    // the catalog default.
+    let hf_tool = matches!(
+        cli.command,
+        Commands::HfMix { .. } | Commands::HfScan { .. }
+    );
+    let profile_name = cli.profile.clone().unwrap_or_else(|| {
+        if hf_tool {
+            HF_PROFILE.to_string()
+        } else {
+            DEFAULT_PROFILE.to_string()
+        }
+    });
+    let profile = profile_name.as_str();
     let link_key = parse_link_key(&cli.link_key);
     let audio = AudioOptions {
         buffer_frames: cli.buffer_frames,
@@ -399,8 +465,336 @@ fn run(cli: Cli) -> Result<ExitCode> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::HfMix {
+            wav_in,
+            wav_out,
+            messages,
+            start_ms,
+            every_ms,
+            hold_ms,
+            repeat,
+        } => {
+            run_hf_mix(
+                wav_in,
+                wav_out,
+                messages,
+                HfMixTiming {
+                    start_ms: *start_ms,
+                    every_ms: *every_ms,
+                    hold_ms: *hold_ms,
+                    repeat: *repeat,
+                },
+                profile,
+                cli.tx_level_db,
+                link_key,
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::HfScan { wav_in } => {
+            run_hf_scan(wav_in, profile, link_key)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Pathcheck { action } => run_pathcheck(action, &audio),
     }
+}
+
+/// The profile `hf-mix` and `hf-scan` use when `--profile` is not given.
+const HF_PROFILE: &str = "instrument";
+
+struct HfMixTiming {
+    start_ms: f32,
+    every_ms: f32,
+    hold_ms: f32,
+    repeat: bool,
+}
+
+/// One `--messages` item (see `Commands::HfMix`). A note item yields the
+/// Note On and, with a hold, its Note Off.
+fn parse_hf_message(item: &str) -> Result<(TransportMessage, Option<TransportMessage>)> {
+    let item = item.trim();
+    let (kind, args) = item.split_once('=').unwrap_or((item, ""));
+    let fields: Vec<&str> = if args.is_empty() {
+        Vec::new()
+    } else {
+        args.split(':').collect()
+    };
+    let num = |i: usize, what: &str, max: u32| -> Result<u8> {
+        let s = fields
+            .get(i)
+            .ok_or_else(|| anyhow!("`{item}`: missing {what}"))?;
+        let v: u32 = s
+            .parse()
+            .map_err(|_| anyhow!("`{item}`: {what} `{s}` is not a number"))?;
+        if v > max {
+            return Err(anyhow!("`{item}`: {what} {v} is above {max}"));
+        }
+        Ok(v as u8)
+    };
+    let channel = |i: usize| -> Result<u8> {
+        let ch = num(i, "channel", 16)?;
+        if ch == 0 {
+            return Err(anyhow!("`{item}`: channels are 1–16"));
+        }
+        Ok(ch - 1)
+    };
+    match kind.to_ascii_lowercase().as_str() {
+        "note" => {
+            let channel = channel(0)?;
+            let note = num(1, "note", 127)?;
+            let velocity = num(2, "velocity", 127)?.max(1);
+            Ok((
+                TransportMessage::NoteOn {
+                    channel,
+                    note,
+                    velocity,
+                },
+                Some(TransportMessage::NoteOff {
+                    channel,
+                    note,
+                    velocity: 64,
+                }),
+            ))
+        }
+        "pc" => Ok((
+            TransportMessage::ProgramChange {
+                channel: channel(0)?,
+                program: num(1, "program", 127)?,
+            },
+            None,
+        )),
+        "cc" => Ok((
+            TransportMessage::ControlChange {
+                channel: channel(0)?,
+                controller: num(1, "controller", 127)?,
+                value: num(2, "value", 127)?,
+            },
+            None,
+        )),
+        "go" => {
+            let cue_text = fields
+                .first()
+                .ok_or_else(|| anyhow!("`{item}`: missing cue number"))?;
+            let cue: f32 = cue_text
+                .parse()
+                .map_err(|_| anyhow!("`{item}`: cue `{cue_text}` is not a number"))?;
+            let tenths = (cue * 10.0).round();
+            if !(0.0..=9999.0).contains(&tenths) {
+                return Err(anyhow!("`{item}`: cue must be 0–999.9"));
+            }
+            let cue = MscCue::from_tenths(tenths as u16)
+                .ok_or_else(|| anyhow!("`{item}`: cue not representable"))?;
+            let list = match fields.get(1) {
+                Some(_) => Some(num(1, "list", 15)?).filter(|&l| l > 0),
+                None => None,
+            };
+            Ok((
+                TransportMessage::Msc(MscMessage::cue(MscCommand::Go, cue, list)),
+                None,
+            ))
+        }
+        "heartbeat" | "hb" => Ok((TransportMessage::Heartbeat, None)),
+        "panic" => Ok((TransportMessage::Panic, None)),
+        other => Err(anyhow!(
+            "unknown message `{other}` in --messages (note=, pc=, cc=, go=, heartbeat, panic)"
+        )),
+    }
+}
+
+/// The HF profile at the recording's sample rate, or an error when the
+/// plan does not fit the rate (44.1 kHz).
+fn hf_profile_for(profile: &str, sample_rate: u32) -> Result<PhyConfig> {
+    let config = PhyConfig::from_name(profile).ok_or_else(|| anyhow!("unknown profile"))?;
+    let config = if config.sample_rate_hz == sample_rate {
+        config
+    } else {
+        config.with_sample_rate(sample_rate)
+    };
+    if let Some(w) = cricket_engine::hf_rate_warning(&config, sample_rate) {
+        return Err(anyhow!(
+            "{} (the recording is {sample_rate} Hz; record at 48 kHz)",
+            w.trim_start_matches("WARNING: ")
+        ));
+    }
+    Ok(config)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hf_mix(
+    wav_in: &str,
+    wav_out: &str,
+    messages: &[String],
+    timing: HfMixTiming,
+    profile: &str,
+    tx_level_db: Option<f32>,
+    link_key: u16,
+) -> Result<()> {
+    let (rate, mut samples) = read_wav_f32(wav_in).map_err(|e| anyhow!(e))?;
+    let mut config = hf_profile_for(profile, rate)?.with_link_key(link_key);
+    if let Some(db) = tx_level_db {
+        config = config.with_tx_level_dbfs(db);
+    }
+    let items: Vec<String> = if messages.is_empty() {
+        vec!["pc=1:10".into(), "note=1:60:100".into(), "go=14.5:2".into()]
+    } else {
+        messages.to_vec()
+    };
+    let parsed: Vec<_> = items
+        .iter()
+        .map(|m| parse_hf_message(m))
+        .collect::<Result<_>>()?;
+    if timing.every_ms <= 0.0 {
+        return Err(anyhow!("--every-ms must be positive"));
+    }
+    let ms = |v: f32| (v / 1000.0 * rate as f32).round().max(0.0) as usize;
+    let program_rms = {
+        let e: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        (e / samples.len().max(1) as f64).sqrt() as f32
+    };
+    let mut tx = CricketModemTx::new(config.clone());
+    let mut placed: Vec<(usize, TransportMessage)> = Vec::new();
+    let mut t = ms(timing.start_ms);
+    let mut round = 0usize;
+    'outer: loop {
+        for (on, off) in &parsed {
+            if t >= samples.len() {
+                break 'outer;
+            }
+            placed.push((t, on.clone()));
+            if let Some(off) = off {
+                if timing.hold_ms > 0.0 {
+                    placed.push((t + ms(timing.hold_ms), off.clone()));
+                }
+            }
+            t += ms(timing.every_ms);
+        }
+        round += 1;
+        if !timing.repeat || round > 100_000 {
+            break;
+        }
+    }
+    placed.sort_by_key(|(at, _)| *at);
+    // Messages are sent in order on one line: a message that would overlap
+    // the previous one starts when that one ends (as the scheduler would).
+    let mut line_free = 0usize;
+    let mut peak = 0f32;
+    let mut written = 0usize;
+    for (at, msg) in &placed {
+        let start = (*at).max(line_free);
+        let audio = tx.encode_message(msg);
+        if start >= samples.len() {
+            break;
+        }
+        for (i, v) in audio.iter().enumerate() {
+            if let Some(s) = samples.get_mut(start + i) {
+                *s += v;
+                peak = peak.max(s.abs());
+            }
+        }
+        line_free = start + audio.len();
+        written += 1;
+        let (kind, payload) = format_message(msg);
+        println!("{:9.3} s  {} {}", start as f32 / rate as f32, kind, payload);
+    }
+    write_wav_f32(wav_out, rate, &samples).map_err(|e| anyhow!(e))?;
+    println!(
+        "Mixed {} messages ({} profile, tones {:.1}–{:.1} kHz at {:.1} dBFS peak) into {} s of {} \
+         (program {:.1} dBFS RMS) → {}; peak after mixing {:.1} dBFS{}.",
+        written,
+        PhyConfig::canonical_name(profile).unwrap_or_else(|| profile.to_string()),
+        config.tone_hz(0) / 1000.0,
+        config.tone_hz(config.n_tones as u8 - 1) / 1000.0,
+        config.tx_level_dbfs(),
+        samples.len() / rate as usize,
+        wav_in,
+        rms_to_dbfs(program_rms),
+        wav_out,
+        rms_to_dbfs(peak / 2f32.sqrt()) + 3.0,
+        if peak >= 1.0 {
+            " — CLIPPED: lower the recording or the tones"
+        } else {
+            ""
+        }
+    );
+    println!("Next: play it through the rig, record the far end at 48 kHz, then `cricket hf-scan --wav-in <recording>`.");
+    Ok(())
+}
+
+fn run_hf_scan(wav_in: &str, profile: &str, link_key: u16) -> Result<()> {
+    let (rate, samples) = read_wav_f32(wav_in).map_err(|e| anyhow!(e))?;
+    let config = hf_profile_for(profile, rate)?.with_link_key(link_key);
+    println!(
+        "Scanning {} ({} s at {} Hz) with the {} profile (tones {:.1}–{:.1} kHz)...",
+        wav_in,
+        samples.len() / rate.max(1) as usize,
+        rate,
+        PhyConfig::canonical_name(profile).unwrap_or_else(|| profile.to_string()),
+        config.tone_hz(0) / 1000.0,
+        config.tone_hz(config.n_tones as u8 - 1) / 1000.0
+    );
+    // Level in the receiver's band and overall, for judging the rig.
+    let (band_rms, full_rms, peak) = {
+        let mut band = config.rx_band_hz.map(|(lo, hi)| {
+            cricket_core::phy::BandPass::with_order(lo, hi, config.rx_band_order as usize, rate)
+        });
+        let mut e_band = 0f64;
+        let mut e_full = 0f64;
+        let mut peak = 0f32;
+        for &s in &samples {
+            let b = band.as_mut().map_or(s, |f| f.process(s));
+            e_band += (b as f64) * (b as f64);
+            e_full += (s as f64) * (s as f64);
+            peak = peak.max(s.abs());
+        }
+        let n = samples.len().max(1) as f64;
+        ((e_band / n).sqrt() as f32, (e_full / n).sqrt() as f32, peak)
+    };
+    let mut rx = CricketModemRx::new(config.clone());
+    let mut count = 0usize;
+    let flush = cricket_core::modem::flush_samples(&config);
+    let mut stream = samples;
+    stream.extend(std::iter::repeat_n(0.0, flush));
+    for chunk in stream.chunks(256) {
+        for out in rx.push_samples(chunk) {
+            if let ModemOutput::Message(m) = out {
+                count += 1;
+                let (kind, payload) = format_message(&m);
+                println!(
+                    "{:9.3} s  {} {}",
+                    rx.samples_processed() as f32 / rate as f32,
+                    kind,
+                    payload
+                );
+            }
+        }
+    }
+    let st = rx.stats();
+    println!(
+        "{} messages. Packets: {} passed, {} failed{}; {} tones repaired by the code; \
+         last confidence {:.1} dB.",
+        count,
+        st.crc_pass,
+        st.crc_fail,
+        if st.wrong_key_suspects > 0 {
+            format!(" ({} look like another link key)", st.wrong_key_suspects)
+        } else {
+            String::new()
+        },
+        st.fec_corrected,
+        st.last_confidence_db
+    );
+    println!(
+        "Recording: {:.1} dBFS RMS, peak {:.1} dBFS; in the tone band ({:.1}–{:.1} kHz): {:.1} dBFS RMS \
+         (tones at −30 dBFS peak measure about −33 dBFS when the line is on).",
+        rms_to_dbfs(full_rms),
+        rms_to_dbfs(peak / 2f32.sqrt()) + 3.0,
+        config.rx_band_hz.map_or(0.0, |b| b.0 / 1000.0),
+        config.rx_band_hz.map_or(0.0, |b| b.1 / 1000.0),
+        rms_to_dbfs(band_rms)
+    );
+    if count == 0 {
+        println!("Nothing decoded: check that the recording is 48 kHz end to end (no 44.1 kHz device, codec or wireless link) and that the tones are above the band noise (hf-mix at −30 dBFS, or try −20).");
+    }
+    Ok(())
 }
 
 /// A profile name (user-facing or older), returned in its canonical form.
@@ -421,12 +815,14 @@ fn parse_profile(s: &str) -> Result<String, String> {
                 .collect()
         };
         format!(
-            "unknown profile `{}`. Profiles: {}; advanced (no error correction): {}. \
+            "unknown profile `{}`. Profiles: {}; advanced (no error correction): {}; \
+             instrument audio (experimental): {}. \
              Add `+digital` to a decoder profile to also accept digital-bit-exact frames. \
              `cricket profiles` explains them.",
             s,
             names(ProfileTier::Standard).join(", "),
-            names(ProfileTier::Advanced).join(", ")
+            names(ProfileTier::Advanced).join(", "),
+            names(ProfileTier::Instrument).join(", ")
         )
     })
 }
@@ -538,12 +934,25 @@ fn print_profiles() {
         print_profile_entry(p);
     }
     println!();
+    println!(
+        "Instrument audio (experimental): MIDI embedded on an instrument's own signal, above the"
+    );
+    println!("music (19.0–21.5 kHz at 48 kHz), extracted by a box that passes the audio through.");
+    println!("Try it on a recording with `cricket hf-mix` and `cricket hf-scan`:");
+    for p in PROFILES
+        .iter()
+        .filter(|p| p.tier == ProfileTier::Instrument)
+    {
+        print_profile_entry(p);
+    }
+    println!();
     println!("A decoder profile with `+digital` (e.g. clean-line+digital) also accepts");
     println!("digital-bit-exact frames. Latencies are MIDI in -> MIDI out measured in-process");
     println!("(`cricket loopback`); real audio interfaces add their own buffering on top.");
     println!(
-        "Transmit level: {:.0} dBFS peak by default (--tx-level-db); the receiver is level-independent.",
-        DEFAULT_TX_LEVEL_DBFS
+        "Transmit level: {:.0} dBFS peak by default (--tx-level-db; the instrument profiles {:.0} dBFS); \
+         the receiver is level-independent.",
+        DEFAULT_TX_LEVEL_DBFS, HF_TX_LEVEL_DBFS
     );
 }
 
@@ -551,11 +960,13 @@ fn run_test_mode(
     wav_out: Option<&str>,
     wav_in: Option<&str>,
     profile: &str,
-    tx_level_db: f32,
+    tx_level_db: Option<f32>,
 ) -> Result<()> {
-    let config = PhyConfig::from_name(profile)
-        .ok_or_else(|| anyhow!("unknown profile {:?}", profile))?
-        .with_tx_level_dbfs(tx_level_db);
+    let mut config =
+        PhyConfig::from_name(profile).ok_or_else(|| anyhow!("unknown profile {:?}", profile))?;
+    if let Some(db) = tx_level_db {
+        config = config.with_tx_level_dbfs(db);
+    }
     println!(
         "Running Cricket loopback test (profile={}, TX level {:.1} dBFS peak)...",
         profile,
@@ -1332,7 +1743,7 @@ fn run_encoder(
     audio_out: DeviceSelector,
     simulate: bool,
     profile: &str,
-    tx_level_db: f32,
+    tx_level_db: Option<f32>,
     audio: &AudioOptions,
     json: bool,
     link: EncoderLink,
@@ -1362,7 +1773,7 @@ fn run_encoder(
         midi_in,
         profile: profile.into(),
         simulate,
-        tx_level_dbfs: Some(tx_level_db),
+        tx_level_dbfs: tx_level_db,
         audio: audio.clone(),
         link_key: link.link_key,
         msc_filter: link.msc_filter,

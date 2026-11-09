@@ -308,6 +308,9 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
     if stream_sample_rate != preferred_sample_rate {
         config = config.with_sample_rate(stream_sample_rate);
     }
+    if let Some(w) = crate::hf_rate_warning(&config, stream_sample_rate) {
+        ev.log(w);
+    }
     let message_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
     let heartbeat_samples =
         config.sample_rate_hz as u64 * config.heartbeat_interval_ms as u64 / 1000;

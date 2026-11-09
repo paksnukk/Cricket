@@ -159,7 +159,8 @@ struct ProfileEntry {
     /// Canonical name (the value stored in settings and sent to the engine).
     name: String,
     display: String,
-    /// `"standard"` or `"advanced"` (no error correction).
+    /// `"standard"`, `"advanced"` (no error correction) or `"instrument"`
+    /// (experimental: tones above the music on the instrument cable).
     tier: String,
     is_default: bool,
     coded: bool,
@@ -172,6 +173,8 @@ struct ProfileEntry {
     airtime_ms: f32,
     /// Confidence (dB) below which the receiver does not accept a packet.
     min_confidence_db: f32,
+    /// The profile's own transmit level (peak dBFS).
+    tx_level_dbfs: f32,
 }
 
 fn profile_entries() -> Vec<ProfileEntry> {
@@ -185,6 +188,7 @@ fn profile_entries() -> Vec<ProfileEntry> {
                 tier: match p.tier {
                     ProfileTier::Standard => "standard".into(),
                     ProfileTier::Advanced => "advanced".into(),
+                    ProfileTier::Instrument => "instrument".into(),
                 },
                 is_default: p.is_default(),
                 coded: p.coded,
@@ -196,6 +200,7 @@ fn profile_entries() -> Vec<ProfileEntry> {
                 airtime_ms: repetition_samples(&c) as f32 * c.repetition_k.max(1) as f32 * 1000.0
                     / c.sample_rate_hz as f32,
                 min_confidence_db: c.min_confidence_db,
+                tx_level_dbfs: c.tx_level_dbfs(),
             }
         })
         .collect()
@@ -685,6 +690,13 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.tier == "advanced" && e.name == "ltc"));
+        let hf = entries
+            .iter()
+            .find(|e| e.name == "instrument")
+            .expect("instrument profile listed");
+        assert_eq!(hf.tier, "instrument");
+        assert!((hf.tx_level_dbfs + 30.0).abs() < 0.1);
+        assert!((entries[0].tx_level_dbfs + 12.0).abs() < 0.1);
         assert!(entries.iter().all(|e| e.airtime_ms > 0.0));
         assert!(parse_profile("robust").is_ok());
         assert!(parse_profile("Clean-Line").is_ok());

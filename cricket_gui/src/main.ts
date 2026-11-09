@@ -166,7 +166,7 @@ interface AppSettings {
 interface ProfileEntry {
   name: string;
   display: string;
-  tier: "standard" | "advanced";
+  tier: "standard" | "advanced" | "instrument";
   is_default: boolean;
   coded: boolean;
   aliases: string[];
@@ -176,6 +176,9 @@ interface ProfileEntry {
   use_when: string;
   airtime_ms: number;
   min_confidence_db: number;
+  /** The profile's own transmit level (peak dBFS): -12 for the line
+   * profiles, -30 for the instrument profiles. */
+  tx_level_dbfs: number;
 }
 
 const DEFAULT_PROFILE = "analog-safe";
@@ -504,6 +507,7 @@ async function loadProfiles() {
   const groups: [string, ProfileEntry["tier"]][] = [
     ["Standard (one per kind of line)", "standard"],
     ["Advanced: no error correction", "advanced"],
+    ["Instrument audio (experimental): tones above the music on the instrument cable", "instrument"],
   ];
   for (const [label, tier] of groups) {
     const group = document.createElement("optgroup");
@@ -676,6 +680,7 @@ async function loadDevices() {
     if (!profileRestored) {
       profileRestored = true;
       await selectSavedProfile(settings.profile);
+      lastProfileDefaultLevel = currentProfile()?.tx_level_dbfs ?? null;
     }
     if (txLevelInput.dataset.loaded !== "1") {
       txLevelInput.value = String(settings.tx_level_db ?? DEFAULT_TX_LEVEL_DB);
@@ -734,8 +739,25 @@ refreshBtn.addEventListener("click", loadDevices);
 saveSettingsBtn.addEventListener("click", () => {
   persistSettings().catch((e) => log(`Save failed: ${e}`));
 });
+/** The TX level the previously selected profile sends at by default. When
+ * the level field still holds it (never customized), a profile change moves
+ * the field to the new profile's default, so the instrument profiles start
+ * at their -30 dBFS and the line profiles at -12 dBFS. */
+let lastProfileDefaultLevel: number | null = null;
+
+function followProfileTxLevel() {
+  const p = currentProfile();
+  if (!p) return;
+  const previous = lastProfileDefaultLevel;
+  lastProfileDefaultLevel = p.tx_level_dbfs;
+  if (previous !== null && txLevelDb() === previous && previous !== p.tx_level_dbfs) {
+    txLevelInput.value = String(p.tx_level_dbfs);
+  }
+}
+
 profileSelect.addEventListener("change", () => {
   refreshProfileHint();
+  followProfileTxLevel();
   refreshSetupWarnings();
 });
 inputDeviceSelect.addEventListener("change", () => {
