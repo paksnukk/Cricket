@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use cricket_core::modem::repetition_samples;
@@ -34,7 +36,7 @@ or Unusable); 2 usage error; 3 path check verdict Marginal.";
 const EXIT_MARGINAL: u8 = 3;
 
 #[derive(Parser)]
-#[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = LONG_ABOUT)]
+#[command(name = "cricket", author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = LONG_ABOUT)]
 struct Cli {
     /// Profile, same on both ends: analog-safe (default), analog-safe-repeat,
     /// analog-fast, clean-line, clean-line-fast, digital-line,

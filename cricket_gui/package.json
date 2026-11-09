@@ -1,8 +1,14 @@
 {
   "name": "cricket_gui",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.2.0",
+  "description": "Cricket — MIDI over audio (Tauri 2 desktop app)",
+  "author": "DPM Studios",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/paksnukk/Cricket.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,8 +17,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/api": "^2.10.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1",

@@ -193,7 +193,7 @@ impl Rig {
 /// Measure wall-clock MIDI-in → MIDI-out NoteOn latency for `profile`
 /// (a [`PhyConfig::from_name`] name such as `"analog-safe"`, `"robust"`,
 /// `"clean-line"` or `"digital"`) over `note_count` notes, each held
-/// for [`HOLD`], released, and followed by a [`rest`] before the next one.
+/// for 150 ms (`HOLD`), released, and followed by a short rest (`rest`) before the next one.
 pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<LatencySummary> {
     measure_midi_loopback_with(profile, note_count, Pacing::RealTime)
 }

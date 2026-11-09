@@ -354,7 +354,7 @@ impl BmcRx {
         }
     }
 
-    /// Mean nibble reliability of the last packet (see [`margin_db`]; an
+    /// Mean nibble reliability of the last packet (the mean of `margin_db`; an
     /// ideal line is ~30-40 dB, a coin-toss bit 0 dB).
     pub fn last_confidence_db(&self) -> f32 {
         self.last_confidence_db

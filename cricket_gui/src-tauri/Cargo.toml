@@ -1,10 +1,14 @@
 [package]
 name = "cricket_gui"
-version = "1.0.0"
-description = "Cricket — MIDI over audio"
-authors = ["you"]
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "Cricket — MIDI over audio (Tauri 2 desktop app)"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -20,11 +24,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2.10", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
+dirs = "6"
 
 # Local dependencies
-cricket_core = { path = "../../cricket_core" }
-cricket_engine = { path = "../../cricket_engine" }
+cricket_core = { path = "../../cricket_core", version = "0.2.0" }
+cricket_engine = { path = "../../cricket_engine", version = "0.2.0" }

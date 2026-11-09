@@ -1,8 +1,16 @@
 [package]
 name = "cricket_core"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "AML v1 MIDI-over-audio modem: tones, LTC-style line code, packets, CRC, Reed-Solomon FEC, TX scheduler and fail-safe (no_std + alloc)"
+readme = "../README.md"
+keywords = ["midi", "audio", "modem", "msc", "no-std"]
+categories = ["multimedia::audio", "no-std", "embedded", "encoding"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["std"]

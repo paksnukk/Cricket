@@ -14,6 +14,7 @@
 //! forwarder, whose `worker_stopped` may then arrive at any later time, and
 //! Tauri does not promise that an event emitted during a command reaches the
 //! webview before that command's response.
+#![forbid(unsafe_code)]
 
 pub mod settings;
 
@@ -545,7 +546,6 @@ fn stop_encoder(state: State<'_, AppState>) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_input_devices,

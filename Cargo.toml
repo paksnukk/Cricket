@@ -6,3 +6,15 @@ members = [
     "cricket_gui/src-tauri"
 ]
 resolver = "2"
+
+# One version for the whole workspace. The next tag is v0.2.0; 1.0.0 is reserved
+# for "field test passed + API frozen" (see ROADMAP.md and docs/release-process.md).
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+authors = ["DPM Studios"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/paksnukk/Cricket"
+homepage = "https://github.com/paksnukk/Cricket"
+# `usize::is_multiple_of` (stable since 1.87) is used in cricket_core.
+rust-version = "1.87"
