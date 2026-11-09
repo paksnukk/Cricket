@@ -6,6 +6,8 @@ members = [
     "cricket_cli",
     "cricket_gui/src-tauri"
 ]
+# The cargo-fuzz targets are a package of their own (nightly, libFuzzer).
+exclude = ["cricket_core/fuzz"]
 resolver = "2"
 
 # One version for the whole workspace. The next tag is v0.2.0; 1.0.0 is reserved

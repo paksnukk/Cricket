@@ -1,0 +1,94 @@
+[package]
+name = "cricket_core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "cargo-fuzz targets for cricket_core (not part of the workspace)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.cricket_core]
+path = ".."
+
+# Standalone: `cargo fuzz` runs from this directory with its own target dir.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_packet_bytes"
+path = "fuzz_targets/decode_packet_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fec_decode_body"
+path = "fuzz_targets/fec_decode_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rs16_decode"
+path = "fuzz_targets/rs16_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "msc_parse_sysex"
+path = "fuzz_targets/msc_parse_sysex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "midi_input"
+path = "fuzz_targets/midi_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "from_name"
+path = "fuzz_targets/from_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rx_mfsk_stream"
+path = "fuzz_targets/rx_mfsk_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rx_bmc_stream"
+path = "fuzz_targets/rx_bmc_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rx_digital_stream"
+path = "fuzz_targets/rx_digital_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "modem_rx_stream"
+path = "fuzz_targets/modem_rx_stream.rs"
+test = false
+doc = false
+bench = false

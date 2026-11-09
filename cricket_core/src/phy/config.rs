@@ -437,15 +437,17 @@ impl PhyConfig {
     /// profile (both ends have to match, and a mismatch means no MIDI).
     pub fn from_name(name: &str) -> Option<Self> {
         let key = normalize(name);
-        if let Some(base) = key.strip_suffix(DIGITAL_SUFFIX) {
-            let mut config = Self::from_name(base)?;
-            config.digital_detect = true;
-            return Some(config);
-        }
-        PROFILES
-            .iter()
-            .find(|p| p.matches(&key))
-            .map(|p| (p.build)())
+        // The same lookup as `canonical_name` and `profile_info`, so the
+        // three always agree (found by fuzzing: re-normalizing the base
+        // accepted whitespace before the suffix that the others rejected).
+        let (base, digital) = match key.strip_suffix(DIGITAL_SUFFIX) {
+            Some(base) => (base, true),
+            None => (key.as_str(), false),
+        };
+        let info = PROFILES.iter().find(|p| p.matches(base))?;
+        let mut config = (info.build)();
+        config.digital_detect |= digital;
+        Some(config)
     }
 
     /// The canonical user-facing name of `name` (`"ROBUST"` →
@@ -1114,11 +1116,31 @@ mod tests {
 
     #[test]
     fn unknown_names_are_rejected() {
-        for name in ["robsut", "", "nonsense", "analog", "+digital", "ltc7200"] {
+        // The last two: whitespace between the base and the `+digital`
+        // suffix (found by the `from_name` fuzz target: `from_name` used to
+        // accept it while `canonical_name` and `profile_info` did not).
+        for name in [
+            "robsut",
+            "",
+            "nonsense",
+            "analog",
+            "+digital",
+            "ltc7200",
+            "digital \n+digital",
+            "ltc\u{a0}+digital",
+        ] {
             assert!(PhyConfig::from_name(name).is_none(), "{name:?}");
             assert!(PhyConfig::canonical_name(name).is_none(), "{name:?}");
             assert!(profile_info(name).is_none(), "{name:?}");
         }
+        // Surrounding whitespace is fine, and the suffix sets the detector.
+        let c = PhyConfig::from_name("  ltc9600+digital \n").unwrap();
+        assert!(c.digital_detect && c.bmc().is_some());
+        assert!(
+            PhyConfig::from_name("digital+digital")
+                .unwrap()
+                .digital_detect
+        );
     }
 
     #[test]

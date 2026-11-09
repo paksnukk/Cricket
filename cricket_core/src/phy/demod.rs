@@ -386,6 +386,14 @@ impl ModemRx {
         self.samples_pushed
     }
 
+    /// Input samples currently buffered (history, a lock attempt in
+    /// progress, and a body awaiting its verdict): bounded by one packet plus
+    /// a hop and the caller's chunk once the verdict is given (checked by
+    /// the fuzz targets).
+    pub fn buffered_samples(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Absolute stream position of the first sample still buffered.
     fn base(&self) -> u64 {
         self.samples_pushed - self.buffer.len() as u64

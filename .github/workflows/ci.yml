@@ -247,3 +247,52 @@ jobs:
           name: harness-${{ matrix.test }}
           path: harness-out/
           retention-days: 90
+
+  # The cargo-fuzz targets (cricket_core/fuzz): nightly + libFuzzer, so not on
+  # every push; weekly (or on demand), ten minutes per target, one job each.
+  # A crash input is uploaded as an artifact; reproduce it as CONTRIBUTING.md
+  # describes.
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decode_packet_bytes
+          - fec_decode_body
+          - rs16_decode
+          - msc_parse_sysex
+          - midi_input
+          - from_name
+          - rx_mfsk_stream
+          - rx_bmc_stream
+          - rx_digital_stream
+          - modem_rx_stream
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: fuzz
+          workspaces: cricket_core/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz for ten minutes
+        working-directory: cricket_core/fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=2048
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: cricket_core/fuzz/artifacts/
+          retention-days: 90

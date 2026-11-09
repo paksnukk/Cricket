@@ -366,7 +366,13 @@ impl MscMessage {
         if bytes.len() < 6 || bytes[0] != 0xF0 || bytes[1] != 0x7F || bytes[3] != 0x02 {
             return Err(MscError::NotMsc);
         }
-        if bytes[bytes.len() - 1] != 0xF7 || bytes[1..bytes.len() - 1].iter().any(|&b| b >= 0x80) {
+        // The shortest MSC message is F0 7F <device> 02 <format> <command> F7:
+        // a 6-byte one has no command byte (found by fuzzing: it used to
+        // index past the end).
+        if bytes.len() < 7
+            || bytes[bytes.len() - 1] != 0xF7
+            || bytes[1..bytes.len() - 1].iter().any(|&b| b >= 0x80)
+        {
             return Err(MscError::Malformed);
         }
         let cmd = bytes[5];
