@@ -33,14 +33,21 @@ Artifacts land under `cricket_gui/src-tauri/target/release/bundle/`.
 2. Do **not** put EQ, compression, limiting, or noise reduction on that bus.
 3. Set gain once; leave it alone during the show.
 4. In Cricket: pick Audio Out + MIDI In on the encoder side; Audio In + MIDI Out on the decoder side.
-5. Prefer **Robust** profile unless the chain is known-clean — then **Fast** (~60 ms).
+5. Prefer **Analog Safe** unless the chain is known-clean — then **Clean Line** (~20 ms) or, for
+   notes only, **Analog Fast** (~80 ms).
+6. **Stop** and **Panic** on the decoder send Sustain off + All Notes Off on all channels to MIDI out.
 
 ## Profiles
 
-| Profile | When | Est. first-copy |
+Named after the line they are for (the older names still work); see the main README for the table.
+
+| Profile | When | Measured NoteOn latency (in-process) |
 |---------|------|-----------------|
-| Robust | Default / unknown chain | ~136 ms |
-| Fast | Clean dedicated chain only | ~60 ms |
+| Analog Safe (`analog-safe`, was `robust`) | Default / any bus you don't control | ~0.3 s |
+| Analog Fast (`analog-fast`, was `fast`) | Clean dedicated analog line, notes only | ~80 ms |
+| Clean Line (`clean-line`, was `ltc_fec`) | Dedicated line without processing | ~20 ms |
+| Digital Line (`digital-line`, was `ltc14400_fec`) | Dante / MADI / AES at 48 / 96 kHz | ~7 ms |
+| Digital Bit-Exact (`digital-bit-exact`, was `digital`) | `cricket pathcheck` passed | < 1 ms |
 
 ## Self-test
 

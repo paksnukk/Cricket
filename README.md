@@ -75,10 +75,41 @@ audio channel instead. Large SysEx dumps would block the line for seconds.
 
 ## Profiles
 
-Both ends must use the same profile; it is not signalled on the wire. All profiles carry the same
-messages and are specified in [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md) §6.
+Both ends must use the same profile; it is not signalled on the wire, and a decoder on the wrong
+profile hears nothing (it never guesses, and a misspelt name is an error, not another profile). All
+profiles carry the same messages and are specified in [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md) §6.
+Profiles are named after the line they are for; the older wire-format names in the second column
+still work everywhere (`--profile robust` is `analog-safe`), and `cricket profiles` prints this table.
 
-| | **Robust** (default) | **Robust repeat** | **Fast** |
+### Which profile?
+
+1. **Analog line, or any bus you don't control** (EQ, compression, unknown gain)? → `analog-safe`.
+   Dropouts of 50 ms or more → `analog-safe-repeat`.
+2. **A dedicated line with nothing on it** (no EQ, dynamics or noise reduction)? Analog → `clean-line`
+   (notes only, without error correction: `analog-fast`). Digital → `clean-line-fast`, or
+   `digital-line` on Dante / MADI / AES at 48 or 96 kHz.
+3. **`cricket pathcheck` says the path is bit-exact?** → `digital-bit-exact` (under 1 ms; experimental).
+
+| Profile | Older name | Use when | Processing on the bus | Airtime per message | Measured NoteOn latency\* |
+|---|---|---|---|---|---|
+| `analog-safe` (default) | `robust` (`robust_fec`) | any bus you don't control: cues and notes | EQ, compression or a limiter are tolerated | 175.5 ms | mean ~0.27 s, p95 ~0.35 s |
+| `analog-safe-repeat` | `robust_repeat` | dropouts of 50 ms or more (every message is sent twice) | as `analog-safe` | 273 ms | mean ~0.35 s, p95 ~0.5 s |
+| `analog-fast` | `fast` | notes over a clean, dedicated analog line | none; no error correction | 57 ms | mean ~80 ms, p95 ~115 ms |
+| `clean-line` | `ltc_fec` (`ltc4800_fec`) | a dedicated line, analog or digital | none; repairs 1–3 ms dropouts and clicks | 21.8 ms | mean ~21 ms, p95 ~24 ms |
+| `clean-line-fast` | `ltc9600_fec` | a dedicated digital line (≥ 6 kHz of bandwidth) | none | 10.9 ms | mean ~11 ms |
+| `digital-line` | `ltc14400_fec` | Dante / MADI / AES at 48 or 96 kHz (≥ 16 kHz of bandwidth) | none | 7.0 ms | mean ~7 ms, p95 ~7.5 ms |
+| `digital-bit-exact` | `digital` | `cricket pathcheck` passed: samples arrive unchanged | none at all | 0.9 ms | mean ~0.6 ms |
+
+**Advanced, no error correction:** the uncoded `ltc` (= `ltc4800`), `ltc2400`, `ltc9600` and
+`ltc14400`, plus the coded `ltc2400_fec` for narrow analog lines, keep their wire-format names; the
+GUI lists them under "Advanced: no error correction". Every profile except `digital-bit-exact`
+transmits at **−12 dBFS peak** by default (`--tx-level-db`, GUI "TX level"), which leaves headroom
+on the bus; the receiver is level-independent and decodes anything from 30 dB below that to full
+scale.
+
+The three MFSK profiles in detail:
+
+| | **Analog Safe** `analog-safe` (default) | **Analog Safe Repeat** `analog-safe-repeat` | **Analog Fast** `analog-fast` |
 |---|---|---|---|
 | Use it for | Cues and notes over a chain you don't fully trust | Lines with glitches or dropouts of ~50 ms or more | Playing notes over a clean, dedicated line (no EQ, compression or limiter) |
 | Symbol | 6 ms + 0.5 ms guard | 6 ms + 0.5 ms guard | 3 ms |
@@ -89,23 +120,23 @@ messages and are specified in [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md) §6.
 | Comfortable rate | ~5 messages/s | ~3–4 messages/s | ~10–17 messages/s |
 | Measured NoteOn latency\* | mean ~265–270 ms, p95 ~340–350 ms | mean ~345–360 ms, p95 ~475–500 ms | mean ~80 ms, p95 ~115 ms |
 
-Robust finds a packet even when two of its four preamble tones are lost, and repairs up to 8 missing or
-4 wrong tones in the body. In the channel simulator it delivers as often as Robust repeat or more in
-every condition except dropouts of 50 ms and longer, where the second copy wins (60 ms dropouts: 92 %
-vs 72 % delivered). Robust repeat was the default before v1.1 (as `robust`); a profile name
-`robust_fec` from earlier builds now means Robust.
+Analog Safe finds a packet even when two of its four preamble tones are lost, and repairs up to 8
+missing or 4 wrong tones in the body. In the channel simulator it delivers as often as Analog Safe
+Repeat or more in every condition except dropouts of 50 ms and longer, where the second copy wins
+(60 ms dropouts: 92 % vs 72 % delivered). Analog Safe Repeat was the default before v1.1 (as
+`robust`); a profile name `robust_fec` from earlier builds now means Analog Safe.
 
-### LTC profiles (dedicated lines)
+### Clean-line and digital-line profiles (LTC-style, dedicated lines)
 
-The LTC profiles send the same packets as a biphase-mark code, like SMPTE timecode, in a fraction of
+These profiles send the same packets as a biphase-mark code, like SMPTE timecode, in a fraction of
 the airtime. Their wire format is in the spec (§6.5) with status **provisional**: complete and tested
 in software, but not yet proven on real show chains, so a later revision may change it.
 
 | Profile | What it is | Measured NoteOn latency\* | Needs |
 |---|---|---|---|
-| `ltc_fec` | 4800 bit/s with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~21 ms, p95 ~22–24 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter |
-| `ltc` | 4800 bit/s, uncoded (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~16 ms (`ltc9600`: ~8 ms) | As `ltc_fec`, and no dropouts or clicks |
-| `ltc14400_fec` | **Experimental, fastest LTC:** 14400 bit/s with the coded body (also uncoded `ltc14400`); 7.0 ms (5.4 ms) per message, a 4-note chord in 29 ms (22 ms); repairs dropouts up to ~0.5 ms | mean ~7 ms, p95 ~7.5 ms (`ltc14400`: ~5.5 ms) | A digital line (Dante, MADI, AES) at 48 or 96 kHz: ≥ 16 kHz bandwidth, ≥ 15 dB SNR |
+| `clean-line` (`ltc_fec`) | 4800 bit/s with a Reed–Solomon coded body (also `ltc2400_fec`, and `clean-line-fast` = `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~21 ms, p95 ~22–24 ms (`clean-line-fast`: ~11 ms) | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter |
+| `ltc` | 4800 bit/s, uncoded (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~16 ms (`ltc9600`: ~8 ms) | As `clean-line`, and no dropouts or clicks |
+| `digital-line` (`ltc14400_fec`) | **Experimental, fastest LTC:** 14400 bit/s with the coded body (also uncoded `ltc14400`); 7.0 ms (5.4 ms) per message, a 4-note chord in 29 ms (22 ms); repairs dropouts up to ~0.5 ms | mean ~7 ms, p95 ~7.5 ms (`ltc14400`: ~5.5 ms) | A digital line (Dante, MADI, AES) at 48 or 96 kHz: ≥ 16 kHz bandwidth, ≥ 15 dB SNR |
 
 An EQ boost inside the signal band breaks them (+12 dB at 3 kHz stops 4800 bit/s; 2400 bit/s survives
 it but not a 1 kHz high-pass), and 9600 bit/s needs more than ~6 kHz of bandwidth (digital lines only).
@@ -116,14 +147,15 @@ low-pass at 12 kHz.
 The measurements behind all profiles are in [docs/proposals/fec.md](docs/proposals/fec.md) and
 [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md).
 
-### Digital (bit-transparent) — experimental
+### Digital bit-exact (bit-transparent) — experimental
 
 For paths that deliver samples **unchanged** (Dante / AES67 / MADI / AES3 routed without processing, a
-USB interface's digital I/O in a bit-exact mode), `--profile digital` writes the packet straight into
+USB interface's digital I/O in a bit-exact mode), `--profile digital-bit-exact` (older name
+`digital`) writes the packet straight into
 the sample values, one nibble per sample, like SMPTE ST 337 carries data in AES3: a message is 21
 samples, sent twice (0.9 ms on air), at −57.4 dBFS peak.
 
-| | `digital` |
+| | `digital-bit-exact` (`digital`) |
 |---|---|
 | Measured NoteOn latency\* | mean ~0.5–0.7 ms, p95 ~0.6–0.8 ms; 4-note chord complete after ~3.3 ms |
 | Throughput | ~1,150 messages/s |
@@ -134,10 +166,11 @@ samples, sent twice (0.9 ms on air), at −57.4 dBFS peak.
 and tells you whether the path is bit-exact and, if not, what it does (gain, word length, dither,
 SRC / drift, polarity, offset, noise). On Windows, Cricket currently uses WASAPI shared mode, which goes
 through the Windows mixer: run the path check, and prefer macOS / Linux (ALSA `hw:` device) until
-exclusive mode / ASIO are supported. A decoder profile with `+digital` (e.g. `ltc9600+digital`) also
+exclusive mode / ASIO are supported (the CLI and GUI warn when `digital-bit-exact` or `digital-line`
+is chosen on Windows). A decoder profile with `+digital` (e.g. `clean-line-fast+digital`) also
 accepts digital frames. Design, false-accept analysis (worst case ~10¹⁰ years per false message), the
 fail-safe table and path requirements: [docs/proposals/digital-transparent.md](docs/proposals/digital-transparent.md).
-Not part of the spec yet, and not in the GUI.
+Not part of the spec yet.
 
 \* MIDI in → MIDI out through the engine, in-process (`cricket loopback`, 20–60 notes), while notes are
 being played *and released*. Real audio interfaces add their own buffering on top. Run the measurement
@@ -149,40 +182,57 @@ You need a Rust toolchain. On Linux you also need ALSA headers (`libasound2-dev`
 Node.js and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```sh
-# What audio and MIDI devices are there?
+# What audio and MIDI devices are there? Which profile?
 cargo run -p cricket_cli -- list-devices
+cargo run -p cricket_cli -- profiles
 
-# Sending side: MIDI in → tones out (by index or by exact name)
-cargo run -p cricket_cli -- encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2"
+# Sending side: MIDI in → tones out (by index or by exact name), on channel 2 of the interface
+cargo run -p cricket_cli -- encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2" --audio-out-channel 2
 
-# Receiving side: tones in → MIDI out
-cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
+# Receiving side: tones in → MIDI out. Ctrl-C sends All Notes Off before it stops;
+# `panic` + Enter sends it right away.
+cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --audio-in-channel 2 --midi-out-name "IAC Bus 1"
 
 # ... sending MSC to a console that listens on device ID 1 (default: 0x7F all-call, format 0x01)
 cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1" \
     --msc-device-id 1 --msc-format 0x01
 
-# No hardware at hand? Encoder plays a C-major scale on its own
+# A dedicated clean line? Both ends:
+cricket --profile clean-line encode ...
+cricket --profile clean-line decode ...
+
+# No hardware at hand? --simulate plays a C-major test scale (without it, and without MIDI in,
+# the encoder sends heartbeats only: a decoder on stage never gets notes nobody played)
 cargo run -p cricket_cli -- encode --simulate
 
-# How fast is it, really? (no hardware needed; default: fast,robust)
-cargo run --release -p cricket_cli -- loopback
-cargo run --release -p cricket_cli -- loopback --profiles robust,robust_repeat,fast,ltc,ltc_fec --notes 40
-cargo run --release -p cricket_cli -- loopback --profiles digital,ltc9600 --chords 20 --throughput 100
+# Quieter on the bus than the default −12 dBFS peak (the receiver doesn't mind)
+cricket --tx-level-db -20 encode --midi-in-name "My Keyboard"
 
-# Is this path bit-transparent (for --profile digital)? Sender, then receiver:
+# Machine-readable: one JSON object per line (level, stats, decoded messages, alarms)
+cricket --json decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
+
+# How fast is it, really? (no hardware needed; default: analog-fast,analog-safe)
+cargo run --release -p cricket_cli -- loopback
+cargo run --release -p cricket_cli -- loopback --profiles analog-safe,analog-safe-repeat,analog-fast,ltc,clean-line --notes 40
+cargo run --release -p cricket_cli -- loopback --profiles digital-bit-exact,ltc9600 --chords 20 --throughput 100
+
+# Is this path bit-transparent (for --profile digital-bit-exact)? Sender, then receiver:
 cricket pathcheck send --audio-out-name "Dante TX 1-2"
 cricket pathcheck receive --audio-in-name "Dante RX 1-2" --seconds 5
 cricket pathcheck sim                     # simulated paths, no hardware
 
 # Lower device latency (default: the host's buffer; ALSA uses 100 ms)
-cricket --profile digital --buffer-frames 128 decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
+cricket --profile digital-bit-exact --buffer-frames 128 decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
 ```
 
 The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).
+While a decoder or encoder runs it prints a status line every second (LINK OK / NO SIGNAL /
+SIGNAL, NO LOCK / LINK DEAD, input level in dBFS, confidence, CRC pass/fail, FEC corrections, last
+message). Exit status: 0 ok, 1 error, 2 usage error, 3 path check "Marginal".
 
 Devices are remembered **by name**, so unplugging and replugging an interface doesn't silently pick another
-one. A name that isn't present is an error.
+one. A name that isn't present is an error. Both ends warn when the chosen audio device looks like a
+built-in microphone or speaker.
 
 ### The GUI
 
@@ -192,9 +242,16 @@ npm install
 npm run tauri dev
 ```
 
-The GUI has the encoder and decoder side by side. It shows live link stats (state, confidence, CRC pass
-rate, sync losses), the TX queue and its latency, alarms for missing or stalled devices, a big red
-**Panic** button, and a **Self-Test** that measures real loopback latency for Fast and Robust.
+The GUI has the encoder and decoder side by side. A traffic light says **LINK OK / NO SIGNAL /
+SIGNAL, NO LOCK / LINK DEAD** with the time since the last heartbeat and a hint ("signal present, no
+lock: profile mismatch or EQ on the bus?"); the input meter reads in dBFS with the good window
+(−30 … 0) marked; link stats show CRC pass/fail and FEC corrections per minute, preambles found vs
+CRC fails, the TX queue and its latency. Alarms are a list with timestamps and counts that you
+acknowledge, not a banner. Each side has a red **Panic** button (the decoder's sends Sustain off +
+All Notes Off on all 16 channels straight to MIDI out, as does **Stop**), the audio channel and TX
+level are selectable, and a **Self-Test** measures real loopback latency for Analog Fast and
+Analog Safe. The test scale is an explicit checkbox; without MIDI in the encoder sends heartbeats
+only.
 
 ## Project layout
 
