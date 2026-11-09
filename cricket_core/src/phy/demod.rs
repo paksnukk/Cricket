@@ -192,14 +192,21 @@ pub struct ModemRx {
     last_confidence_db: f32,
     /// Expected body nibble count for the current packet (set by caller via `expect_body_nibbles`).
     expected_body_nibbles: usize,
+    /// Bits per symbol of the tone alphabet (`PhyConfig::bits_per_symbol`).
+    bits: u32,
+    /// Body symbols of the current attempt, on an alphabet of fewer than 16
+    /// tones: the nibble events are regrouped from them once the body is
+    /// complete (see [`pack`](super::pack)). Unused with 4 bits per symbol.
+    body_symbols: Vec<DemodResult>,
 }
 
 impl ModemRx {
     pub fn new(config: PhyConfig) -> Self {
         let tones = config.tone_table();
-        let band = config
-            .rx_band_hz
-            .map(|(lo, hi)| BandPass::new(lo, hi, config.sample_rate_hz));
+        let band = config.rx_band_hz.map(|(lo, hi)| {
+            BandPass::with_order(lo, hi, config.rx_band_order as usize, config.sample_rate_hz)
+        });
+        let bits = config.bits_per_symbol();
         Self {
             config,
             tones,
@@ -214,7 +221,70 @@ impl ModemRx {
             align_floor: 0,
             last_confidence_db: 0.0,
             expected_body_nibbles: 16, // default; encoder pads to multiple of interleave depth
+            bits,
+            body_symbols: Vec::new(),
         }
+    }
+
+    /// Body symbols to read for the expected nibbles (equal on 16 tones;
+    /// 30 for 22 nibbles on 8 tones).
+    fn expected_body_symbols(&self) -> usize {
+        super::pack::symbols_for_nibbles(self.expected_body_nibbles, self.bits)
+    }
+
+    /// Enter the body phase of a lock attempt.
+    fn start_body(&mut self) {
+        self.body_symbols.clear();
+        self.phase = RxPhase::Body {
+            collected: 0,
+            expected: self.expected_body_symbols(),
+            erased: 0,
+        };
+    }
+
+    /// Emit a body symbol: directly as a nibble on a 16-tone alphabet;
+    /// on a smaller one it is buffered, and when the body is complete each
+    /// nibble is assembled from the symbols that carry its bits, erased if
+    /// any of them was, with the least confidence and purity among them.
+    fn emit_body_symbol(
+        &mut self,
+        result: DemodResult,
+        last: bool,
+        end_sample: u64,
+        events: &mut Vec<RxEvent>,
+    ) {
+        if self.bits >= 4 {
+            events.push(RxEvent::BodyNibble { result, end_sample });
+            return;
+        }
+        self.body_symbols.push(result);
+        if !last {
+            return;
+        }
+        let symbols: Vec<u8> = self.body_symbols.iter().map(|r| r.nibble).collect();
+        let nibbles = super::pack::unpack_symbols(&symbols, self.bits, self.expected_body_nibbles);
+        for (i, &nibble) in nibbles.iter().enumerate() {
+            let (first, last) = super::pack::symbols_of_nibble(i, self.bits);
+            let parts = &self.body_symbols[first.min(symbols.len())..(last + 1).min(symbols.len())];
+            let result = parts.iter().fold(
+                DemodResult {
+                    nibble,
+                    power: f32::INFINITY,
+                    confidence_db: f32::INFINITY,
+                    purity: f32::INFINITY,
+                    erased: parts.is_empty(),
+                },
+                |acc, r| DemodResult {
+                    nibble,
+                    power: acc.power.min(r.power),
+                    confidence_db: acc.confidence_db.min(r.confidence_db),
+                    purity: acc.purity.min(r.purity),
+                    erased: acc.erased || r.erased,
+                },
+            );
+            events.push(RxEvent::BodyNibble { result, end_sample });
+        }
+        self.body_symbols.clear();
     }
 
     pub fn config(&self) -> &PhyConfig {
@@ -403,11 +473,7 @@ impl ModemRx {
                             let n = self.config.preamble.len() as u64;
                             self.attempt = Some(Attempt { trigger, aligned });
                             self.read = aligned + n * period as u64;
-                            self.phase = RxPhase::Body {
-                                collected: 0,
-                                expected: self.expected_body_nibbles,
-                                erased: 0,
-                            };
+                            self.start_body();
                             self.last_confidence_db = confidence_db;
                             events.push(RxEvent::PreambleLocked { confidence_db });
                             self.trim(hop);
@@ -483,11 +549,7 @@ impl ModemRx {
                             self.last_confidence_db = confidence_db;
                         }
                         if next >= self.config.preamble.len() {
-                            self.phase = RxPhase::Body {
-                                collected: 0,
-                                expected: self.expected_body_nibbles,
-                                erased: 0,
-                            };
+                            self.start_body();
                             events.push(RxEvent::PreambleLocked { confidence_db });
                         } else {
                             self.phase = RxPhase::ConfirmPreamble {
@@ -546,11 +608,8 @@ impl ModemRx {
                         if gate_ok {
                             self.last_confidence_db = result.confidence_db;
                         }
-                        events.push(RxEvent::BodyNibble {
-                            result,
-                            end_sample: self.read,
-                        });
                         let next = collected + 1;
+                        self.emit_body_symbol(result, next >= expected, self.read, &mut events);
                         if next >= expected {
                             // Keep the attempt (and its audio) until the
                             // caller's verdict.

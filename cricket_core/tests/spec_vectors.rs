@@ -158,6 +158,46 @@ fn mfsk_on_air_symbols() {
     }
 }
 
+/// The HF profiles (spec §6.6): `hf_robust` sends Robust's symbols on
+/// 19 000 + 166⅔ k Hz; `hf_fast` repacks the coded body into 3-bit symbols
+/// on 8 tones (19 000 + 333⅓ k Hz) after the preamble `5 2 6 1`. The Note
+/// On vector's 30 body symbols are quoted in §9.
+#[test]
+fn hf_on_air_symbols() {
+    let v = &vectors()[0];
+    let robust = PhyConfig::hf_robust();
+    assert_eq!(robust.tone_table()[0], 19_000.0);
+    assert!((robust.tone_table()[15] - 21_500.0).abs() < 0.01);
+    let fast = PhyConfig::hf_fast();
+    assert_eq!(fast.preamble, vec![5, 2, 6, 1]);
+    assert!((fast.tone_table()[7] - 21_333.3).abs() < 0.1);
+    let fast_body: Vec<u8> = "4 6 0 3 4 5 5 6 4 2 0 1 2 2 5 0 5 6 0 1 3 2 4 3 7 3 0 1 7 4"
+        .split_whitespace()
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(
+        cricket_core::phy::pack::pack_nibbles(&hex(v.coded_body), 3),
+        fast_body
+    );
+    for (config, body) in [(robust, hex(v.coded_body)), (fast, fast_body)] {
+        let audio = CricketModemTx::new(config.clone()).encode_message_with_seq(&v.msg, v.seq);
+        let rep = repetition_samples(&config) as usize;
+        assert_eq!(audio.len(), rep);
+        let mut symbols = config.preamble.clone();
+        symbols.extend(body);
+        let period = config.samples_per_symbol_period();
+        let sym = config.symbol_samples();
+        let tones = config.tone_table();
+        for (i, &want) in symbols.iter().enumerate() {
+            let at = i * period;
+            let det = best_tone(&audio[at..at + sym], &tones, config.sample_rate_hz).unwrap();
+            assert_eq!(det.index, want, "symbol {i}");
+        }
+        assert!(audio[symbols.len() * period..].iter().all(|&s| s == 0.0));
+        assert_eq!(decode_samples(config, &audio), vec![v.msg.clone()]);
+    }
+}
+
 /// The LTC profiles carry the same bodies (`ltc_fec`: the coded body,
 /// `ltc`: the uncoded one) as 4 bits per nibble. (The BMC receiver can
 /// start a second, false lock on the burst's tail, whose erased nibbles the

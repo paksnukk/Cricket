@@ -25,6 +25,41 @@ pub const DEFAULT_TX_LEVEL_DBFS: f32 = -12.0;
 /// [`DEFAULT_TX_LEVEL_DBFS`] as a peak amplitude (−12.04 dBFS).
 pub const DEFAULT_AMPLITUDE: f32 = 0.25;
 
+/// Default transmit level of the HF (instrument-audio) profiles: peak
+/// −30 dBFS ([`HF_AMPLITUDE`]). Their tones ride on an instrument's own
+/// signal, so the level is an audibility and intermodulation budget, not a
+/// headroom one: 19–21.5 kHz at −30 dBFS or less is inaudible to adults,
+/// and the tones' intermodulation residue in a tanh drive stage stays
+/// ≳ 40 dB under the program (`docs/proposals/hf-instrument.md`). A
+/// SHOULD of spec §6.6; [`PhyConfig::with_tx_level_dbfs`] changes it.
+pub const HF_TX_LEVEL_DBFS: f32 = -30.0;
+/// [`HF_TX_LEVEL_DBFS`] as a peak amplitude.
+pub const HF_AMPLITUDE: f32 = 0.031_622_78;
+
+/// Lowest tone of the HF profiles at 48 kHz (spec §6.6): 19 000 Hz, so the
+/// plan stays above 19 kHz (audible to young listeners below that) and its
+/// 16 orthogonal 166⅔ Hz tones end at 21 500 Hz, under the 21.77 kHz
+/// (0.4535 fs) passband edge of a sharp 48 kHz converter.
+pub const HF_BASE_HZ: f32 = 19_000.0;
+/// Lowest tone of the 96 kHz HF variant: 24 000 Hz, above a 48 kHz
+/// device's Nyquist, so any 48 kHz link in the path removes it entirely.
+pub const HF_BASE_96K_HZ: f32 = 24_000.0;
+/// Receiver band of the 48 kHz HF profiles: an 8th-order high-pass at
+/// 18 kHz (−1.6 dB at the lowest tone, −40 dB at 10 kHz, −80 dB at a
+/// guitar's 4 kHz resonance) and an 8th-order low-pass at 22.5 kHz
+/// (hiss and converter images above the plan).
+pub const HF_RX_BAND_HZ: (f32, f32) = (18_000.0, 22_500.0);
+/// Order of each side of the HF receiver band filter (`rx_band_order`).
+pub const HF_RX_BAND_ORDER: u8 = 8;
+/// Raised-cosine attack and release of an `hf_robust` symbol (6 ms): 1 ms.
+/// Robust's linear 0.3 ms ramps leak −40 dB of a symbol's energy below
+/// 17 kHz (the sinc² skirt of the ramp); a 1 ms raised cosine leaks
+/// −58 dB, so what reaches the audible band from −30 dBFS tones is below
+/// −88 dBFS.
+pub const HF_RAMP_MS: f32 = 1.0;
+/// Raised-cosine ramps of an `hf_fast` symbol (3 ms): 0.5 ms.
+pub const HF_FAST_RAMP_MS: f32 = 0.5;
+
 /// Peak amplitude of a level in dBFS (0 dBFS = 1.0).
 pub fn amplitude_from_dbfs(dbfs: f32) -> f32 {
     libm::powf(10.0, dbfs / 20.0)
@@ -95,6 +130,11 @@ pub struct PhyConfig {
     pub guard_gap_ms: f32,
     pub attack_ms: f32,
     pub release_ms: f32,
+    /// Symbol envelope: raised-cosine attack and release (the HF profiles,
+    /// spec §6.6, whose leakage into the audible band must stay far under
+    /// the tones) instead of the linear ramps of spec §3.1 (the baseband
+    /// profiles). Wire format.
+    pub raised_cosine_ramps: bool,
     pub amplitude: f32,
     pub tone_base_hz: f32,
     pub tone_step_hz: f32,
@@ -112,6 +152,11 @@ pub struct PhyConfig {
     /// detection, so window energy, silence floor and tone purity are
     /// measured in the tone band only. `None` disables the filter.
     pub rx_band_hz: Option<(f32, f32)>,
+    /// Receiver only: Butterworth order of each side of the
+    /// [`rx_band_hz`](Self::rx_band_hz) filter (even, 2–8). 2 on the
+    /// baseband profiles (spec §3.2); 8 on the HF profiles (spec §6.6),
+    /// whose tones sit a few kHz above an instrument 30–60 dB stronger.
+    pub rx_band_order: u8,
     /// Receiver only (spec §3.2.3): re-centre the symbol clock on every
     /// body symbol that passes the detection gate (±3 / ±6 samples), so
     /// the body survives a sample-rate mismatch of up to ~2 % between the
@@ -190,6 +235,7 @@ impl PhyConfig {
             guard_gap_ms: 0.5,
             attack_ms: 0.3,
             release_ms: 0.3,
+            raised_cosine_ramps: false,
             amplitude: DEFAULT_AMPLITUDE,
             tone_base_hz: 2500.0,
             tone_step_hz: orthogonal_step_hz(6.0),
@@ -199,6 +245,7 @@ impl PhyConfig {
             min_tone_purity: PURITY_MFSK,
             min_rms_dbfs: -60.0,
             rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(6.0), 16)),
+            rx_band_order: 2,
             rx_track_timing: true,
             repetition_k: 2,
             interleave_depth: 4,
@@ -232,6 +279,88 @@ impl PhyConfig {
         }
     }
 
+    /// **HF robust** (`hf_robust`, spec §6.6, provisional; user-facing name
+    /// `instrument`): Robust's timing (6 ms + 0.5 ms guard), preamble,
+    /// RS(11,7)×2 coded body and joint acquisition with the 16 orthogonal
+    /// 166⅔ Hz tones moved to **19.0–21.5 kHz** ([`HF_BASE_HZ`]), above a
+    /// guitar, bass or keyboard whose signal the tones ride on, and under the
+    /// 21.77 kHz passband edge of a sharp 48 kHz converter. 169 ms per
+    /// message (175.5 ms with the trailing silence), as Robust. Transmit
+    /// level [`HF_TX_LEVEL_DBFS`] (−30 dBFS peak): inaudible to adults, and
+    /// a safe intermodulation budget through a drive stage. The receiver
+    /// band-passes 18–22.5 kHz with 8th-order sides ([`HF_RX_BAND_HZ`],
+    /// [`HF_RX_BAND_ORDER`]), so the instrument's own spectrum does not
+    /// count against the tones' purity. The whole chain must run at
+    /// 48 kHz (or higher) and pass 19.0–21.5 kHz: a 44.1 kHz device, a
+    /// wireless link or a codec in the path removes the tones.
+    /// Measurements: `docs/proposals/hf-instrument.md`.
+    pub fn hf_robust() -> Self {
+        Self {
+            attack_ms: HF_RAMP_MS,
+            release_ms: HF_RAMP_MS,
+            raised_cosine_ramps: true,
+            tone_base_hz: HF_BASE_HZ,
+            amplitude: HF_AMPLITUDE,
+            rx_band_hz: Some(HF_RX_BAND_HZ),
+            rx_band_order: HF_RX_BAND_ORDER,
+            ..Self::robust()
+        }
+    }
+
+    /// **HF fast** (`hf_fast`, spec §6.6, provisional; user-facing name
+    /// `instrument-fast`): Robust's RS(11,7)×2 coded body and joint
+    /// acquisition on Fast's 3 ms symbols, with an **8-tone** alphabet of
+    /// 333⅓ Hz orthogonal tones at **19.0–21.33 kHz** (3 bits per symbol,
+    /// [`super::pack`]): 16 tones at 333⅓ Hz would need 19–24 kHz, which
+    /// no 48 kHz converter passes. The 22 body nibbles become 30 symbols;
+    /// with the 4-symbol preamble `5 2 6 1` a message is 34 × 3 = 102 ms on
+    /// air (105 ms with the trailing silence), 40 % less than `hf_robust`.
+    /// The price: a 3 ms symbol has half the energy per bin (≈ 3 dB less
+    /// hiss margin) and one erased symbol can erase two nibbles. Same
+    /// level, receiver band and line requirements as `hf_robust`.
+    pub fn hf_fast() -> Self {
+        Self {
+            symbol_duration_ms: 3.0,
+            guard_gap_ms: 0.0,
+            attack_ms: HF_FAST_RAMP_MS,
+            release_ms: HF_FAST_RAMP_MS,
+            tone_step_hz: orthogonal_step_hz(3.0),
+            n_tones: 8,
+            preamble: vec![0x5, 0x2, 0x6, 0x1],
+            ..Self::hf_robust()
+        }
+    }
+
+    /// **HF fast at 96 kHz** (`hf_fast_96k`, experimental, not in the spec):
+    /// Robust's preamble, coded body and joint acquisition on Fast's 3 ms
+    /// symbols (333⅓ Hz orthogonal tones) at **24.0–29.0 kHz**
+    /// ([`HF_BASE_96K_HZ`]), for rigs that run at 96 kHz end to end
+    /// (26 × 3 ms = 78 ms per message, 81 ms with the trailing silence). The
+    /// band lies above a 48 kHz device's Nyquist frequency, so **any 48 kHz
+    /// device, converter or link in the path removes it completely**; it is
+    /// a constructor for measurements and native 96 kHz hardware, not a
+    /// catalog profile.
+    pub fn hf_fast_96k() -> Self {
+        let step = orthogonal_step_hz(3.0);
+        Self {
+            sample_rate_hz: 96_000,
+            symbol_duration_ms: 3.0,
+            guard_gap_ms: 0.0,
+            attack_ms: HF_FAST_RAMP_MS,
+            release_ms: HF_FAST_RAMP_MS,
+            raised_cosine_ramps: true,
+            tone_base_hz: HF_BASE_96K_HZ,
+            tone_step_hz: step,
+            amplitude: HF_AMPLITUDE,
+            rx_band_hz: Some((
+                HF_BASE_96K_HZ - 1_000.0,
+                HF_BASE_96K_HZ + 15.0 * step + 1_000.0,
+            )),
+            rx_band_order: HF_RX_BAND_ORDER,
+            ..Self::robust()
+        }
+    }
+
     /// Fast profile for clean dedicated chains (user-facing name
     /// `analog-fast`). Targets ≤60 ms first-copy: 3 ms symbols, orthogonal
     /// tones (333⅓ Hz steps, 2.5–7.5 kHz: the line must pass 7.5 kHz),
@@ -244,6 +373,7 @@ impl PhyConfig {
             guard_gap_ms: 0.0,
             attack_ms: 0.15,
             release_ms: 0.15,
+            raised_cosine_ramps: false,
             amplitude: DEFAULT_AMPLITUDE,
             tone_base_hz: 2500.0,
             tone_step_hz: orthogonal_step_hz(3.0),
@@ -253,6 +383,7 @@ impl PhyConfig {
             min_tone_purity: PURITY_MFSK,
             min_rms_dbfs: -60.0,
             rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(3.0), 16)),
+            rx_band_order: 2,
             rx_track_timing: true,
             repetition_k: 1,
             interleave_depth: 4,
@@ -295,6 +426,7 @@ impl PhyConfig {
             guard_gap_ms: 0.0,
             attack_ms: 0.0,
             release_ms: 0.0,
+            raised_cosine_ramps: false,
             amplitude: DEFAULT_AMPLITUDE,
             tone_base_hz: 0.0,
             tone_step_hz: 0.0,
@@ -304,6 +436,7 @@ impl PhyConfig {
             min_tone_purity: 0.0,
             min_rms_dbfs: -60.0,
             rx_band_hz: None,
+            rx_band_order: 2,
             rx_track_timing: false,
             repetition_k: 1,
             interleave_depth: 4,
@@ -366,6 +499,7 @@ impl PhyConfig {
             guard_gap_ms: 0.0,
             attack_ms: 0.0,
             release_ms: 0.0,
+            raised_cosine_ramps: false,
             amplitude: super::digital::PEAK,
             tone_base_hz: 0.0,
             tone_step_hz: 0.0,
@@ -375,6 +509,7 @@ impl PhyConfig {
             min_tone_purity: 0.0,
             min_rms_dbfs: -120.0,
             rx_band_hz: None,
+            rx_band_order: 2,
             rx_track_timing: false,
             repetition_k: 2,
             interleave_depth: 4,
@@ -469,9 +604,27 @@ impl PhyConfig {
             }
             Modulation::Mfsk => {}
         }
-        let symbols = self.preamble.len() + body_nibbles;
+        let symbols = self.preamble.len() + self.body_symbols();
         let period_ms = self.symbol_duration_ms + self.guard_gap_ms;
         symbols as f32 * period_ms
+    }
+
+    /// Bits one MFSK symbol carries: 4 with 16 tones, 3 with 8
+    /// ([`super::pack`]). 4 for the non-MFSK profiles (one nibble).
+    pub fn bits_per_symbol(&self) -> u32 {
+        match self.modulation {
+            Modulation::Mfsk => super::pack::bits_per_symbol(self.n_tones),
+            _ => 4,
+        }
+    }
+
+    /// Symbols of one body on the wire: the body nibbles
+    /// ([`FecMode::body_nibbles`]) repacked into
+    /// [`bits_per_symbol`](Self::bits_per_symbol)-bit symbols (22 → 30 on
+    /// an 8-tone plan; equal to the nibble count on 16 tones and on the
+    /// non-MFSK profiles).
+    pub fn body_symbols(&self) -> usize {
+        super::pack::symbols_for_nibbles(self.fec.body_nibbles(), self.bits_per_symbol())
     }
 
     pub fn symbol_samples(&self) -> usize {
@@ -521,6 +674,10 @@ pub enum ProfileTier {
     /// Uncoded variants (and `ltc2400_fec`) under their wire-format names,
     /// for operators who know their line.
     Advanced,
+    /// Experimental: MIDI embedded on an instrument's own signal in the
+    /// near-ultrasonic band (spec §6.6, provisional), extracted by a box
+    /// that passes the audio through.
+    Instrument,
 }
 
 /// One entry of the profile catalog ([`PROFILES`]): the user-facing name,
@@ -728,6 +885,30 @@ pub static PROFILES: &[ProfileInfo] = &[
         coded: true,
         build: PhyConfig::robust_fast,
     },
+    ProfileInfo {
+        name: "instrument",
+        aliases: &["hf_robust"],
+        tier: ProfileTier::Instrument,
+        display: "Instrument (experimental)",
+        line: "an instrument's own signal (guitar, bass, keys) on a 48 kHz chain: Analog Safe's tones moved to 19.0–21.5 kHz, above the music, sent at −30 dBFS",
+        processing: "buffers and clean boosts before the box are fine; no 44.1 kHz device, codec or wireless link, and no gate, compressor or drive ahead of the box",
+        latency: "~0.2 s (measured in-process: mean ~0.21 s, p95 ~0.33 s)",
+        use_when: "MIDI embedded in the instrument cable and extracted by a box that passes the audio through; experimental, spec §6.6 (provisional)",
+        coded: true,
+        build: PhyConfig::hf_robust,
+    },
+    ProfileInfo {
+        name: "instrument-fast",
+        aliases: &["hf_fast"],
+        tier: ProfileTier::Instrument,
+        display: "Instrument Fast (experimental)",
+        line: "as Instrument: 8 tones at 19.0–21.33 kHz on 3 ms symbols, the same error correction, 105 ms per message instead of 175.5 ms",
+        processing: "as Instrument; loses more to dropouts of 10 ms and longer (30 ms: 84 % vs 96 % delivered in the simulator)",
+        latency: "~0.12 s (measured in-process: mean ~0.12 s, p95 ~0.2 s)",
+        use_when: "playing notes over the instrument cable when Instrument is too slow and the line has no dropouts; experimental, spec §6.6 (provisional)",
+        coded: true,
+        build: PhyConfig::hf_fast,
+    },
 ];
 
 /// Catalog entry of a user-facing or wire-format name (a `+digital` suffix
@@ -755,6 +936,7 @@ mod tests {
             ("digital-line", "ltc14400_fec"),
             ("digital-bit-exact", "digital"),
             ("ltc", "ltc4800"),
+            ("instrument", "hf_robust"),
         ] {
             let x = PhyConfig::from_name(a).unwrap_or_else(|| panic!("{a}"));
             let y = PhyConfig::from_name(b).unwrap_or_else(|| panic!("{b}"));
@@ -849,6 +1031,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The HF profile is Robust moved up: same timing, body, acquisition
+    /// and fail-safe, tones at 19.0–21.5 kHz, −30 dBFS, steep 18–22.5 kHz
+    /// receiver band. The 96 kHz variant sits above 24 kHz.
+    #[test]
+    fn hf_profiles_are_robust_moved_up() {
+        let hf = PhyConfig::hf_robust();
+        let r = PhyConfig::robust();
+        assert_eq!(hf.symbol_duration_ms, r.symbol_duration_ms);
+        assert_eq!(hf.guard_gap_ms, r.guard_gap_ms);
+        assert_eq!(hf.preamble, r.preamble);
+        assert_eq!(hf.fec, r.fec);
+        assert_eq!(hf.acquisition, r.acquisition);
+        assert_eq!(hf.repetition_k, 1);
+        assert_eq!((hf.heartbeat_interval_ms, hf.link_dead_ms), (500, 2000));
+        assert_eq!(hf.tone_step_hz, r.tone_step_hz);
+        assert_eq!(hf.tone_hz(0), 19_000.0);
+        assert!((hf.tone_hz(15) - 21_500.0).abs() < 0.01);
+        assert!((hf.tone_hz(6) - 20_000.0).abs() < 0.01);
+        assert!((hf.tx_level_dbfs() - HF_TX_LEVEL_DBFS).abs() < 0.05);
+        assert_eq!(hf.rx_band_hz, Some(HF_RX_BAND_HZ));
+        assert_eq!(hf.rx_band_order, 8);
+        assert_eq!(hf.estimated_first_copy_ms(), r.estimated_first_copy_ms());
+        // Every tone is a whole Goertzel bin of the 288-sample window.
+        for k in 0..16u8 {
+            let bins = hf.tone_hz(k) * hf.symbol_samples() as f32 / hf.sample_rate_hz as f32;
+            assert!(
+                (bins - libm::roundf(bins)).abs() < 1e-3,
+                "tone {k}: {bins} bins"
+            );
+        }
+        let hf96 = PhyConfig::hf_fast_96k();
+        assert_eq!(hf96.sample_rate_hz, 96_000);
+        assert_eq!(hf96.tone_hz(0), 24_000.0);
+        assert!((hf96.tone_hz(15) - 29_000.0).abs() < 0.01);
+        assert_eq!(hf96.fec, r.fec);
+        assert!((hf96.estimated_first_copy_ms() - 78.0).abs() < 1e-3);
+        assert!(hf96.rx_band_hz.unwrap().0 > 22_050.0);
+        // Catalog: the `instrument` tier, aliases, default level.
+        let info = profile_info("hf-robust").unwrap();
+        assert_eq!(info.name, "instrument");
+        assert_eq!(info.tier, ProfileTier::Instrument);
+        assert!(PhyConfig::from_name("INSTRUMENT").is_some());
+        assert!((PhyConfig::from_name("hf_robust").unwrap().amplitude - HF_AMPLITUDE).abs() < 1e-6);
+        assert!(PhyConfig::from_name("hf_fast_96k").is_none());
     }
 
     #[test]

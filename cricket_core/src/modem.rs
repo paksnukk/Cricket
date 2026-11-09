@@ -139,7 +139,8 @@ pub fn repetition_samples(config: &PhyConfig) -> u64 {
         Modulation::Digital => return digital::MAX_FRAME_SAMPLES as u64,
         Modulation::Mfsk => {}
     }
-    ((config.preamble.len() + body_nibbles + 1) * config.samples_per_symbol_period()) as u64
+    ((config.preamble.len() + config.body_symbols() + 1) * config.samples_per_symbol_period())
+        as u64
 }
 
 /// Least spacing between the repeats of one released note for `config` at
