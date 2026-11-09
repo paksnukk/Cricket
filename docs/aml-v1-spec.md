@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Protocol** | AML (AudioMIDI Link) version **1**: header version nibble `1` (§4.1) |
-| **Document** | AML v1 — revision **r5**, 2026-11-09 |
-| **Status** | Pre-release draft. §3–§5 and §6.1–§6.4 are complete and tested in software; §6.5 is **provisional**. Nothing has been proven on a real show chain yet (see §7). Revision r5 is the wire format frozen by the first tagged release of the reference implementation (Cricket **v0.2.0**, 2026-11-09) for the stable sections, under the policy below. |
+| **Document** | AML v1 — revision **r6**, 2026-11-09 |
+| **Status** | Pre-release draft. §3–§5 and §6.1–§6.4 are complete and tested in software; §6.5 and §6.6 are **provisional**. Nothing has been proven on a real show chain yet (see §7). Revision r5 is the wire format frozen by the first tagged release of the reference implementation (Cricket **v0.2.0**, 2026-11-09) for the stable sections, under the policy below; r6 adds a provisional section only. |
 | **Reference implementation** | Cricket (`cricket_core`), <https://github.com/paksnukk/Cricket>; test vectors in §9 are asserted by its test suite |
 | **Informative material** | `docs/proposals/fec.md`, `docs/proposals/ltc-bmc.md` (adopted), `docs/proposals/digital-transparent.md` (experimental, not part of v1) |
 
@@ -18,6 +18,8 @@
 | r4 | 2026-11-09 | **Wire change: orthogonal tone spacing.** The MFSK tone step becomes 1 / symbol duration (§3.1): Robust and Robust repeat 166⅔ Hz (tones 2500 … 5000 Hz, was 100 Hz / 2500 … 4000 Hz), Fast 333⅓ Hz (2500 … 7500 Hz, was 200 Hz / 2500 … 5500 Hz); the line bandwidth each profile needs is now a MUST (§6). Receiver (SHOULD, §3.2): tone-band input filter, purity gate 0.20 for every profile (was 0.25 / 0.30), the joint-acquisition contradiction bar at the gate purity, uncoded bodies keep the best guess instead of aborting, body symbol clock tracking. §9 tone frequencies updated. Both ends must run r4: an r3 receiver hears nothing from an r4 transmitter and vice versa. |
 | r5 | 2026-11-09 | **Released with Cricket v0.2.0.** **Wire change (policy rule 1):** the CRC-16 init value is the **link key** (§4.1); the default key `0xFFFF` is the CRC-16/CCITT-FALSE init, so an unkeyed link is bit-identical to r3 and interoperates with it. §4.7 adds the wrong-key count (informative). Fail-safe: timers per profile (§5.3, §6 table, §6.5; shorter from 9600 bit/s and on `digital`), the burst releases the receiver's sounding notes explicitly and MAY be disabled for cue-only links, a suppressed duplicate re-arms link-dead (§5.3). MSC: the transmitter MAY filter by device ID / command format for multi-device rigs (§5.4). Scheduler (§5.5, TX policy, no wire effect): MSC ahead of Note Off; the Note On limit per profile with drop-newest; Note Off repeats on a Fibonacci schedule after a quiet line (coded profiles); controller state refreshed in Heartbeat slots; §5.5 "at most 4 Note Ons" statement replaced. |
 
+| r6 | 2026-11-09 | **New provisional section §6.6 (policy rule 3): the HF (instrument-audio) profiles** `hf_robust` (user-facing `instrument`) and `hf_fast` (`instrument-fast`), MIDI embedded on an instrument's own signal at 19.0–21.5 kHz and extracted by a box that passes the audio through. New wire elements for these profiles only: raised-cosine symbol ramps, an 8-tone alphabet with 3-bit symbols (`hf_fast`), a −30 dBFS level SHOULD, and the line requirements. Receiver (SHOULD): an 8th-order tone-band filter. §6 lists the identifiers; §9 gives the on-air symbols. The stable sections are unchanged: an r5 implementation interoperates with r6 on every profile it has. |
+
 Revisions are numbered r1, r2, … per document; a revision id and date identify the text an
 implementation or a measurement refers to. The crate version of the reference implementation is
 independent of the revision number.
@@ -30,8 +32,8 @@ independent of the revision number.
    §6.1–§6.4) bumps the header version nibble (§4.1) and starts a new document (AML v2); the v1
    document is then frozen except for errata. A receiver MUST NOT deliver packets whose version
    nibble it does not implement (§4.7).
-3. **Provisional and experimental sections** (today §6.5; the `ltc14400*` and `digital` profiles are
-   not in the spec) may change with a spec revision and a **minor** bump of the crates. Such a change
+3. **Provisional and experimental sections** (today §6.5 and §6.6; the `ltc14400*` and `digital`
+   profiles are not in the spec) may change with a spec revision and a **minor** bump of the crates. Such a change
    is a wire change for those profiles only; both ends must run the same revision.
 4. **Errata are appended** to the *Errata* list below with a date and the affected section, never
    silently edited into the text. The next revision that folds an erratum into the text references
@@ -721,15 +723,17 @@ message is playing waits for that message only, not for one already encoded behi
 
 Profile identifiers (case-insensitive; `-` and `_` are equivalent): `robust`, `robust_repeat`,
 `fast`, `ltc2400`, `ltc` (= `ltc4800`), `ltc9600`, `ltc2400_fec`, `ltc_fec` (= `ltc4800_fec`),
-`ltc9600_fec`. The reference implementation also accepts `robust_fec`, the former name of `robust`,
-and rejects an unknown name (it MUST NOT substitute another profile: both ends have to match).
+`ltc9600_fec`, and the provisional `hf_robust`, `hf_fast` (§6.6). The reference implementation also
+accepts `robust_fec`, the former name of `robust`, and rejects an unknown name (it MUST NOT
+substitute another profile: both ends have to match).
 
 User-facing names (Cricket; informative, equivalent to the identifiers above): `analog-safe` =
 `robust`, `analog-safe-repeat` = `robust_repeat`, `analog-fast` = `fast`, `clean-line` = `ltc_fec`,
 `clean-line-fast` = `ltc9600_fec`, `digital-line` = `ltc14400_fec` (not in this spec),
 `digital-bit-exact` = `digital` (not in this spec), `analog-safe-fast` = `robust_fast` (experimental,
 not in this spec: Robust's preamble and coded body on 4 ms symbols with 250 Hz orthogonal tones,
-2.5–6.25 kHz, 108 ms per message). The uncoded LTC profiles keep their identifiers.
+2.5–6.25 kHz, 108 ms per message), `instrument` = `hf_robust` and `instrument-fast` = `hf_fast`
+(§6.6). The uncoded LTC profiles keep their identifiers.
 
 | | Robust (default) | Robust repeat | Fast | LTC family (§6.5) |
 |---|---|---|---|---|
@@ -902,6 +906,88 @@ Measured with the reference receiver (`docs/proposals/ltc-bmc.md` §4, §9): ≥
 22 % / 0 %); MIDI-in → MIDI-out NoteOn latency in loopback ~22 ms (`ltc`) and ~26 ms (`ltc_fec`).
 The MFSK and BMC receivers never decode each other's audio, so a receiver MAY run both in parallel.
 
+### 6.6 HF (instrument-audio) profiles — status: provisional
+
+MFSK-16 (§3) with the tones moved to the near-ultrasonic band **above an instrument's own signal**:
+a guitar, bass or keyboard carries MIDI on its own cable, and a box on the pedalboard taps the signal
+(analog pass-through, high-impedance tap) and extracts it. The link layer (§4), the transport
+messages (§5), the fail-safe and the scheduler are those of Robust; only the tone plan, the symbol
+envelope, the level and (for `hf_fast`) the alphabet differ. **Provisional** as §6.5: complete and
+tested in software (`docs/proposals/hf-instrument.md`), not yet on a real instrument chain, and a
+later revision MAY change these parameters.
+
+| | `hf_robust` (`instrument`) | `hf_fast` (`instrument-fast`) |
+|---|---|---|
+| Sample rate | 48 000 Hz (the whole chain, see below) | 48 000 Hz |
+| Tones | 16: 19 000 + 166⅔ `k` Hz (19.0–21.5 kHz) | **8**: 19 000 + 333⅓ `k` Hz, `k` = 0–7 (19.0–21.33 kHz) |
+| Bits per symbol | 4 (one nibble) | **3** (see below) |
+| Symbol + guard | 6.0 + 0.5 ms (as Robust) | 3.0 + 0 ms (as Fast) |
+| Attack / release | **raised cosine**, 1.0 ms each | raised cosine, 0.5 ms each |
+| Amplitude `A` (peak; SHOULD) | **0.0316 (−30 dBFS)** | 0.0316 (−30 dBFS) |
+| Preamble | `A 5 C 3` (as Robust) | `5 2 6 1` (tone indices; `A` and `C` do not exist on 8 tones) |
+| Body | 22 coded nibbles (§4.6), 22 symbols | 22 coded nibbles → **30 symbols** |
+| Copies K | 1 | 1 |
+| Silence after the copy | 1 symbol period | 1 symbol period |
+| One copy on air / airtime per message | 169 ms / 175.5 ms | 102 ms / 105 ms |
+| Dedup window (§4.4) | 263 ms | 157.5 ms |
+| Acquisition (RX, §3.2) | joint, 2 misses | joint, 2 misses |
+| Input filter (RX) | **8th-order** Butterworth high-pass 18.0 kHz + low-pass 22.5 kHz | same |
+| Purity / confidence gate (RX) | 0.20 / 3.0 dB | 0.20 / 3.0 dB |
+| Body erasures kept (RX) | ≤ 8 symbols | ≤ 8 symbols |
+| Heartbeat / link-dead (§5.3) | 500 ms / 2000 ms | 500 ms / 2000 ms |
+
+**Symbol envelope.** The ramps are raised cosines instead of §3.1's linear ramps: with `env[i] =
+½ − ½ cos(π i / A)` for `i < A` and the mirror image over the last `R` samples. A linear 0.3 ms
+ramp puts −40 dB of a symbol's energy below 17 kHz (the sinc² skirt of the ramp), a 1 ms raised
+cosine −58 dB, so what the tones themselves leave in the audible band is below −88 dBFS at the
+level above. Every other rule of §3.1 holds (phase 0 at every symbol start, one copy = preamble +
+body + one period of silence).
+
+**3-bit symbols (`hf_fast`).** 16 tones at 333⅓ Hz would need 19.0–24.0 kHz, which no 48 kHz
+converter passes, so `hf_fast` uses 8 tones and carries 3 bits per symbol. The body nibbles of §4.6
+are read as a bit stream, MSB first, and cut into 3-bit symbols; the last symbol is zero-padded
+(22 nibbles = 88 bits → 30 symbols = 90 bits). The receiver reassembles the nibbles from the symbol
+bits; a nibble whose symbols include an erasure is an erasure for the decoder, with the smaller
+confidence of its symbols as its reliability. The preamble is given in tone indices. The price of the
+smaller alphabet is paid in dropouts, not in level: one erased symbol can erase two nibbles, so a
+30 ms dropout costs `hf_fast` 16 % of messages against 4 % for `hf_robust`, while both deliver
+100 % down to −50 dBFS over a guitar, bass or keyboard.
+
+**Level (SHOULD).** A transmitter SHOULD send at `A` = 0.0316 (−30 dBFS peak) and MAY go down to
+−50 dBFS where the line is quiet, or up to −20 dBFS where a full-band source (cymbal samples, a bright
+synth) shares the cable. The receiver is level-independent (§3.2) and in the simulator delivers 100 %
+from −20 to −50 dBFS over every instrument source measured, with a pedalboard hiss floor of −85 dBFS
+and a power-supply spur of −40 dBFS in a tone slot. The budget behind −30 dBFS: 19–21.5 kHz at or
+below −30 dBFS is inaudible to adult listeners through a full-range system (and the band stays above
+19 kHz, which young listeners can hear); and the intermodulation residue the tones leave when they
+pass **through a nonlinear stage** scales with their level: −38 dB under the program through a clean
+boost, but only −17 dB through a fuzz at −30 dBFS (10–20 dB better per 10 dB less). The tones MUST
+therefore be extracted, or stripped, before any drive stage; see the line requirements.
+
+**Line requirements (MUST).** Between the embedder and the box the signal path MUST run at 48 kHz
+or higher end to end and pass 19.0–21.5 kHz (19.0–21.33 kHz for `hf_fast`): analog copper (any
+length, buffers, clean boosts, a compressor or a noise gate before the box are tolerated), or 48 kHz
+PCM. The following remove or break the band and are NOT supported: a 44.1 kHz device or sample-rate
+conversion (a half-band converter may pass the plan, a sharp SRC takes the top tones; measured 96 %
+on a quiet line and not relied on), a wireless link or codec (a 19 kHz band limit delivers 0–40 %),
+a sample-rate mismatch between the ends above ±0.3 % (`hf_robust`; a 1 % mismatch moves the tones
+by 1.3 bins) or ±0.5 % (`hf_fast`), and any drive, distortion or clipping between the embedder and
+the box. Crystal-clocked converters at both ends (≤ ±200 ppm) are far inside the drift limit. A
+96 kHz variant (16 × 333⅓ Hz at 24.0–29.0 kHz, 3 ms symbols; `PhyConfig::hf_fast_96k`) exists for
+rigs that run at 96 kHz end to end and is not in this specification: any 48 kHz device in the path
+removes it completely.
+
+**Receiver (SHOULD).** As §3.2 with the input filter of eighth order on both sides: an instrument's
+own spectrum is 30–60 dB stronger a few kHz below the band, and the second-order filter of §3.2 would
+let a guitar's 3–5 kHz resonance into the purity measurement at −26 dB (100 % → 22 % delivered at
+−50 dBFS over a guitar; 0 % → 100 % through a slow-roll-off converter at −30 dBFS). The band filter
+costs 8 biquad sections (40 multiply-adds) per sample; the reference receiver spends ~62 ns per
+sample idle and ~96 ns busy on a desktop core (Robust: 54 / 74 ns). Measured false messages: none in
+60 s each of guitar, bass, keys, bright synth, cymbals, white noise, speech, music, MFSK and LTC
+traffic (no phy lock at all: the band filter removes everything below 18 kHz), and the baseband
+receivers never lock on HF traffic; the false-accept bounds of `docs/proposals/fec.md` §9 apply
+unchanged since the body code and the CRC are Robust's.
+
 ## 7. Release assumptions
 
 - Dedicated mono path (analog XLR, Dante, MADI, virtual loop) treated like LTC
@@ -951,6 +1037,13 @@ symbol period of silence. Robust repeat sends `A 5 C 3 1 9 6 B …` twice, Fast 
 (333⅓ Hz steps: 5833⅓, 4166⅔, 2833⅓, 5500, 4500, 6166⅔ Hz, …) once. The
 LTC profiles send the same body nibbles, MSB first, after their sync: `ltc_fec`'s first body bits for
 the NoteOn are `1001 1000 0011 1001 …`.
+
+The HF profiles (§6.6): `hf_robust` sends Robust's 26 symbols on 19 000 + 166⅔ k Hz (`A 5 C 3 9 8
+3 9 …` = 20 666⅔, 19 833⅓, 21 000, 19 500, 20 500, 20 333⅓, 19 500, 20 500 Hz, …). `hf_fast` sends
+the preamble `5 2 6 1` and the coded body repacked into 30 three-bit symbols, `4 6 0 3 4 5 5 6 4 2 0
+1 2 2 5 0 5 6 0 1 3 2 4 3 7 3 0 1 7 4` (tone indices on 19 000 + 333⅓ k Hz: 20 666⅔, 19 666⅔,
+21 000, 19 333⅓, then 20 333⅓, 21 000, 19 000, 20 000 Hz, …), then one symbol period of silence.
+Asserted by `spec_vectors.rs` (`hf_on_air_symbols`).
 
 ## 10. Design history
 
