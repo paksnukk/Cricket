@@ -13,6 +13,30 @@ nothing but, well, crickets, it sends All Notes Off so no note is left droning.
 Cricket speaks **AML v1** (AudioMIDI Link), an open protocol for MIDI over audio, specified in
 [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md). Anything else that speaks AML v1 can talk to it.
 
+> **Status: measured in software only.** Every number in this README comes from `cricket loopback`
+> (MIDI in → MIDI out through the engine, in-process) or from the channel simulator, **not from a real
+> show chain**. Use Cricket as a backup line before you trust it with the main cue, and send a
+> [field report](.github/ISSUE_TEMPLATE/field-report.md) either way. The next release is **v0.2.0**; see
+> [`ROADMAP.md`](ROADMAP.md).
+
+## Quick start
+
+1. **Get a binary.** Download `cricket` (CLI) or the Cricket desktop app for your OS from the
+   [Releases page](https://github.com/paksnukk/Cricket/releases) once a release exists, or build from
+   source: a Rust toolchain (1.87+), on Linux also `libasound2-dev`, then `cargo install --path cricket_cli`
+   (or `cargo build --release` → `target/release/cricket`).
+2. **Patch a dedicated mono audio channel** from the sending machine to the receiving one. No EQ,
+   compressor, limiter or noise gate on that channel; set its gain once and leave it.
+3. **See your devices:** `cricket list-devices`.
+4. **Sending side** (MIDI in → tones out): `cricket encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2"`
+5. **Receiving side** (tones in → MIDI out): `cricket decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"`
+6. **Same profile on both ends** (`analog-safe` is the default; `cricket profiles` lists them, see [Profiles](#profiles)).
+7. **No hardware?** `cricket encode --simulate` plays a C-major test scale (without it, and without MIDI in, the encoder sends heartbeats only); `cricket loopback` measures latency in-process.
+8. **Something wrong?** See [Troubleshooting](#troubleshooting).
+
+The desktop app does the same with the encoder and decoder side by side: `cd cricket_gui && npm install && npm run tauri dev`
+(needs Node.js and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)).
+
 ```
  ┌───────────┐  MIDI   ┌─────────┐  ♪ audio ♪  ┌──────────────────┐  ♪ audio ♪  ┌─────────┐  MIDI   ┌──────────┐
  │ keyboard, │ ──────▶ │ Cricket │ ──────────▶ │ Dante / MADI /   │ ──────────▶ │ Cricket │ ──────▶ │ synth,   │
@@ -176,25 +200,22 @@ Not part of the spec yet.
 being played *and released*. Real audio interfaces add their own buffering on top. Run the measurement
 yourself rather than trusting this table.
 
-## Quick start
-
-You need a Rust toolchain. On Linux you also need ALSA headers (`libasound2-dev`). The GUI additionally needs
-Node.js and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/).
+## The CLI in more detail
 
 ```sh
 # What audio and MIDI devices are there? Which profile?
-cargo run -p cricket_cli -- list-devices
-cargo run -p cricket_cli -- profiles
+cricket list-devices
+cricket profiles
 
 # Sending side: MIDI in → tones out (by index or by exact name), on channel 2 of the interface
-cargo run -p cricket_cli -- encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2" --audio-out-channel 2
+cricket encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2" --audio-out-channel 2
 
 # Receiving side: tones in → MIDI out. Ctrl-C sends All Notes Off before it stops;
 # `panic` + Enter sends it right away.
-cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --audio-in-channel 2 --midi-out-name "IAC Bus 1"
+cricket decode --audio-in-name "Dante RX 1-2" --audio-in-channel 2 --midi-out-name "IAC Bus 1"
 
 # ... sending MSC to a console that listens on device ID 1 (default: 0x7F all-call, format 0x01)
-cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1" \
+cricket decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1" \
     --msc-device-id 1 --msc-format 0x01
 
 # A dedicated clean line? Both ends:
@@ -203,7 +224,7 @@ cricket --profile clean-line decode ...
 
 # No hardware at hand? --simulate plays a C-major test scale (without it, and without MIDI in,
 # the encoder sends heartbeats only: a decoder on stage never gets notes nobody played)
-cargo run -p cricket_cli -- encode --simulate
+cricket encode --simulate
 
 # Quieter on the bus than the default −12 dBFS peak (the receiver doesn't mind)
 cricket --tx-level-db -20 encode --midi-in-name "My Keyboard"
@@ -212,9 +233,9 @@ cricket --tx-level-db -20 encode --midi-in-name "My Keyboard"
 cricket --json decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
 
 # How fast is it, really? (no hardware needed; default: analog-fast,analog-safe)
-cargo run --release -p cricket_cli -- loopback
-cargo run --release -p cricket_cli -- loopback --profiles analog-safe,analog-safe-repeat,analog-fast,ltc,clean-line --notes 40
-cargo run --release -p cricket_cli -- loopback --profiles digital-bit-exact,ltc9600 --chords 20 --throughput 100
+cricket loopback
+cricket loopback --profiles analog-safe,analog-safe-repeat,analog-fast,ltc,clean-line --notes 40
+cricket loopback --profiles digital-bit-exact,ltc9600 --chords 20 --throughput 100
 
 # Is this path bit-transparent (for --profile digital-bit-exact)? Sender, then receiver:
 cricket pathcheck send --audio-out-name "Dante TX 1-2"
@@ -225,8 +246,8 @@ cricket pathcheck sim                     # simulated paths, no hardware
 cricket --profile digital-bit-exact --buffer-frames 128 decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
 ```
 
-The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).
-While a decoder or encoder runs it prints a status line every second (LINK OK / NO SIGNAL /
+From a source checkout, replace `cricket` with `cargo run -p cricket_cli --` (add `--release` for
+`loopback`). While a decoder or encoder runs it prints a status line every second (LINK OK / NO SIGNAL /
 SIGNAL, NO LOCK / LINK DEAD, input level in dBFS, confidence, CRC pass/fail, FEC corrections, last
 message). Exit status: 0 ok, 1 error, 2 usage error, 3 path check "Marginal".
 
@@ -252,6 +273,59 @@ All Notes Off on all 16 channels straight to MIDI out, as does **Stop**), the au
 level are selectable, and a **Self-Test** measures real loopback latency for Analog Fast and
 Analog Safe. The test scale is an explicit checkbox; without MIDI in the encoder sends heartbeats
 only.
+Build instructions: [`cricket_gui/README.md`](cricket_gui/README.md).
+
+
+## Troubleshooting
+
+| Symptom | Look at | Fix |
+|---|---|---|
+| Decoder shows NO SIGNAL (stays in `Search`, CRC pass count 0) | Is audio arriving at all? The dBFS input meter / `input_level` event; `cricket list-devices` and `--audio-in-channel` for the right input and channel; both ends on the **same profile** (a misspelt name is an error, not another profile) | Patch and select the right channel; match `--profile`; raise the send level if the far end is below the −60 dBFS silence floor |
+| SIGNAL, NO LOCK; or `Locked` for a moment, then `Search` again; many sync losses | The chain: a gate, compressor, limiter or EQ on the Cricket channel; sample-rate conversion on a digital path; a profile mismatch | Remove processing from that channel (treat it like LTC); try `analog-safe`; on digital lines run `cricket pathcheck` |
+| Notes arrive but some hang, or arrive late | TX queue depth and latency in the GUI; the profile's comfortable rate; dense controller data | Use a faster profile on a clean line, play fewer simultaneous messages, let the fail-safe clear notes (link dead → All Notes Off) |
+| Everything works until someone touches the fader | Level within −30…0 dB of transmit level? Clipping on the way in? | Keep the default −12 dBFS send level (`--tx-level-db`); level is otherwise irrelevant to detection |
+| `clean-line*` / `digital-line` never lock, `analog-*` profiles do | Bandwidth and EQ: the LTC-style profiles need ≥ 6 kHz (`clean-line-fast`) or ≥ 16 kHz (`digital-line`), no EQ boost in band | Use `clean-line` (or `ltc2400_fec`) on analog paths, `clean-line-fast` / `digital-line` on digital lines only |
+| `--profile digital-bit-exact` gives nothing | `cricket pathcheck receive` verdict: gain, SRC, dither, mixer? | Route the channel bit-exact (no gain, no SRC, no mixing); on Windows prefer another OS until exclusive mode exists (the CLI and GUI warn) |
+| Audio input stalls ("audio-input-stalled" alarm), or MIDI out fails (`MidiOutputError`) | The interface's clock / driver; USB power; an unplugged MIDI interface | Re-plug or re-select the device; the decoder already sent All Notes Off; Stop and Panic also send it |
+| "MSC cue … not representable" | Cue number has more than one decimal, a cue path, or a command outside the carried set | Rename the cue (0–999.9, one decimal, list 1–15) or send it another way |
+| `cricket --version` or the GUI shows an unexpected version | You may be running an old binary | `cargo install --path cricket_cli --force`, or download the current release |
+
+When you report a problem, the [field report template](.github/ISSUE_TEMPLATE/field-report.md) asks for
+the chain, the profile and the decoder's link stats; that is usually enough to tell what happened.
+
+## Routing and cable guide (stub)
+
+Cricket's channel is treated **like an LTC timecode line**:
+
+- **One dedicated mono channel per direction.** Nothing else is mixed onto it (`--audio-out-channel` /
+  `--audio-in-channel` pick the channel of a multichannel interface). Return traffic (if any) takes a
+  second channel.
+- **No processing:** no EQ, dynamics, noise gate, de-esser, limiter or "auto gain" on that channel.
+  Insert points and console channel strips are the usual culprits.
+- **Set gain once.** Anything from −30 dB to 0 dB relative to the transmit level decodes; the
+  transmitter sends at −12 dBFS peak by default (`--tx-level-db`, GUI "TX level"), which leaves
+  headroom so nothing upstream limits it.
+- **Analog XLR:** balanced line level works over long runs; the `analog-*` profiles live between 2.5
+  and 5.5 kHz, so even a narrow-band path carries them. `clean-line-fast` and `digital-line` want a
+  digital path.
+- **Dante / AES67 / MADI / AES3:** route the channel without sample-rate conversion if you intend to
+  use `digital-bit-exact` or `digital-line`; the `analog-*` profiles and `clean-line` don't care about SRC.
+- **Virtual cables / DAW loopback:** fine for testing; watch the buffer sizes (`--buffer-frames`).
+- **Wireless, codecs, intercom:** compression codecs and wireless links alter the signal; expect only
+  `analog-safe` to work, and test first.
+
+A fuller guide with measured chains will replace this stub as field reports come in.
+
+## Hardware box (FAQ)
+
+**Can Cricket run in a small box instead of a computer?** That is the plan. `cricket_core` is
+`no_std` + `alloc`, allocates nothing per sample in the LTC and digital phys, and CI builds it for
+Cortex-M (`thumbv8m.main-none-eabihf`, `thumbv6m-none-eabi`) and RISC-V (`riscv32imac-unknown-none-elf`).
+Candidate parts are the ESP32-S3 and the RP2350 with an I²S codec; the MFSK receivers cost ~15 ns per
+sample idle and ~64 ns worst case on a desktop core, the LTC receiver ~60 ns, so a 48 kHz mono stream
+leaves headroom even on a microcontroller. What is **not** done: a firmware crate, a board, or any
+measurement on real hardware; what is measured is the host-side CPU cost and the simulator results above.
+Follow [`ROADMAP.md`](ROADMAP.md) for the product track.
 
 ## Project layout
 
@@ -274,22 +348,17 @@ The tests don't need hardware. A channel simulator in [`cricket_core/tests/suppo
 puts packets through offsets, odd chunk sizes, gain changes, noise, clock drift, low-pass filtering and
 random symbol corruption. In [`stuck_notes.rs`](cricket_core/tests/stuck_notes.rs), a thousand NoteOn/NoteOff
 pairs go through a corrupted channel, and every note must be released. CI runs all of the above on
-every push.
+every push, on Linux, macOS and Windows, and the long measurement harnesses weekly
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## Docs
 
+- [`docs/README.md`](docs/README.md): index of all documents and the status of each proposal.
 - [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol, all profiles and test vectors.
-- [`docs/v1.1-plan.md`](docs/v1.1-plan.md): what v1.1 set out to fix, and how.
-- [`docs/proposals/digital-transparent.md`](docs/proposals/digital-transparent.md): the experimental
-  `digital` profile, `cricket pathcheck`, and the engine latency audit.
+- [`docs/proposals/`](docs/proposals): the measurements behind FEC, the LTC profiles and the digital profile.
+- [`ROADMAP.md`](ROADMAP.md): what comes next, and what 1.0 means.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed.
-
-## Status
-
-v1.1 is unreleased. Everything above is tested in software and through the channel simulator, but **not yet
-on a real show chain**. Use it as a backup line before you trust it with the main cue. Field reports are
-very welcome, especially your chain (Dante? analog? any processing?) and what the decoder's link stats
-said.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute, including spec changes and new profiles.
 
 ## License
 
@@ -302,4 +371,4 @@ at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by
 you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or
-conditions.
+conditions. See [`NOTICE`](NOTICE) for attribution.

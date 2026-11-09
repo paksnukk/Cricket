@@ -180,7 +180,7 @@ link-dead detection matters. Its receiver is the same one: the idle fill is one 
   tolerance, the silence floor, the rule that the RX must accept either polarity, and minimum
   performance figures rather than a receiver algorithm.
 
-### 3.3 Combining with link-layer FEC (`claude/fec`)
+### 3.3 Combining with link-layer FEC
 
 The BMC phy carries an **opaque nibble body** of any length. The TX sends whatever nibbles it is given,
 and the RX collects `set_expected_body_nibbles(n)` nibbles. An RS(GF(16)) codeword produced by the link
