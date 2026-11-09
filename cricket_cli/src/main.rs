@@ -13,7 +13,7 @@ use cricket_engine::{
     DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, LinkLight, LinkStats, MidiIn,
     MidiOut, Pacing, SampleFormatPref, MIN_TX_LEVEL_DBFS,
 };
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -884,9 +884,16 @@ fn now_ms() -> u128 {
 }
 
 /// Prints events as a human log with a periodic status line, or as NDJSON.
+///
+/// Output goes through [`Monitor::print`]: when stdout is closed (the
+/// consumer of `--json` went away, `| head`), the monitor asks for an
+/// orderly stop instead of panicking, so the decoder still sends its
+/// fail-safe burst.
 struct Monitor {
     role: Role,
     json: bool,
+    /// Set when a write to stdout failed; the monitor loop stops the worker.
+    stdout_closed: Arc<AtomicBool>,
     level_db: f32,
     level_at: Instant,
     stats: Option<LinkStats>,
@@ -903,6 +910,7 @@ impl Monitor {
         Self {
             role,
             json,
+            stdout_closed: Arc::new(AtomicBool::new(false)),
             level_db: -120.0,
             level_at: now,
             stats: None,
@@ -914,12 +922,23 @@ impl Monitor {
         }
     }
 
+    /// One line to stdout; a failed write (closed pipe) requests a stop.
+    fn print(&self, line: &str) {
+        if self.stdout_closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "{}", line).and_then(|_| out.flush()).is_err() {
+            self.stdout_closed.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn emit_json(&self, mut value: serde_json::Value) {
         if let Some(obj) = value.as_object_mut() {
             obj.insert("ts_ms".into(), serde_json::json!(now_ms()));
             obj.insert("role".into(), serde_json::json!(self.role.name()));
         }
-        println!("{}", value);
+        self.print(&value.to_string());
     }
 
     /// A line the operator should see (setup warnings).
@@ -927,7 +946,7 @@ impl Monitor {
         if self.json {
             self.emit_json(serde_json::json!({ "event": "warning", "message": message }));
         } else {
-            println!("WARNING: {}", message);
+            self.print(&format!("WARNING: {}", message));
         }
     }
 
@@ -935,7 +954,7 @@ impl Monitor {
         if self.json {
             self.emit_json(serde_json::json!({ "event": "log", "message": message }));
         } else {
-            println!("{}", message);
+            self.print(message);
         }
     }
 
@@ -1027,18 +1046,20 @@ impl Monitor {
 
     fn print_text(&self, event: &EngineEvent) {
         match event {
-            EngineEvent::Log(line) => println!("{}", line),
+            EngineEvent::Log(line) => self.print(line),
             EngineEvent::Decoded(msg) => {
                 if !matches!(msg, TransportMessage::Heartbeat) {
                     let (kind, payload) = format_message(msg);
-                    println!("[MSG] {} {}", kind, payload);
+                    self.print(&format!("[MSG] {} {}", kind, payload));
                 }
             }
             EngineEvent::Alarm { kind, message } => {
-                println!("[ALARM] {}: {}", kind.title(), message)
+                self.print(&format!("[ALARM] {}: {}", kind.title(), message))
             }
-            EngineEvent::AlarmCleared { message, .. } => println!("[ALARM CLEARED] {}", message),
-            EngineEvent::Stopped => println!("[STOPPED]"),
+            EngineEvent::AlarmCleared { message, .. } => {
+                self.print(&format!("[ALARM CLEARED] {}", message))
+            }
+            EngineEvent::Stopped => self.print("[STOPPED]"),
             EngineEvent::Level(_) | EngineEvent::Stats(_) | EngineEvent::TxStatus { .. } => {}
         }
     }
@@ -1065,7 +1086,7 @@ impl Monitor {
                     ),
                     None => ("—".into(), "—".into(), "—".into()),
                 };
-                println!(
+                self.print(&format!(
                     "[status] {} · in {:.1} dBFS · conf {} · CRC {} · FEC fixed {} · last packet {} · last: {}",
                     light.label(),
                     self.level_db.max(-99.9),
@@ -1074,19 +1095,19 @@ impl Monitor {
                     fec,
                     ago,
                     last
-                );
+                ));
                 if let Some(hint) = light.hint() {
                     if light != LinkLight::Dead || self.last_packet.is_some() {
-                        println!("[hint] {}", hint);
+                        self.print(&format!("[hint] {}", hint));
                     }
                 }
             }
             Role::Encoder => {
                 let (queued, late) = self.tx.unwrap_or((0, 0.0));
-                println!(
+                self.print(&format!(
                     "[status] TX queue {} · oldest waiting {:.0} ms · last: {}",
                     queued, late, last
-                );
+                ));
             }
         }
     }
@@ -1107,6 +1128,10 @@ fn monitor(
         Role::Encoder => "Encoder",
     };
     loop {
+        if mon.stdout_closed.load(Ordering::Relaxed) {
+            // Whoever read our output is gone: stop in order (burst first).
+            interrupted.store(true, Ordering::SeqCst);
+        }
         if interrupted.swap(false, Ordering::SeqCst) {
             mon.note(match handle {
                 Handle::Decoder(_) => {
