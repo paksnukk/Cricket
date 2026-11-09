@@ -15,8 +15,11 @@ use support::{decode_chunked, ChannelSim, XorShift64};
 
 fn fast_profiles() -> Vec<(&'static str, PhyConfig)> {
     vec![
-        ("ltc14400", PhyConfig::from_name("ltc14400")),
-        ("ltc14400_fec", PhyConfig::from_name("ltc14400_fec")),
+        ("ltc14400", PhyConfig::from_name("ltc14400").unwrap()),
+        (
+            "ltc14400_fec",
+            PhyConfig::from_name("ltc14400_fec").unwrap(),
+        ),
     ]
 }
 
@@ -65,7 +68,7 @@ fn profile_selection_and_wire_format() {
         ("ltc14400_fec", FecMode::Rs16 { parity: 4 }),
         ("ltc14400-FEC", FecMode::Rs16 { parity: 4 }),
     ] {
-        let c = PhyConfig::from_name(name);
+        let c = PhyConfig::from_name(name).unwrap();
         assert_eq!(c.fec, fec, "{name}");
         assert_eq!(c.repetition_k, 1, "{name}");
         let p = bmc(&c);
@@ -79,9 +82,13 @@ fn profile_selection_and_wire_format() {
         );
     }
     // Burst: 16 + 6 + 128 (176 coded) + 1 half cells at 14400 bit/s.
-    let ms = PhyConfig::from_name("ltc14400").estimated_first_copy_ms();
+    let ms = PhyConfig::from_name("ltc14400")
+        .unwrap()
+        .estimated_first_copy_ms();
     assert!((ms - 5.24).abs() < 0.01, "{ms}");
-    let ms = PhyConfig::from_name("ltc14400_fec").estimated_first_copy_ms();
+    let ms = PhyConfig::from_name("ltc14400_fec")
+        .unwrap()
+        .estimated_first_copy_ms();
     assert!((ms - 6.91).abs() < 0.01, "{ms}");
 
     // The original LTC profiles keep their wire format and receiver.
@@ -181,7 +188,8 @@ fn band_limited_and_resampled_paths() {
             s.drift_ppm(1000.0).snr_db(20.0)
         }),
         ("inverted + SNR 20", |s| s.invert().snr_db(20.0)),
-        ("level -50 dB + SNR 30", |s| s.gain(0.00316).snr_db(30.0)),
+        // -36 dB below the -12 dBFS default level, above the silence floor.
+        ("level -36 dB + SNR 30", |s| s.gain(0.0158).snr_db(30.0)),
     ];
     let mut failures = Vec::new();
     for (name, config) in fast_profiles() {
@@ -233,9 +241,9 @@ fn dropout_in_body_is_repaired() {
         }
         (ok, n)
     };
-    let (ok, n) = run(&PhyConfig::from_name("ltc14400_fec"));
+    let (ok, n) = run(&PhyConfig::from_name("ltc14400_fec").unwrap());
     assert_eq!(ok, n, "ltc14400_fec repaired {ok}/{n}");
-    let (ok, n) = run(&PhyConfig::from_name("ltc14400"));
+    let (ok, n) = run(&PhyConfig::from_name("ltc14400").unwrap());
     assert!(ok < n / 2, "ltc14400 without FEC decoded {ok}/{n}");
 }
 
@@ -245,8 +253,8 @@ fn dropout_in_body_is_repaired() {
 fn other_ltc_rates_do_not_cross_decode() {
     let messages: Vec<_> = (0..6).map(|i| note_on(10 * i, 1 + 9 * i)).collect();
     let others = [
-        ("ltc9600", PhyConfig::from_name("ltc9600")),
-        ("ltc9600_fec", PhyConfig::from_name("ltc9600_fec")),
+        ("ltc9600", PhyConfig::from_name("ltc9600").unwrap()),
+        ("ltc9600_fec", PhyConfig::from_name("ltc9600_fec").unwrap()),
         ("ltc", PhyConfig::ltc()),
         ("ltc_fec", PhyConfig::ltc_fec()),
     ];

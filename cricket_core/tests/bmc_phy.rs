@@ -27,7 +27,7 @@ fn ltc_profiles() -> Vec<(&'static str, PhyConfig)> {
         ("ltc2400", PhyConfig::ltc_with_bit_rate(2400)),
         ("ltc4800", PhyConfig::ltc()),
         ("ltc9600", PhyConfig::ltc_with_bit_rate(9600)),
-        ("ltc14400", PhyConfig::from_name("ltc14400")),
+        ("ltc14400", PhyConfig::from_name("ltc14400").unwrap()),
     ]
 }
 
@@ -63,11 +63,11 @@ fn profile_selection() {
     ));
     assert!(matches!(PhyConfig::fast().modulation, Modulation::Mfsk));
     assert!(matches!(
-        PhyConfig::from_name("robust").modulation,
+        PhyConfig::from_name("robust").unwrap().modulation,
         Modulation::Mfsk
     ));
     for name in ["ltc", "LTC", "ltc4800"] {
-        match PhyConfig::from_name(name).modulation {
+        match PhyConfig::from_name(name).unwrap().modulation {
             Modulation::Bmc(p) => assert_eq!(p.bit_rate, 4800),
             _ => panic!("{name} must select BMC"),
         }
@@ -157,7 +157,9 @@ fn impairments_4800() {
     type Impair = fn(ChannelSim) -> ChannelSim;
     let cases: [(&str, Impair); 9] = [
         ("SNR 12 dB", |s| s.snr_db(12.0)),
-        ("level -50 dB", |s| s.gain(0.00316)),
+        // -36 dB below the -12 dBFS default level: 6 dB past the -30 dB
+        // the spec promises, still above the -60 dBFS silence floor.
+        ("level -36 dB", |s| s.gain(0.0158)),
         ("inverted + SNR 15", |s| s.invert().snr_db(15.0)),
         ("drift +1000 ppm", |s| s.drift_ppm(1000.0)),
         ("drift -1 %", |s| s.drift_ppm(-10_000.0)),
@@ -244,7 +246,10 @@ fn mfsk_and_bmc_do_not_cross_decode() {
         ("ltc2400_fec", PhyConfig::ltc_fec_with_bit_rate(2400)),
         ("ltc_fec", PhyConfig::ltc_fec()),
         ("ltc9600_fec", PhyConfig::ltc_fec_with_bit_rate(9600)),
-        ("ltc14400_fec", PhyConfig::from_name("ltc14400_fec")),
+        (
+            "ltc14400_fec",
+            PhyConfig::from_name("ltc14400_fec").unwrap(),
+        ),
     ]);
     for (name, bmc) in bmc_profiles {
         for m in &mfsk {

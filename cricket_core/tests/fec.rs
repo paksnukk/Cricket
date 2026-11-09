@@ -65,16 +65,24 @@ fn profile_parameters() {
     assert_eq!(fec.fec.body_nibbles(), 22);
     assert_eq!(repetition_samples(&fec), 27 * 312);
     assert!((fec.estimated_first_copy_ms() - 26.0 * 6.5).abs() < 1e-3);
-    // Names: `robust_fec` is a deprecated alias of `robust`; unknown names
-    // mean robust.
-    for name in ["robust", "ROBUST", "robust_fec", "robust-fec", "nonsense"] {
-        let c = PhyConfig::from_name(name);
+    // Names: `robust_fec` is a deprecated alias of `robust`, `analog-safe`
+    // its user-facing name; unknown names are rejected.
+    for name in [
+        "robust",
+        "ROBUST",
+        "robust_fec",
+        "robust-fec",
+        "analog-safe",
+        "analog_safe",
+    ] {
+        let c = PhyConfig::from_name(name).unwrap();
         assert_eq!(c.fec, fec.fec, "{name}");
         assert_eq!(c.repetition_k, 1, "{name}");
         assert_eq!(c.acquisition, fec.acquisition, "{name}");
     }
-    for name in ["robust_repeat", "robust-repeat"] {
-        let c = PhyConfig::from_name(name);
+    assert!(PhyConfig::from_name("nonsense").is_none());
+    for name in ["robust_repeat", "robust-repeat", "analog-safe-repeat"] {
+        let c = PhyConfig::from_name(name).unwrap();
         assert_eq!(c.fec, FecMode::None, "{name}");
         assert_eq!(c.repetition_k, 2, "{name}");
     }
@@ -543,7 +551,8 @@ fn acq_profiles() -> Vec<(String, PhyConfig)> {
                 Some(b) => (b, true),
                 None => (base, false),
             };
-            let mut config = PhyConfig::from_name(base);
+            let mut config =
+                PhyConfig::from_name(base).unwrap_or_else(|| panic!("unknown profile {base}"));
             if pre6 {
                 config.preamble = vec![0xA, 0x5, 0xC, 0x3, 0x8, 0xE];
             }

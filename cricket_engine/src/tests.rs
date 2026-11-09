@@ -74,6 +74,7 @@ fn loopback_midi_in_to_midi_out() {
         midi_in: MidiIn::Custom(Box::new(midi_in)),
         profile: "fast".into(),
         simulate: false,
+        tx_level_dbfs: None,
         audio: AudioOptions::default(),
     })
     .unwrap();
@@ -144,7 +145,7 @@ fn loopback_midi_in_to_midi_out() {
     assert_eq!(
         alarms(&enc_events, AlarmKind::MessageRejected),
         vec![
-            "MSC cue 1.25 not representable (cues 0–999.9 with at most one decimal) — not sent"
+            "Can't be sent over this link: MSC cue 1.25 not representable (cues 0–999.9 with at most one decimal) — not sent"
                 .to_string()
         ]
     );
@@ -163,7 +164,7 @@ fn loopback_midi_in_to_midi_out() {
     );
 }
 
-/// Without MIDI in the encoder plays its simulated scale (first note: 60).
+/// With the test scale switched on the encoder plays it (first note: 60).
 #[test]
 fn simulated_scale_reaches_decoder() {
     let (sink, source) = MemoryAudio::pair(RATE, RATE as usize * 4);
@@ -173,7 +174,8 @@ fn simulated_scale_reaches_decoder() {
         audio_out: AudioOut::Custom(Box::new(sink)),
         midi_in: MidiIn::None,
         profile: "fast".into(),
-        simulate: false,
+        simulate: true,
+        tx_level_dbfs: None,
         audio: AudioOptions::default(),
     })
     .unwrap();
@@ -183,6 +185,47 @@ fn simulated_scale_reaches_decoder() {
     });
     assert!(ok, "MIDI out: {:?}", rec.messages());
     // Handles dropped here: Drop must stop and join both workers.
+}
+
+/// Without MIDI in (and the test scale off, the default) the encoder sends
+/// heartbeats only: a decoder on stage must never get notes nobody played.
+#[test]
+fn no_midi_in_sends_heartbeats_only() {
+    let (sink, source) = MemoryAudio::pair(RATE, RATE as usize * 4);
+    let rec = RecordingMidiSink::new();
+    let mut dec = memory_decoder(source, &rec);
+    let enc = EncoderHandle::start(EncoderConfig {
+        audio_out: AudioOut::Custom(Box::new(sink)),
+        midi_in: MidiIn::None,
+        profile: "analog-fast".into(),
+        simulate: false,
+        tx_level_dbfs: None,
+        audio: AudioOptions::default(),
+    })
+    .unwrap();
+    // Two heartbeat intervals plus airtime: the scale would have struck
+    // its first note long ago.
+    let events = collect_until(dec.events(), Duration::from_secs(5), |e| {
+        matches!(e, EngineEvent::Decoded(TransportMessage::Heartbeat))
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        rec.messages().is_empty(),
+        "no MIDI must come out of heartbeats: {:?}",
+        rec.messages()
+    );
+    assert!(events
+        .iter()
+        .all(|e| !matches!(e, EngineEvent::Decoded(TransportMessage::NoteOn { .. }))));
+    let enc_logs = log_lines(&enc.events().try_iter().collect::<Vec<_>>());
+    assert!(
+        enc_logs
+            .iter()
+            .any(|l| l == "No MIDI in selected — sending heartbeats only."),
+        "{:?}",
+        enc_logs
+    );
+    assert!(dec.stop());
 }
 
 #[test]
@@ -195,6 +238,7 @@ fn stop_joins_worker_and_ends_with_stopped() {
         midi_in: MidiIn::None,
         profile: "fast".into(),
         simulate: true,
+        tx_level_dbfs: None,
         audio: AudioOptions::default(),
     })
     .unwrap();
@@ -215,7 +259,7 @@ fn stop_joins_worker_and_ends_with_stopped() {
     let dec_logs = log_lines(&expect_stopped_then_closed(dec.events()));
     assert_eq!(
         dec_logs.first().map(String::as_str),
-        Some("Starting decoder (profile=fast)...")
+        Some("Starting decoder (profile=analog-fast)...")
     );
     assert_eq!(
         dec_logs.last().map(String::as_str),
@@ -254,7 +298,7 @@ fn audio_open_error_is_logged_and_worker_ends() {
     assert_eq!(
         logs,
         vec![
-            "Starting decoder (profile=robust)...".to_string(),
+            "Starting decoder (profile=analog-safe)...".to_string(),
             "No MIDI out selected — decode to UI only.".to_string(),
             "Audio input error: boom".to_string(),
         ]
@@ -266,6 +310,7 @@ fn audio_open_error_is_logged_and_worker_ends() {
         midi_in: MidiIn::None,
         profile: "robust".into(),
         simulate: false,
+        tx_level_dbfs: None,
         audio: AudioOptions::default(),
     })
     .unwrap();
@@ -447,11 +492,17 @@ fn input_stall_without_link_sends_no_burst() {
         )
     });
     std::thread::sleep(Duration::from_millis(TEST_LINK_DEAD_MS));
-    assert!(dec.stop());
     assert!(rec.messages().is_empty(), "{:?}", rec.messages());
     let stalls = alarms(&events, AlarmKind::AudioInputStalled);
     assert_eq!(stalls.len(), 1);
     assert!(!stalls[0].contains("All Notes Off"), "{}", stalls[0]);
+    // Stopping always sends the fail-safe burst, link or no link.
+    assert!(dec.stop());
+    let midi = rec.messages();
+    assert_eq!(count(&midi, &ALL_NOTES_OFF), 1, "{:?}", midi);
+    assert_eq!(count(&midi, &SUSTAIN_OFF), 1, "{:?}", midi);
+    assert_eq!(count(&midi, &[0xBF, 0x7B, 0x00]), 1, "{:?}", midi);
+    assert_eq!(midi.len(), 32, "{:?}", midi);
 }
 
 /// Samples resume after the stall (with more than link-dead of silence): the
@@ -490,9 +541,10 @@ fn input_resume_after_stall_no_second_burst() {
     push_and_drain(&mut sink, &packet_audio(&mut tx, 62, 100));
     wait_for_bursts(&rec, 2, Duration::from_secs(3)).expect("no second-outage burst");
     std::thread::sleep(link_dead);
+    // Before the stop (which adds its own burst).
+    let midi = rec.messages();
     assert!(dec.stop());
     events.extend(dec.events().try_iter());
-    let midi = rec.messages();
     assert_eq!(count(&midi, &ALL_NOTES_OFF), 2, "{:?}", midi);
     assert!(midi.contains(&vec![0x90, 62, 100]), "{:?}", midi);
     assert_eq!(alarms(&events, AlarmKind::AudioInputStalled).len(), 2);
@@ -511,6 +563,7 @@ fn device_errors_become_alarms() {
         midi_in: MidiIn::None,
         profile: "fast".into(),
         simulate: false,
+        tx_level_dbfs: None,
         audio: AudioOptions::default(),
     })
     .unwrap();
@@ -551,4 +604,262 @@ fn device_error_queue_is_bounded() {
     assert_eq!(all[15], "e15");
     assert_eq!(all[16], "4 further audio device errors not shown");
     assert_eq!(q.pop(), None);
+}
+
+// --- Stage safety: stop / panic bursts, MIDI-out failures, link restored ---
+
+/// Stopping a decoder with a MIDI out sends the fail-safe burst first, and
+/// `panic()` sends it on demand while running.
+#[test]
+fn stop_and_panic_send_fail_safe_burst() {
+    let (_sink, source) = MemoryAudio::pair(RATE, RATE as usize);
+    let rec = RecordingMidiSink::new();
+    let mut dec = memory_decoder(source, &rec);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(rec.is_empty());
+
+    dec.panic();
+    assert!(wait_for(Duration::from_secs(2), || rec.len() >= 32));
+    let midi = rec.messages();
+    assert_eq!(midi.len(), 32, "{:?}", midi);
+    assert_eq!(count(&midi, &SUSTAIN_OFF), 1);
+    assert_eq!(count(&midi, &ALL_NOTES_OFF), 1);
+    assert_eq!(count(&midi, &[0xBF, 0x7B, 0x00]), 1);
+
+    assert!(dec.stop());
+    let midi = rec.messages();
+    assert_eq!(midi.len(), 64, "{:?}", midi);
+    let logs = log_lines(&dec.events().try_iter().collect::<Vec<_>>());
+    assert!(
+        logs.iter().any(|l| l.starts_with("Panic — Sustain off")),
+        "{:?}",
+        logs
+    );
+    assert!(
+        logs.iter().any(|l| l.starts_with("Stop — Sustain off")),
+        "{:?}",
+        logs
+    );
+    assert_eq!(logs.last().map(String::as_str), Some("Decoder stopped."));
+
+    // Without a MIDI out there is nothing to send and nothing is logged.
+    let (_sink, source) = MemoryAudio::pair(RATE, RATE as usize);
+    let mut dec = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Custom(Box::new(source)),
+        midi_out: MidiOut::None,
+        profile: "analog-fast".into(),
+        link_dead_ms: None,
+        msc: MscTarget::default(),
+        audio: AudioOptions::default(),
+    })
+    .unwrap();
+    assert!(dec.stop());
+    let logs = log_lines(&dec.events().try_iter().collect::<Vec<_>>());
+    assert!(!logs.iter().any(|l| l.starts_with("Stop — ")), "{:?}", logs);
+}
+
+/// A failing MIDI output raises one alarm per failure streak and clears it
+/// when a send succeeds again; the lost messages are counted.
+#[test]
+fn midi_out_failure_is_one_alarm_and_clears() {
+    let (mut sink, source) = MemoryAudio::pair(RATE, RATE as usize * 4);
+    let failing = testing::FailingMidiSink::default();
+    let mut dec = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Custom(Box::new(source)),
+        midi_out: MidiOut::Custom(Box::new(failing.clone())),
+        profile: "fast".into(),
+        link_dead_ms: None,
+        msc: MscTarget::default(),
+        audio: AudioOptions::default(),
+    })
+    .unwrap();
+    let mut tx = CricketModemTx::new(PhyConfig::fast());
+
+    failing.set_failing(true);
+    push_and_drain(&mut sink, &packet_audio(&mut tx, 60, 20));
+    push_and_drain(&mut sink, &packet_audio(&mut tx, 62, 20));
+    let events = collect_until(dec.events(), Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            EngineEvent::Decoded(TransportMessage::NoteOn { note: 62, .. })
+        )
+    });
+    let raised = alarms(&events, AlarmKind::MidiOutputError);
+    assert_eq!(raised.len(), 1, "{:?}", raised);
+    assert!(
+        raised[0].starts_with("MIDI out failed: MIDI send: port closed"),
+        "{}",
+        raised[0]
+    );
+    assert!(failing.recorder.is_empty());
+
+    failing.set_failing(false);
+    push_and_drain(&mut sink, &packet_audio(&mut tx, 64, 20));
+    let events = collect_until(dec.events(), Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            EngineEvent::AlarmCleared {
+                kind: AlarmKind::MidiOutputError,
+                ..
+            }
+        )
+    });
+    let Some(EngineEvent::AlarmCleared { message, .. }) = events.last() else {
+        panic!("{:?}", events);
+    };
+    assert_eq!(
+        message,
+        "MIDI out is working again (2 messages lost meanwhile)"
+    );
+    assert!(alarms(&events, AlarmKind::MidiOutputError).is_empty());
+    assert!(wait_for(Duration::from_secs(2), || !failing
+        .recorder
+        .is_empty()));
+    assert_eq!(failing.recorder.messages()[0], vec![0x90, 64, 100]);
+    assert!(dec.stop());
+}
+
+/// The link-dead alarm is cleared by the next valid packet.
+#[test]
+fn link_dead_alarm_is_cleared_by_next_packet() {
+    let (mut sink, source) = MemoryAudio::pair(RATE, RATE as usize * 8);
+    let rec = RecordingMidiSink::new();
+    let mut dec = stall_decoder(source, &rec);
+    let mut tx = CricketModemTx::new(PhyConfig::fast());
+
+    // A packet, then more than link-dead of silence in the same stream: the
+    // sample-based link-dead fires.
+    let silence_ms = TEST_LINK_DEAD_MS as usize * 2;
+    push_and_drain(&mut sink, &packet_audio(&mut tx, 60, silence_ms));
+    let events = collect_until(dec.events(), Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            EngineEvent::Alarm {
+                kind: AlarmKind::LinkDead,
+                ..
+            }
+        )
+    });
+    let dead = alarms(&events, AlarmKind::LinkDead);
+    assert_eq!(dead.len(), 1, "{:?}", dead);
+    assert!(
+        dead[0].starts_with("Link dead: no valid packet for 400 ms"),
+        "{}",
+        dead[0]
+    );
+    assert_eq!(count(&rec.messages(), &ALL_NOTES_OFF), 1);
+
+    push_and_drain(&mut sink, &packet_audio(&mut tx, 62, 20));
+    let events = collect_until(dec.events(), Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            EngineEvent::Decoded(TransportMessage::NoteOn { note: 62, .. })
+        )
+    });
+    let restored: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::AlarmCleared {
+                kind: AlarmKind::LinkDead,
+                message,
+            } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(restored.len(), 1, "{:?}", events);
+    assert!(
+        restored[0].starts_with("Link restored after"),
+        "{}",
+        restored[0]
+    );
+    assert!(dec.stop());
+}
+
+/// A typo in the profile name is an error, never another profile.
+#[test]
+fn unknown_profile_is_an_error() {
+    let (sink, source) = MemoryAudio::pair(RATE, RATE as usize);
+    let err = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Custom(Box::new(source)),
+        midi_out: MidiOut::None,
+        profile: "robsut".into(),
+        link_dead_ms: None,
+        msc: MscTarget::default(),
+        audio: AudioOptions::default(),
+    })
+    .err()
+    .expect("unknown profile must fail");
+    assert!(
+        err.to_string().contains("unknown profile \"robsut\""),
+        "{}",
+        err
+    );
+    let err = EncoderHandle::start(EncoderConfig {
+        audio_out: AudioOut::Custom(Box::new(sink)),
+        midi_in: MidiIn::None,
+        profile: "ltc_fec_".into(),
+        simulate: false,
+        tx_level_dbfs: None,
+        audio: AudioOptions::default(),
+    })
+    .err()
+    .expect("unknown profile must fail");
+    assert!(err.to_string().contains("unknown profile"), "{}", err);
+}
+
+/// The transmit level option changes the encoded amplitude (default −12 dBFS
+/// peak), and the level event reports it in a way a meter can show.
+#[test]
+fn tx_level_is_applied() {
+    for (level, want_peak) in [(None, 0.25f32), (Some(-20.0), 0.1), (Some(0.0), 1.0)] {
+        let (sink, source) = MemoryAudio::pair(RATE, RATE as usize * 4);
+        let rec = RecordingMidiSink::new();
+        let mut dec = DecoderHandle::start(DecoderConfig {
+            audio_in: AudioIn::Custom(Box::new(source)),
+            midi_out: MidiOut::Custom(Box::new(rec.clone())),
+            profile: "robust".into(),
+            link_dead_ms: None,
+            msc: MscTarget::default(),
+            audio: AudioOptions::default(),
+        })
+        .unwrap();
+        let mut enc = EncoderHandle::start(EncoderConfig {
+            audio_out: AudioOut::Custom(Box::new(sink)),
+            midi_in: MidiIn::None,
+            profile: "analog-safe".into(),
+            simulate: false,
+            tx_level_dbfs: level,
+            audio: AudioOptions::default(),
+        })
+        .unwrap();
+        // A heartbeat is 169 ms of tone at the TX level: the loudest 50 ms
+        // level window reads close to the tone's RMS (peak / sqrt 2).
+        let events = collect_until(dec.events(), Duration::from_secs(5), |e| {
+            matches!(e, EngineEvent::Decoded(TransportMessage::Heartbeat))
+        });
+        let peak_rms = events
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Level(rms) => Some(*rms),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        let want_rms = want_peak * core::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (peak_rms - want_rms).abs() < want_rms * 0.25,
+            "level {:?}: peak RMS {} (want ~{})",
+            level,
+            peak_rms,
+            want_rms
+        );
+        let logs = log_lines(&enc.events().try_iter().collect::<Vec<_>>());
+        let want_db = 20.0 * want_peak.log10();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains(&format!("TX level {:.1} dBFS", want_db))),
+            "{:?}",
+            logs
+        );
+        assert!(enc.stop() && dec.stop());
+    }
 }

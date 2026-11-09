@@ -107,7 +107,8 @@ struct Rig {
 
 impl Rig {
     fn start(profile: &str, pacing: Pacing) -> Result<Self> {
-        let config = PhyConfig::from_name(profile);
+        let config = PhyConfig::from_name(profile)
+            .ok_or_else(|| anyhow!("unknown profile {:?}", profile))?;
         let packet_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
         let sink_capacity = (packet_samples * 2).max(48_000) as usize;
         let (sink, source) = MemoryAudio::pair(RATE, sink_capacity);
@@ -130,6 +131,7 @@ impl Rig {
             midi_in: MidiIn::Custom(Box::new(midi_in)),
             profile: profile.into(),
             simulate: false,
+            tx_level_dbfs: None,
             audio: AudioOptions::default(),
         })?;
         let rig = Self {
@@ -189,8 +191,8 @@ impl Rig {
 }
 
 /// Measure wall-clock MIDI-in → MIDI-out NoteOn latency for `profile`
-/// (a [`PhyConfig::from_name`] name such as `"robust"`, `"robust_repeat"`,
-/// `"fast"`, `"ltc_fec"` or `"digital"`) over `note_count` notes, each held
+/// (a [`PhyConfig::from_name`] name such as `"analog-safe"`, `"robust"`,
+/// `"clean-line"` or `"digital"`) over `note_count` notes, each held
 /// for [`HOLD`], released, and followed by a [`rest`] before the next one.
 pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<LatencySummary> {
     measure_midi_loopback_with(profile, note_count, Pacing::RealTime)
@@ -303,7 +305,8 @@ pub fn measure_throughput(profile: &str, messages: usize) -> Result<f64> {
         for w in &wanted {
             rig.inject(w)?;
         }
-        let config = PhyConfig::from_name(profile);
+        let config = PhyConfig::from_name(profile)
+            .ok_or_else(|| anyhow!("unknown profile {:?}", profile))?;
         let airtime =
             repetition_samples(&config) as f64 * config.repetition_k.max(1) as f64 / RATE as f64;
         let timeout = Duration::from_secs_f64(5.0 + 2.0 * airtime * messages as f64);

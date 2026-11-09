@@ -1,5 +1,6 @@
 //! Level-independent detection (plan task A3): the receiver must decode
-//! attenuated signals down to -30 dB below the nominal 0.8-peak transmit level,
+//! attenuated signals down to -30 dB below the nominal transmit level (peak
+//! -12 dBFS, amplitude 0.25),
 //! while noise, near-silence and interfering tones never produce messages.
 //! Uses the simulator in `tests/support`.
 

@@ -72,8 +72,9 @@
                 flex-direction: column;
                 gap: 0.4rem;
             }
+            .col.narrow { flex: 0 0 110px; min-width: 110px; }
             label { font-size: 0.8rem; color: var(--muted); }
-            select, button {
+            select, button, input[type="number"] {
                 padding: 0.55rem 0.75rem;
                 border-radius: 6px;
                 border: 1px solid var(--line);
@@ -81,6 +82,7 @@
                 color: var(--text);
                 font: inherit;
             }
+            input[type="number"] { width: 100%; }
             button {
                 cursor: pointer;
                 background: #1e242b;
@@ -99,6 +101,7 @@
                 color: #ffb4b4;
                 font-weight: 600;
             }
+            button.small { padding: 0.25rem 0.6rem; font-size: 0.8rem; }
             .mode-row { gap: 0.5rem; align-items: center; }
             .mode-row label { display: flex; align-items: center; gap: 0.35rem; color: var(--text); font-size: 0.9rem; }
             .display-box {
@@ -124,9 +127,18 @@
                 border-radius: 6px;
             }
             .hint { font-size: 0.8rem; color: var(--muted); margin: 0; }
+            .meter-row { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.5rem; }
+            .meter-row .readout {
+                font-family: "IBM Plex Mono", ui-monospace, monospace;
+                font-size: 0.8rem;
+                min-width: 7.5em;
+                text-align: right;
+                color: var(--muted);
+            }
             .meter-container {
-                width: 100%;
-                height: 8px;
+                position: relative;
+                flex: 1;
+                height: 10px;
                 background: #12151a;
                 border-radius: 4px;
                 overflow: hidden;
@@ -137,17 +149,62 @@
                 background: var(--accent);
                 transition: width 0.05s ease-out;
             }
-            .alarm {
-                display: none;
+            /* The window where the level or confidence is fine. */
+            .meter-good {
+                position: absolute;
+                top: 0;
+                height: 100%;
+                background: rgba(61, 154, 122, 0.18);
+                border-left: 1px solid rgba(61, 154, 122, 0.7);
+                pointer-events: none;
+            }
+            .meter-scale {
+                display: flex;
+                justify-content: space-between;
+                font-size: 0.65rem;
+                color: var(--muted);
+                font-family: ui-monospace, monospace;
+                margin-top: 0.15rem;
+            }
+            /* Alarm list */
+            .alarm-card { display: none; border-color: var(--danger); }
+            .alarm-card.visible { display: block; }
+            .alarm-head { display: flex; justify-content: space-between; align-items: center; }
+            .alarm-head h2 { color: #ffb4b4; margin: 0; }
+            .alarm-row {
+                display: flex;
+                gap: 0.75rem;
+                align-items: center;
                 background: #3a1818;
                 border: 1px solid var(--danger);
                 color: #ffb4b4;
-                padding: 0.75rem 1rem;
+                padding: 0.5rem 0.75rem;
                 border-radius: 6px;
-                margin-bottom: 1rem;
-                font-weight: 600;
+                margin-top: 0.5rem;
+                font-size: 0.9rem;
             }
-            .alarm.visible { display: block; }
+            .alarm-row.warning { background: #2a2418; border-color: #6b5420; color: #f0d78c; }
+            .alarm-row .alarm-time { font-family: ui-monospace, monospace; font-size: 0.8rem; opacity: 0.8; white-space: nowrap; }
+            .alarm-row .alarm-text { flex: 1; }
+            .alarm-row .alarm-count { font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: nowrap; }
+            /* Traffic light */
+            .light-row { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+            .light {
+                font-weight: 700;
+                font-size: 1.1rem;
+                letter-spacing: 0.04em;
+                padding: 0.5rem 1rem;
+                border-radius: 999px;
+                border: 2px solid var(--line);
+                color: var(--muted);
+                background: #15181c;
+                min-width: 11em;
+                text-align: center;
+            }
+            .light.ok { border-color: var(--accent); color: #9fe3c6; background: #15261f; }
+            .light.nosignal { border-color: var(--muted); color: var(--muted); }
+            .light.nolock { border-color: var(--warn); color: #f0d78c; background: #2a2418; }
+            .light.dead { border-color: var(--danger); color: #ffb4b4; background: #3a1818; }
             .stat-grid {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
@@ -155,36 +212,67 @@
                 font-size: 0.9rem;
             }
             .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
+            .warnings { margin: 0.5rem 0 0; padding: 0; list-style: none; }
+            .warnings li {
+                background: #2a2418;
+                border: 1px solid #6b5420;
+                color: #f0d78c;
+                padding: 0.4rem 0.75rem;
+                border-radius: 6px;
+                margin-top: 0.4rem;
+                font-size: 0.85rem;
+            }
+            .check { display: flex; align-items: center; gap: 0.4rem; color: var(--text); font-size: 0.9rem; margin-top: 0.5rem; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>Cricket</h1>
-            <p class="hint">Cricket MIDI v1.0 — MIDI over a dedicated audio path</p>
+            <p class="hint">Cricket MIDI — MIDI over a dedicated audio path</p>
 
             <div class="banner">
                 Dedicated channel only (like LTC). Do not EQ, compress, or limit the Cricket bus. Keep gain staging stable.
             </div>
 
-            <div id="alarm-box" class="alarm"></div>
+            <div id="alarm-card" class="card alarm-card">
+                <div class="alarm-head">
+                    <h2>Alarms</h2>
+                    <button id="ack-all-btn" class="small">Acknowledge all</button>
+                </div>
+                <div id="alarm-list"></div>
+            </div>
 
             <div class="card">
                 <h2>Link Status</h2>
+                <div class="light-row">
+                    <div id="link-light" class="light">STOPPED</div>
+                    <div>
+                        <div id="link-light-detail" class="hint">Decoder not running.</div>
+                        <div id="link-hint" class="hint"></div>
+                    </div>
+                </div>
                 <div class="stat-grid">
-                    <div>State: <strong id="link-state">Search</strong></div>
-                    <div>Link alive: <span id="link-alive">no</span></div>
+                    <div>State: <strong id="link-state">—</strong></div>
+                    <div>Last packet: <span id="link-last-packet">—</span></div>
                     <div>Confidence: <span id="link-confidence">—</span> dB</div>
-                    <div>Est. decode latency: <span id="link-latency">—</span> ms</div>
-                    <div>CRC pass/fail: <span id="link-crc">0 / 0</span></div>
-                    <div>CRC pass rate: <span id="link-crc-rate">—</span>%</div>
+                    <div>Airtime per packet: <span id="link-latency">—</span> ms</div>
+                    <div>CRC pass / fail: <span id="link-crc">0 / 0</span></div>
+                    <div>CRC fails per minute: <span id="link-crc-fail-rate">—</span></div>
+                    <div>FEC corrected: <span id="link-fec">0</span> (<span id="link-fec-rate">—</span>/min)</div>
+                    <div>Preambles found / CRC fails: <span id="link-locks">0 / 0</span></div>
                     <div>Sync lost: <span id="link-sync-lost">0</span></div>
                     <div>Buffer drops: <span id="link-drops">0</span></div>
                     <div>Last seq: <span id="link-seq">—</span></div>
                     <div>Last event: <span id="link-last-event">—</span></div>
                 </div>
-                <div class="meter-container" title="Confidence" style="margin-top: 0.75rem">
-                    <div id="confidence-meter" class="meter-bar"></div>
+                <div class="meter-row" title="Confidence of the last packet (0–20 dB); the shaded part is good">
+                    <div class="meter-container">
+                        <div id="confidence-good" class="meter-good" style="left: 30%; width: 70%"></div>
+                        <div id="confidence-meter" class="meter-bar"></div>
+                    </div>
+                    <div class="readout" id="confidence-readout">— dB</div>
                 </div>
+                <div class="meter-scale"><span>0 dB</span><span>confidence · good ≥ 6 dB</span><span>20 dB</span></div>
             </div>
 
             <div class="card">
@@ -197,22 +285,12 @@
                 </div>
                 <div class="row" style="margin-bottom: 0.75rem">
                     <div class="col">
-                        <label for="profile-select">Profile</label>
-                        <select id="profile-select">
-                            <option value="robust">Robust (default, coded, ~169 ms)</option>
-                            <option value="robust_repeat">Robust repeat (2 copies, ~130 ms)</option>
-                            <option value="fast">Fast (clean chain, ~54 ms)</option>
-                            <option value="ltc_fec">LTC FEC (dedicated line, ~21 ms)</option>
-                            <option value="ltc">LTC (dedicated line, ~16 ms)</option>
-                            <option value="ltc2400_fec">LTC 2400 FEC (dedicated line)</option>
-                            <option value="ltc9600_fec">LTC 9600 FEC (digital line)</option>
-                            <option value="ltc14400_fec">LTC 14400 FEC (Dante/MADI/AES, ~7 ms)</option>
-                            <option value="ltc14400">LTC 14400 (Dante/MADI/AES, ~5 ms)</option>
-                        </select>
+                        <label for="profile-select">Profile (same on both ends)</label>
+                        <select id="profile-select"></select>
                     </div>
                     <div class="col">
                         <label>&nbsp;</label>
-                        <p class="hint" id="profile-hint">Dedicated bus recommended for Fast.</p>
+                        <p class="hint" id="profile-hint">Loading profiles…</p>
                     </div>
                 </div>
                 <div class="row">
@@ -220,9 +298,17 @@
                         <label for="input-device-select">Audio In (Cricket RX)</label>
                         <select id="input-device-select"></select>
                     </div>
+                    <div class="col narrow">
+                        <label for="input-channel-select">Channel</label>
+                        <select id="input-channel-select"></select>
+                    </div>
                     <div class="col">
                         <label for="output-device-select">Audio Out (Cricket TX)</label>
                         <select id="output-device-select"></select>
+                    </div>
+                    <div class="col narrow">
+                        <label for="output-channel-select">Channel</label>
+                        <select id="output-channel-select"></select>
                     </div>
                 </div>
                 <div class="row" style="margin-top: 0.75rem">
@@ -244,7 +330,16 @@
                         <label for="msc-format-select">MSC command format (decoder output)</label>
                         <select id="msc-format-select"></select>
                     </div>
+                    <div class="col narrow">
+                        <label for="tx-level-input">TX level (dBFS peak)</label>
+                        <input type="number" id="tx-level-input" min="-60" max="0" step="1" value="-12" />
+                    </div>
                 </div>
+                <p class="hint" style="margin-top: 0.4rem">
+                    TX level: −12 dBFS by default leaves headroom on the bus; the receiver decodes anything from −30 dB
+                    below that to full scale. Not used by Digital Bit-Exact.
+                </p>
+                <ul id="setup-warnings" class="warnings"></ul>
                 <div class="actions">
                     <button id="refresh-devices-btn">Refresh Devices</button>
                     <button id="save-settings-btn">Save Settings</button>
@@ -259,13 +354,20 @@
                     <div class="actions">
                         <button id="start-listening-btn" class="primary">Start Decoder</button>
                         <button id="stop-listening-btn" disabled>Stop</button>
+                        <button id="decoder-panic-btn" class="danger" disabled title="Sustain off + All Notes Off on all 16 channels to MIDI out, now">Panic</button>
                     </div>
                     <div id="decoded-display" class="display-box">
                         <span style="color: #555">Waiting…</span>
                     </div>
-                    <div class="meter-container" title="Input Level" style="margin-top: 0.5rem">
-                        <div id="input-meter" class="meter-bar"></div>
+                    <div class="meter-row" title="Input level in dBFS (full-scale sine = 0); the shaded part is the good window">
+                        <div class="meter-container">
+                            <div class="meter-good" style="left: 50%; width: 50%"></div>
+                            <div id="input-meter" class="meter-bar"></div>
+                        </div>
+                        <div class="readout" id="input-level-readout">— dBFS</div>
                     </div>
+                    <div class="meter-scale"><span>−60</span><span>input · good −30 … 0 dBFS</span><span>0</span></div>
+                    <p class="hint" style="margin-top: 0.5rem">Stop and Panic send Sustain off + All Notes Off on all channels to MIDI out.</p>
                 </div>
 
                 <div class="card col" id="encode-card">
@@ -273,17 +375,17 @@
                     <div class="actions">
                         <button id="start-encode-btn" class="primary">Start Encoder</button>
                         <button id="stop-encode-btn" disabled>Stop</button>
-                        <button id="panic-btn" class="danger" disabled>Panic</button>
+                        <button id="panic-btn" class="danger" disabled title="Send All Notes Off over the link">Panic</button>
                     </div>
                     <p class="hint" id="tx-queue-hint" style="margin-top: 0.5rem">
                         Queue: <span id="tx-queued">—</span> msgs · queue latency:
                         <span id="tx-queue-latency">—</span> ms
                     </p>
-                    <label style="margin-top: 0.5rem">
+                    <label class="check">
                         <input type="checkbox" id="simulate-check" />
-                        Also send simulated C-major scale
+                        Play test scale (no MIDI in needed)
                     </label>
-                    <p class="hint">With MIDI In set to None the encoder always sends the simulated scale.</p>
+                    <p class="hint">Off by default: with MIDI In = None the encoder sends heartbeats only, never notes nobody played.</p>
                     <p class="hint">Heartbeat is sent every 500 ms while encoding.</p>
                 </div>
             </div>

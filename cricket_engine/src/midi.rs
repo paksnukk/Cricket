@@ -51,7 +51,8 @@ pub enum MidiOut {
 
 /// Where the encoder reads MIDI from.
 pub enum MidiIn {
-    /// No MIDI input (the encoder then runs its simulated scale).
+    /// No MIDI input (the encoder then sends heartbeats only, plus the test
+    /// scale if asked for).
     None,
     /// A midir input port.
     Device(DeviceSelector),

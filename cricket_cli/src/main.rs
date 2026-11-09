@@ -1,33 +1,45 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use cricket_core::modem::repetition_samples;
 use cricket_core::pathcheck::{self, PathImpairment, PathReport, Verdict};
-use cricket_core::phy::PhyConfig;
+use cricket_core::phy::{
+    PhyConfig, ProfileInfo, ProfileTier, DEFAULT_PROFILE, DEFAULT_TX_LEVEL_DBFS, PROFILES,
+};
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, MscTarget, TransportMessage};
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
 use cricket_engine::{
     audio, format_message, measure_chord_loopback, measure_midi_loopback_with, measure_throughput,
-    midi, AlarmKind, AudioIn, AudioOptions, AudioOut, DecoderConfig, DecoderHandle, DeviceSelector,
-    EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, Pacing, SampleFormatPref,
+    midi, rms_to_dbfs, AudioIn, AudioOptions, AudioOut, DecoderConfig, DecoderHandle,
+    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, LinkLight, LinkStats, MidiIn,
+    MidiOut, Pacing, SampleFormatPref, MIN_TX_LEVEL_DBFS,
 };
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::io::BufRead;
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const LONG_ABOUT: &str = "\
+Cricket MIDI-over-audio modem CLI (AML v1).
+
+Both ends must use the same profile (`cricket profiles` explains them). While a decoder runs,
+Ctrl-C stops it after sending Sustain off + All Notes Off on all 16 channels to MIDI out, and
+typing `panic` + Enter sends that burst at once.
+
+Exit status: 0 ok; 1 error (device not found, worker stopped, test failed, path check NoSignal
+or Unusable); 2 usage error; 3 path check verdict Marginal.";
+
+/// Exit status of a path check whose verdict is `Marginal`.
+const EXIT_MARGINAL: u8 = 3;
 
 #[derive(Parser)]
-#[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = None)]
+#[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = LONG_ABOUT)]
 struct Cli {
-    /// PHY profile (both ends must use the same one): robust (default;
-    /// Reed–Solomon coded body, sent once), robust_repeat (uncoded body sent
-    /// twice; for lines with dropouts of ~50 ms or more), fast (clean
-    /// dedicated line), or the LTC-style biphase-mark profiles for a
-    /// dedicated clean line without EQ: ltc (4800 bit/s), ltc2400, ltc4800,
-    /// ltc9600, and with Reed–Solomon body FEC ltc_fec, ltc2400_fec,
-    /// ltc9600_fec; for digital lines only (Dante, MADI, AES; >= 48 kHz)
-    /// ltc14400 and ltc14400_fec; or (experimental) digital, packets in the
-    /// sample values of a bit-transparent digital path (check it with
-    /// `cricket pathcheck` first). A `+digital` suffix (e.g.
-    /// ltc9600+digital) makes a decoder also accept digital-profile frames
-    #[arg(long, global = true, default_value = "robust")]
+    /// Profile, same on both ends: analog-safe (default), analog-safe-repeat,
+    /// analog-fast, clean-line, clean-line-fast, digital-line,
+    /// digital-bit-exact; `cricket profiles` lists all, with the older names
+    #[arg(long, global = true, value_name = "NAME", default_value = DEFAULT_PROFILE, value_parser = parse_profile)]
     profile: String,
 
     /// Audio device buffer size in frames, e.g. 64–512 (default: the host's;
@@ -35,10 +47,29 @@ struct Cli {
     #[arg(long, global = true, value_name = "FRAMES")]
     buffer_frames: Option<u32>,
 
-    /// Audio sample format: auto (device default; the digital profile
-    /// prefers i32, then f32, then i16), f32, i16 or i32
+    /// Audio sample format: auto (device default; digital-bit-exact prefers
+    /// i32, then f32, then i16), f32, i16 or i32
     #[arg(long, global = true, value_name = "FORMAT", default_value = "auto")]
     sample_format: SampleFormatPref,
+
+    /// Audio input channel the decoder listens on (1 = first)
+    #[arg(long, global = true, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    audio_in_channel: u16,
+
+    /// Audio output channel the encoder sends on (1 = first); the other
+    /// channels of the device stay silent
+    #[arg(long, global = true, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    audio_out_channel: u16,
+
+    /// Transmit level, peak dBFS (−60 … 0). The receiver is level-independent;
+    /// −12 leaves headroom on the bus. Ignored by digital-bit-exact
+    #[arg(long, global = true, value_name = "DB", default_value_t = DEFAULT_TX_LEVEL_DBFS, allow_negative_numbers = true, value_parser = parse_tx_level)]
+    tx_level_db: f32,
+
+    /// Machine-readable output for encode / decode: one JSON object per line
+    /// (NDJSON) with every engine event, instead of the human log
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -49,7 +80,8 @@ enum Commands {
     /// Start the real-time encoder (MIDI -> Audio)
     ///
     /// Devices are chosen by index or by exact name (see `list-devices`);
-    /// a name that is not present is an error, never another device.
+    /// a name that is not present is an error, never another device. With
+    /// no MIDI in, only heartbeats are sent unless --simulate is given.
     Encode {
         /// Input MIDI device index
         #[arg(short, long)]
@@ -67,7 +99,8 @@ enum Commands {
         #[arg(long, value_name = "NAME", conflicts_with = "audio_out")]
         audio_out_name: Option<String>,
 
-        /// Simulate a C-major scale if no MIDI device is used
+        /// Play a C-major test scale (one note per second). Never on by
+        /// itself: a decoder on stage must not get notes nobody played
         #[arg(long, default_value_t = false)]
         simulate: bool,
     },
@@ -75,6 +108,8 @@ enum Commands {
     ///
     /// Devices are chosen by index or by exact name (see `list-devices`);
     /// a name that is not present is an error, never another device.
+    /// Ctrl-C sends Sustain off + All Notes Off on all channels before
+    /// stopping; `panic` + Enter sends it at once.
     Decode {
         /// Input Audio device index (default device if neither is given)
         #[arg(short, long)]
@@ -104,6 +139,8 @@ enum Commands {
     },
     /// List available Audio and MIDI devices
     ListDevices,
+    /// Explain the profiles: which line each is for, latency, older names
+    Profiles,
     /// Synthetic / WAV loopback test for the Cricket modem
     Test {
         /// Optional path to write encoded WAV
@@ -116,8 +153,8 @@ enum Commands {
     /// Encode→decode loopback with latency measurement (in-process)
     Loopback {
         /// Profiles to measure, comma-separated (e.g.
-        /// `robust,robust_repeat,fast,ltc_fec,digital`)
-        #[arg(long, value_delimiter = ',', default_value = "fast,robust")]
+        /// `analog-safe,analog-fast,clean-line,digital-bit-exact`)
+        #[arg(long, value_delimiter = ',', default_value = "analog-fast,analog-safe", value_parser = parse_profile)]
         profiles: Vec<String>,
         /// NoteOns per profile
         #[arg(long, default_value_t = LOOPBACK_NOTES)]
@@ -137,7 +174,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         zero_airtime: bool,
     },
-    /// Is an audio path bit-transparent? (for the `digital` profile)
+    /// Is an audio path bit-transparent? (for the digital-bit-exact profile)
     ///
     /// Run `pathcheck send` on the sending machine and `pathcheck receive`
     /// on the receiving one (or `pathcheck loop` when both ends are on one
@@ -145,6 +182,8 @@ enum Commands {
     /// unchanged and, if not, what the path did (gain, word length, dither,
     /// sample-rate conversion, polarity, offset, noise). The test signal
     /// peaks at -48 dBFS. `pathcheck sim` runs simulated paths in-process.
+    /// Exit status: 0 BitExact or DigitalOk, 3 Marginal, 1 NoSignal or
+    /// Unusable.
     Pathcheck {
         #[command(subcommand)]
         action: PathcheckAction,
@@ -204,13 +243,25 @@ enum PathcheckAction {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    match run(cli) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {:#}", e);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<ExitCode> {
     let profile = cli.profile.as_str();
     let audio = AudioOptions {
         buffer_frames: cli.buffer_frames,
         sample_format: cli.sample_format,
         digital: false,
+        input_channel: usize::from(cli.audio_in_channel) - 1,
+        output_channel: usize::from(cli.audio_out_channel) - 1,
     };
 
     match &cli.command {
@@ -220,15 +271,15 @@ fn main() -> Result<()> {
             audio_out,
             audio_out_name,
             simulate,
-        } => {
-            run_encoder(
-                selector(*midi_in, midi_in_name),
-                selector(*audio_out, audio_out_name),
-                *simulate,
-                profile,
-                &audio,
-            )?;
-        }
+        } => run_encoder(
+            selector(*midi_in, midi_in_name),
+            selector(*audio_out, audio_out_name),
+            *simulate,
+            profile,
+            cli.tx_level_db,
+            &audio,
+            cli.json,
+        ),
         Commands::Decode {
             audio_in,
             audio_in_name,
@@ -236,23 +287,33 @@ fn main() -> Result<()> {
             midi_out_name,
             msc_device_id,
             msc_format,
-        } => {
-            run_decoder(
-                selector(*audio_in, audio_in_name),
-                selector(*midi_out, midi_out_name),
-                MscTarget {
-                    device_id: *msc_device_id,
-                    command_format: *msc_format,
-                },
-                profile,
-                &audio,
-            )?;
-        }
+        } => run_decoder(
+            selector(*audio_in, audio_in_name),
+            selector(*midi_out, midi_out_name),
+            MscTarget {
+                device_id: *msc_device_id,
+                command_format: *msc_format,
+            },
+            profile,
+            &audio,
+            cli.json,
+        ),
         Commands::ListDevices => {
             list_all_devices()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Profiles => {
+            print_profiles();
+            Ok(ExitCode::SUCCESS)
         }
         Commands::Test { wav_out, wav_in } => {
-            run_test_mode(wav_out.as_deref(), wav_in.as_deref(), profile)?;
+            run_test_mode(
+                wav_out.as_deref(),
+                wav_in.as_deref(),
+                profile,
+                cli.tx_level_db,
+            )?;
+            Ok(ExitCode::SUCCESS)
         }
         Commands::Loopback {
             profiles,
@@ -268,11 +329,50 @@ fn main() -> Result<()> {
                 Pacing::RealTime
             };
             run_loopback_metrics(profiles, *notes, *chords, *chord_size, *throughput, pacing)?;
+            Ok(ExitCode::SUCCESS)
         }
-        Commands::Pathcheck { action } => run_pathcheck(action, &audio)?,
+        Commands::Pathcheck { action } => run_pathcheck(action, &audio),
     }
+}
 
-    Ok(())
+/// A profile name (user-facing or older), returned in its canonical form.
+/// Unknown names list what is accepted.
+fn parse_profile(s: &str) -> Result<String, String> {
+    PhyConfig::canonical_name(s).ok_or_else(|| {
+        let names = |tier: ProfileTier| -> Vec<String> {
+            PROFILES
+                .iter()
+                .filter(|p| p.tier == tier)
+                .map(|p| {
+                    if p.aliases.is_empty() {
+                        p.name.to_string()
+                    } else {
+                        format!("{} ({})", p.name, p.aliases.join(", "))
+                    }
+                })
+                .collect()
+        };
+        format!(
+            "unknown profile `{}`. Profiles: {}; advanced (no error correction): {}. \
+             Add `+digital` to a decoder profile to also accept digital-bit-exact frames. \
+             `cricket profiles` explains them.",
+            s,
+            names(ProfileTier::Standard).join(", "),
+            names(ProfileTier::Advanced).join(", ")
+        )
+    })
+}
+
+/// A transmit level in dBFS within the accepted range.
+fn parse_tx_level(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("{}: {}", s, e))?;
+    if !(MIN_TX_LEVEL_DBFS..=0.0).contains(&v) {
+        return Err(format!(
+            "{} dBFS is outside {} … 0 (0 = full scale)",
+            s, MIN_TX_LEVEL_DBFS
+        ));
+    }
+    Ok(v)
 }
 
 /// A 7-bit value, decimal or `0x` hex.
@@ -299,28 +399,100 @@ fn selector(index: Option<usize>, name: &Option<String>) -> DeviceSelector {
 
 fn list_all_devices() -> Result<()> {
     println!("Host: {}", audio::host_name());
-    println!("--- Input Devices ---");
-    for (index, name) in audio::list_input_devices()?.iter().enumerate() {
-        println!("{}: {}", index, name);
-    }
-    println!("--- Output Devices ---");
-    for (index, name) in audio::list_output_devices()?.iter().enumerate() {
-        println!("{}: {}", index, name);
-    }
-    println!("--- MIDI Input Devices ---");
-    for (i, name) in midi::list_inputs()?.iter().enumerate() {
-        println!("{}: {}", i, name);
-    }
-    println!("--- MIDI Output Devices ---");
-    for (i, name) in midi::list_outputs()?.iter().enumerate() {
-        println!("{}: {}", i, name);
-    }
+    let list = |title: &str, what: &str, names: Result<Vec<String>>| {
+        println!("--- {} ---", title);
+        match names {
+            Ok(names) if names.is_empty() => println!("(none)"),
+            Ok(names) => {
+                for (index, name) in names.iter().enumerate() {
+                    println!("{}: {}", index, name);
+                }
+            }
+            Err(e) => println!("{} unavailable: {}", what, e),
+        }
+    };
+    list("Input Devices", "Audio", audio::list_input_devices());
+    list("Output Devices", "Audio", audio::list_output_devices());
+    // A machine without a MIDI backend (e.g. no ALSA sequencer) still has
+    // audio: say so instead of aborting.
+    list("MIDI Input Devices", "MIDI", midi::list_inputs());
+    list("MIDI Output Devices", "MIDI", midi::list_outputs());
     Ok(())
 }
 
-fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>, profile: &str) -> Result<()> {
-    println!("Running Cricket loopback test (profile={})...", profile);
-    let config = PhyConfig::from_name(profile);
+/// Airtime of one full message (all copies) in ms.
+fn airtime_ms(config: &PhyConfig) -> f32 {
+    repetition_samples(config) as f32 * config.repetition_k.max(1) as f32 * 1000.0
+        / config.sample_rate_hz as f32
+}
+
+fn print_profile_entry(p: &ProfileInfo) {
+    let config = (p.build)();
+    let default = if p.is_default() { " (default)" } else { "" };
+    let also = if p.aliases.is_empty() {
+        String::new()
+    } else {
+        format!("   also: {}", p.aliases.join(", "))
+    };
+    println!("  {}{}{}", p.name, default, also);
+    println!("      for:        {}", p.line);
+    println!("      processing: {}", p.processing);
+    println!(
+        "      latency:    {}; airtime per message {:.1} ms",
+        p.latency,
+        airtime_ms(&config)
+    );
+    println!("      use when:   {}", p.use_when);
+}
+
+fn print_profiles() {
+    println!("Cricket profiles. Both ends must use the same one; names are case-insensitive and");
+    println!("`-` = `_`. The older (wire-format) names are still accepted everywhere.");
+    println!();
+    println!("Which profile?");
+    println!("  1. Analog line, or any bus you don't control (EQ, dynamics, unknown gain)?");
+    println!("       -> analog-safe. Dropouts of 50 ms or more: analog-safe-repeat.");
+    println!("  2. A dedicated line with nothing on it (no EQ, compression, limiter)?");
+    println!("       analog  -> clean-line (notes only, no error correction: analog-fast)");
+    println!(
+        "       digital -> clean-line-fast, or digital-line (Dante / MADI / AES at 48 / 96 kHz)"
+    );
+    println!("  3. `cricket pathcheck` says the path is bit-exact?");
+    println!("       -> digital-bit-exact (< 1 ms; experimental)");
+    println!();
+    println!("Standard profiles:");
+    for p in PROFILES.iter().filter(|p| p.tier == ProfileTier::Standard) {
+        print_profile_entry(p);
+    }
+    println!();
+    println!("Advanced: no error correction (and ltc2400_fec), for operators who know their line:");
+    for p in PROFILES.iter().filter(|p| p.tier == ProfileTier::Advanced) {
+        print_profile_entry(p);
+    }
+    println!();
+    println!("A decoder profile with `+digital` (e.g. clean-line+digital) also accepts");
+    println!("digital-bit-exact frames. Latencies are MIDI in -> MIDI out measured in-process");
+    println!("(`cricket loopback`); real audio interfaces add their own buffering on top.");
+    println!(
+        "Transmit level: {:.0} dBFS peak by default (--tx-level-db); the receiver is level-independent.",
+        DEFAULT_TX_LEVEL_DBFS
+    );
+}
+
+fn run_test_mode(
+    wav_out: Option<&str>,
+    wav_in: Option<&str>,
+    profile: &str,
+    tx_level_db: f32,
+) -> Result<()> {
+    let config = PhyConfig::from_name(profile)
+        .ok_or_else(|| anyhow!("unknown profile {:?}", profile))?
+        .with_tx_level_dbfs(tx_level_db);
+    println!(
+        "Running Cricket loopback test (profile={}, TX level {:.1} dBFS peak)...",
+        profile,
+        config.tx_level_dbfs()
+    );
     let messages = vec![
         TransportMessage::NoteOn {
             channel: 0,
@@ -473,16 +645,19 @@ fn stream_line(what: &str, info: &cricket_engine::pathcheck::StreamInfo) -> Stri
     )
 }
 
-/// Exit status 1 when the digital profile would not work.
-fn finish_pathcheck(report: &PathReport) -> Result<()> {
-    if matches!(report.verdict, Verdict::NoSignal | Verdict::Unusable) {
-        std::process::exit(1);
+/// Exit status of a path check: 0 when the digital profile works, 3 when
+/// it works with losses (`Marginal`), 1 when it would not work.
+fn pathcheck_exit(report: &PathReport) -> ExitCode {
+    match report.verdict {
+        Verdict::BitExact | Verdict::DigitalOk => ExitCode::SUCCESS,
+        Verdict::Marginal => ExitCode::from(EXIT_MARGINAL),
+        Verdict::NoSignal | Verdict::Unusable => ExitCode::from(1),
     }
-    Ok(())
 }
 
-fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<()> {
+fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<ExitCode> {
     use cricket_engine::pathcheck as engine_pc;
+    let in_channel = options.input_channel + 1;
     match action {
         PathcheckAction::Send {
             audio_out,
@@ -500,9 +675,11 @@ fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<()>
                     periods as f64 * pathcheck::PERIOD as f64 / 48_000.0,
                     path
                 );
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
-            let stop = AtomicBool::new(false);
+            let stop = Arc::new(AtomicBool::new(false));
+            install_ctrlc(&stop);
+            let out_channel = options.output_channel + 1;
             engine_pc::play_pattern(
                 AudioOut::Device(selector(*audio_out, audio_out_name)),
                 options,
@@ -511,11 +688,13 @@ fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<()>
                 |info| {
                     println!(
                         "Cricket path check: playing the test pattern ({}; peak -48 dBFS, \
-                         mono on every channel). Ctrl-C to stop.",
-                        stream_line("output", info)
+                         on channel {}). Ctrl-C to stop.",
+                        stream_line("output", info),
+                        out_channel
                     );
                 },
             )?;
+            Ok(ExitCode::SUCCESS)
         }
         PathcheckAction::Receive {
             audio_in,
@@ -539,11 +718,11 @@ fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<()>
                     options,
                     Duration::from_secs_f64(*seconds),
                 )?;
-                println!("  {} (channel 1)", stream_line("input", &info));
+                println!("  {} (channel {})", stream_line("input", &info), in_channel);
                 pathcheck::analyze(&samples, info.0)
             };
             print_report(&report);
-            finish_pathcheck(&report)?;
+            Ok(pathcheck_exit(&report))
         }
         PathcheckAction::Loop {
             audio_out,
@@ -562,15 +741,25 @@ fn run_pathcheck(action: &PathcheckAction, options: &AudioOptions) -> Result<()>
                 options,
                 Duration::from_secs_f64(*seconds),
             )?;
-            println!("  {}", stream_line("output", &out_info));
-            println!("  {} (channel 1)", stream_line("input", &in_info));
+            println!(
+                "  {} (channel {})",
+                stream_line("output", &out_info),
+                options.output_channel + 1
+            );
+            println!(
+                "  {} (channel {})",
+                stream_line("input", &in_info),
+                in_channel
+            );
             let report = pathcheck::analyze(&samples, in_info.0);
             print_report(&report);
-            finish_pathcheck(&report)?;
+            Ok(pathcheck_exit(&report))
         }
-        PathcheckAction::Sim { path } => run_pathcheck_sim(path)?,
+        PathcheckAction::Sim { path } => {
+            run_pathcheck_sim(path)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
-    Ok(())
 }
 
 fn run_pathcheck_sim(name: &str) -> Result<()> {
@@ -611,27 +800,356 @@ fn run_pathcheck_sim(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print engine events until the worker stops (it only stops on its own
-/// after a device error, so that is reported as a failure).
-fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
-    for event in events {
+// --- live monitoring (encode / decode) -------------------------------------
+
+/// Set `flag` on Ctrl-C (once per process; a second handler is ignored).
+fn install_ctrlc(flag: &Arc<AtomicBool>) {
+    let flag = flag.clone();
+    let _ = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst));
+}
+
+/// Lines typed on stdin, for the `panic` command. The thread ends when
+/// stdin closes (it is not a terminal in a service).
+fn stdin_lines() -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("cricket-stdin".into())
+        .spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .ok();
+    rx
+}
+
+/// Peak-hold time of the level readout in the status line.
+const LEVEL_HOLD: Duration = Duration::from_millis(1500);
+/// Interval of the status line.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// Level events in `--json` mode are thinned to this interval.
+const JSON_LEVEL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Decoder,
+    Encoder,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Decoder => "decoder",
+            Role::Encoder => "encoder",
+        }
+    }
+}
+
+/// The running worker, whichever kind.
+enum Handle {
+    Decoder(DecoderHandle),
+    Encoder(EncoderHandle),
+}
+
+impl Handle {
+    fn stop(&mut self) -> bool {
+        match self {
+            Handle::Decoder(d) => d.stop(),
+            Handle::Encoder(e) => e.stop(),
+        }
+    }
+
+    /// Fail-safe burst: the decoder sends it to MIDI out, the encoder sends
+    /// a Panic message over the link.
+    fn panic(&self) {
+        match self {
+            Handle::Decoder(d) => d.panic(),
+            Handle::Encoder(e) => e.send(TransportMessage::Panic),
+        }
+    }
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Prints events as a human log with a periodic status line, or as NDJSON.
+struct Monitor {
+    role: Role,
+    json: bool,
+    level_db: f32,
+    level_at: Instant,
+    stats: Option<LinkStats>,
+    last_msg: Option<String>,
+    last_packet: Option<Instant>,
+    tx: Option<(usize, f32)>,
+    last_status: Instant,
+    last_json_level: Instant,
+}
+
+impl Monitor {
+    fn new(role: Role, json: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            role,
+            json,
+            level_db: -120.0,
+            level_at: now,
+            stats: None,
+            last_msg: None,
+            last_packet: None,
+            tx: None,
+            last_status: now,
+            last_json_level: now - JSON_LEVEL_INTERVAL,
+        }
+    }
+
+    fn emit_json(&self, mut value: serde_json::Value) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("ts_ms".into(), serde_json::json!(now_ms()));
+            obj.insert("role".into(), serde_json::json!(self.role.name()));
+        }
+        println!("{}", value);
+    }
+
+    /// A line the operator should see (setup warnings).
+    fn warning(&self, message: &str) {
+        if self.json {
+            self.emit_json(serde_json::json!({ "event": "warning", "message": message }));
+        } else {
+            println!("WARNING: {}", message);
+        }
+    }
+
+    fn note(&self, message: &str) {
+        if self.json {
+            self.emit_json(serde_json::json!({ "event": "log", "message": message }));
+        } else {
+            println!("{}", message);
+        }
+    }
+
+    fn handle(&mut self, event: &EngineEvent) {
+        match event {
+            EngineEvent::Level(rms) => {
+                let db = rms_to_dbfs(*rms);
+                if db >= self.level_db || self.level_at.elapsed() > LEVEL_HOLD {
+                    self.level_db = db;
+                    self.level_at = Instant::now();
+                }
+            }
+            EngineEvent::Decoded(msg) => {
+                self.last_packet = Some(Instant::now());
+                if !matches!(msg, TransportMessage::Heartbeat) {
+                    let (kind, payload) = format_message(msg);
+                    self.last_msg = Some(format!("{} {}", kind, payload).trim_end().to_string());
+                }
+            }
+            EngineEvent::Stats(s) => self.stats = Some(s.clone()),
+            EngineEvent::TxStatus { queued, latency_ms } => self.tx = Some((*queued, *latency_ms)),
+            EngineEvent::Log(line) if line.starts_with("TX ") => {
+                self.last_msg = Some(line.trim_start_matches("TX ").to_string());
+            }
+            _ => {}
+        }
+        if self.json {
+            self.print_json(event);
+        } else {
+            self.print_text(event);
+        }
+    }
+
+    fn print_json(&mut self, event: &EngineEvent) {
+        use serde_json::json;
+        let value = match event {
+            EngineEvent::Log(message) => json!({ "event": "log", "message": message }),
+            EngineEvent::Level(rms) => {
+                if self.last_json_level.elapsed() < JSON_LEVEL_INTERVAL {
+                    return;
+                }
+                self.last_json_level = Instant::now();
+                json!({ "event": "level", "rms": rms, "dbfs": rms_to_dbfs(*rms) })
+            }
+            EngineEvent::Decoded(msg) => {
+                let (kind, payload) = format_message(msg);
+                json!({
+                    "event": "decoded",
+                    "type": kind,
+                    "payload": payload,
+                    "heartbeat": matches!(msg, TransportMessage::Heartbeat),
+                })
+            }
+            EngineEvent::Stats(s) => json!({
+                "event": "stats",
+                "state": cricket_engine::link_state_name(s.state),
+                "light": LinkLight::from_stats(Some(s), self.level_db).label(),
+                "link_alive": s.link_alive,
+                "crc_pass": s.crc_pass,
+                "crc_fail": s.crc_fail,
+                "crc_pass_rate": s.crc_pass_rate,
+                "fec_corrected": s.fec_corrected,
+                "sync_lost": s.sync_lost,
+                "locks": s.locks(),
+                "confidence_db": s.confidence_db,
+                "last_seq": s.last_seq,
+                "buffer_drops": s.buffer_drops,
+                "airtime_ms": s.est_latency_ms,
+                "level_dbfs": self.level_db,
+            }),
+            EngineEvent::Alarm { kind, message } => json!({
+                "event": "alarm",
+                "kind": kind.as_str(),
+                "title": kind.title(),
+                "message": message,
+            }),
+            EngineEvent::AlarmCleared { kind, message } => json!({
+                "event": "alarm_cleared",
+                "kind": kind.as_str(),
+                "message": message,
+            }),
+            EngineEvent::TxStatus { queued, latency_ms } => {
+                json!({ "event": "tx_status", "queued": queued, "latency_ms": latency_ms })
+            }
+            EngineEvent::Stopped => json!({ "event": "stopped" }),
+        };
+        self.emit_json(value);
+    }
+
+    fn print_text(&self, event: &EngineEvent) {
         match event {
             EngineEvent::Log(line) => println!("{}", line),
             EngineEvent::Decoded(msg) => {
-                let (kind, payload) = format_message(&msg);
-                println!("[MSG] {} {}", kind, payload);
+                if !matches!(msg, TransportMessage::Heartbeat) {
+                    let (kind, payload) = format_message(msg);
+                    println!("[MSG] {} {}", kind, payload);
+                }
             }
-            EngineEvent::Alarm {
-                kind: AlarmKind::LinkDead,
-                ..
-            } => println!("[LINK DEAD] All Notes Off"),
-            EngineEvent::Alarm { message, .. } => println!("[ALARM] {}", message),
+            EngineEvent::Alarm { kind, message } => {
+                println!("[ALARM] {}: {}", kind.title(), message)
+            }
             EngineEvent::AlarmCleared { message, .. } => println!("[ALARM CLEARED] {}", message),
-            EngineEvent::Stopped => break,
+            EngineEvent::Stopped => println!("[STOPPED]"),
             EngineEvent::Level(_) | EngineEvent::Stats(_) | EngineEvent::TxStatus { .. } => {}
         }
     }
-    Err(anyhow!("{} stopped", what))
+
+    /// The periodic status line (text mode only).
+    fn status_line(&mut self) {
+        if self.json || self.last_status.elapsed() < STATUS_INTERVAL {
+            return;
+        }
+        self.last_status = Instant::now();
+        let last = self.last_msg.as_deref().unwrap_or("—");
+        match self.role {
+            Role::Decoder => {
+                let light = LinkLight::from_stats(self.stats.as_ref(), self.level_db);
+                let ago = match self.last_packet {
+                    Some(t) => format!("{:.1} s ago", t.elapsed().as_secs_f32()),
+                    None => "never".to_string(),
+                };
+                let (crc, fec, conf) = match &self.stats {
+                    Some(s) => (
+                        format!("{} ok / {} fail", s.crc_pass, s.crc_fail),
+                        s.fec_corrected.to_string(),
+                        format!("{:.1} dB", s.confidence_db),
+                    ),
+                    None => ("—".into(), "—".into(), "—".into()),
+                };
+                println!(
+                    "[status] {} · in {:.1} dBFS · conf {} · CRC {} · FEC fixed {} · last packet {} · last: {}",
+                    light.label(),
+                    self.level_db.max(-99.9),
+                    conf,
+                    crc,
+                    fec,
+                    ago,
+                    last
+                );
+                if let Some(hint) = light.hint() {
+                    if light != LinkLight::Dead || self.last_packet.is_some() {
+                        println!("[hint] {}", hint);
+                    }
+                }
+            }
+            Role::Encoder => {
+                let (queued, late) = self.tx.unwrap_or((0, 0.0));
+                println!(
+                    "[status] TX queue {} · oldest waiting {:.0} ms · last: {}",
+                    queued, late, last
+                );
+            }
+        }
+    }
+}
+
+/// Run `handle` until it stops on its own (an error: exit 1), Ctrl-C (the
+/// worker is stopped in order, exit 0) or stdin closes with a `quit`.
+fn monitor(
+    mut handle: Handle,
+    events: Receiver<EngineEvent>,
+    mut mon: Monitor,
+) -> Result<ExitCode> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    install_ctrlc(&interrupted);
+    let commands = stdin_lines();
+    let what = match mon.role {
+        Role::Decoder => "Decoder",
+        Role::Encoder => "Encoder",
+    };
+    loop {
+        if interrupted.swap(false, Ordering::SeqCst) {
+            mon.note(match handle {
+                Handle::Decoder(_) => {
+                    "Stopping — Sustain off + All Notes Off go to MIDI out first..."
+                }
+                Handle::Encoder(_) => "Stopping encoder...",
+            });
+            let stopped = handle.stop();
+            // The worker's last events (the stop burst log, Stopped).
+            for ev in events.try_iter() {
+                mon.handle(&ev);
+            }
+            if !stopped {
+                return Err(anyhow!("{} did not stop in time", what));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        while let Ok(line) = commands.try_recv() {
+            match line.trim().to_ascii_lowercase().as_str() {
+                "p" | "panic" => {
+                    handle.panic();
+                    mon.note("Panic requested.");
+                }
+                "q" | "quit" | "exit" => interrupted.store(true, Ordering::SeqCst),
+                "" => {}
+                other => mon.note(&format!(
+                    "Unknown command {:?}: type `panic` (All Notes Off) or `quit`.",
+                    other
+                )),
+            }
+        }
+        match events.recv_timeout(Duration::from_millis(100)) {
+            Ok(EngineEvent::Stopped) => {
+                mon.handle(&EngineEvent::Stopped);
+                // Only a device error makes a worker stop by itself.
+                return Err(anyhow!("{} stopped", what));
+            }
+            Ok(ev) => mon.handle(&ev),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(anyhow!("{} vanished", what)),
+        }
+        mon.status_line();
+    }
 }
 
 fn run_decoder(
@@ -640,17 +1158,27 @@ fn run_decoder(
     msc: MscTarget,
     profile: &str,
     audio: &AudioOptions,
-) -> Result<()> {
-    println!("Initializing Cricket decoder...");
+    json: bool,
+) -> Result<ExitCode> {
+    let mon = Monitor::new(Role::Decoder, json);
+    mon.note("Initializing Cricket decoder...");
     let midi_out = match midi_out {
         DeviceSelector::Default => MidiOut::None,
         sel => {
             // Fail fast on a bad port, as before the engine.
-            println!("MIDI Out: {}", midi::output_port_name(&sel)?);
+            mon.note(&format!("MIDI Out: {}", midi::output_port_name(&sel)?));
             MidiOut::Device(sel)
         }
     };
-    let dec = DecoderHandle::start(DecoderConfig {
+    let config = PhyConfig::from_name(profile).ok_or_else(|| anyhow!("unknown profile"))?;
+    let in_name = audio::resolve_device_name(&audio_in, true).ok();
+    for w in audio::setup_warnings(&config, in_name.as_deref(), None) {
+        mon.warning(&w);
+    }
+    if !json {
+        mon.note("Type `panic` + Enter for Sustain off + All Notes Off on all channels; Ctrl-C stops (burst sent first).");
+    }
+    let mut dec = DecoderHandle::start(DecoderConfig {
         audio_in: AudioIn::Device(audio_in),
         midi_out,
         profile: profile.into(),
@@ -658,34 +1186,100 @@ fn run_decoder(
         msc,
         audio: audio.clone(),
     })?;
-    print_events(dec.events(), "Decoder")
+    let events = dec.take_events();
+    monitor(Handle::Decoder(dec), events, mon)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_encoder(
     midi_in: DeviceSelector,
     audio_out: DeviceSelector,
     simulate: bool,
     profile: &str,
+    tx_level_db: f32,
     audio: &AudioOptions,
-) -> Result<()> {
-    println!("Initializing Cricket encoder...");
+    json: bool,
+) -> Result<ExitCode> {
+    let mon = Monitor::new(Role::Encoder, json);
+    mon.note("Initializing Cricket encoder...");
     let midi_in = match midi_in {
         DeviceSelector::Default => MidiIn::None,
         sel => {
             // Fail fast on a bad port, as before the engine.
-            println!("MIDI In: {}", midi::input_port_name(&sel)?);
+            mon.note(&format!("MIDI In: {}", midi::input_port_name(&sel)?));
             MidiIn::Device(sel)
         }
     };
-    if simulate || matches!(midi_in, MidiIn::None) {
-        println!("Simulation mode: C-major scale + heartbeats");
+    if simulate {
+        mon.note("Test scale ON: C-major scale, one note per second, plus heartbeats.");
+    } else if matches!(midi_in, MidiIn::None) {
+        mon.note("No MIDI in: heartbeats only (add --simulate for a test scale).");
     }
-    let enc = EncoderHandle::start(EncoderConfig {
+    let config = PhyConfig::from_name(profile).ok_or_else(|| anyhow!("unknown profile"))?;
+    let out_name = audio::resolve_device_name(&audio_out, false).ok();
+    for w in audio::setup_warnings(&config, None, out_name.as_deref()) {
+        mon.warning(&w);
+    }
+    let mut enc = EncoderHandle::start(EncoderConfig {
         audio_out: AudioOut::Device(audio_out),
         midi_in,
         profile: profile.into(),
         simulate,
+        tx_level_dbfs: Some(tx_level_db),
         audio: audio.clone(),
     })?;
-    print_events(enc.events(), "Encoder")
+    let events = enc.take_events();
+    monitor(Handle::Encoder(enc), events, mon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cricket_core::phy::profile_info;
+
+    #[test]
+    fn profile_parser_accepts_tiers_and_old_names_and_rejects_typos() {
+        assert_eq!(parse_profile("robust").unwrap(), "analog-safe");
+        assert_eq!(parse_profile("Analog_Safe").unwrap(), "analog-safe");
+        assert_eq!(
+            parse_profile("ltc9600_fec+digital").unwrap(),
+            "clean-line-fast+digital"
+        );
+        let err = parse_profile("robsut").unwrap_err();
+        assert!(err.starts_with("unknown profile `robsut`"), "{err}");
+        assert!(err.contains("analog-safe (robust, robust_fec)"), "{err}");
+        assert!(
+            err.contains("advanced (no error correction): ltc (ltc4800)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn tx_level_range() {
+        assert_eq!(parse_tx_level("-12").unwrap(), -12.0);
+        assert_eq!(parse_tx_level("0").unwrap(), 0.0);
+        assert!(parse_tx_level("3").is_err());
+        assert!(parse_tx_level("-61").is_err());
+        assert!(parse_tx_level("loud").is_err());
+    }
+
+    #[test]
+    fn pathcheck_exit_codes() {
+        let mut report = pathcheck::analyze(&[0.0; 48_000], 48_000);
+        assert_eq!(report.verdict, Verdict::NoSignal);
+        assert_eq!(pathcheck_exit(&report), ExitCode::from(1));
+        report.verdict = Verdict::Marginal;
+        assert_eq!(pathcheck_exit(&report), ExitCode::from(EXIT_MARGINAL));
+        report.verdict = Verdict::BitExact;
+        assert_eq!(pathcheck_exit(&report), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn every_catalog_profile_is_listed_with_its_airtime() {
+        for p in PROFILES {
+            let c = (p.build)();
+            assert!(airtime_ms(&c) > 0.0, "{}", p.name);
+            assert_eq!(profile_info(p.name).map(|i| i.name), Some(p.name));
+        }
+    }
 }

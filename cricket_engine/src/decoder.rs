@@ -14,7 +14,17 @@
 //! outage has already been handled: `declare_link_dead` disarmed the modem's
 //! monitor, so the samples arriving after the stall do not fire a second
 //! burst for it. The link stays `Dead` until the next valid packet, which
-//! re-arms link-dead as usual.
+//! re-arms link-dead as usual and clears the `LinkDead` alarm.
+//!
+//! **Fail-safe on stop and Panic.** When the worker is stopped
+//! ([`DecoderHandle::stop`], drop, GUI Stop, Ctrl-C in the CLI) it sends the
+//! same fail-safe burst to MIDI out before closing it, so stopping Cricket
+//! can never leave a note droning on stage. [`DecoderHandle::panic`] sends
+//! the burst immediately while running.
+//!
+//! **MIDI output failures** are counted: the first failed send raises
+//! `Alarm { MidiOutputError }`, the next successful one
+//! `AlarmCleared { MidiOutputError }`.
 //!
 //! Device errors reported by the source (cpal's error callback) are polled
 //! every loop iteration and emitted as `Alarm { AudioDeviceError }`.
@@ -28,19 +38,22 @@ use crate::audio::{AudioIn, AudioOptions};
 use crate::events::{AlarmKind, EngineEvent, LinkStats};
 use crate::midi::{self, MidiOut, MidiSink};
 use crate::{closed_receiver, Emitter, Worker};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use cricket_core::modem::{CricketModemRx, ModemOutput, ModemStats};
-use cricket_core::phy::{LinkState, Modulation, PhyConfig};
-use cricket_core::transport::{MscTarget, TransportMessage};
+use cricket_core::phy::{Modulation, PhyConfig};
+use cricket_core::transport::MscTarget;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Decoder settings.
 pub struct DecoderConfig {
     pub audio_in: AudioIn,
     pub midi_out: MidiOut,
-    /// PHY profile name (see `PhyConfig::from_name`; unknown names mean robust).
+    /// PHY profile name, user-facing or wire-format (see
+    /// `PhyConfig::from_name`). An unknown name makes
+    /// [`DecoderHandle::start`] fail: it never falls back to another profile.
     pub profile: String,
     /// Override the profile's link-dead timeout in ms (both the modem's
     /// sample-based link-dead and the wall-clock input watchdog). `None`
@@ -49,24 +62,41 @@ pub struct DecoderConfig {
     /// Device ID and command format of the MSC SysEx sent to MIDI out
     /// (spec §5.4; default all-call `0x7F`, Lighting (General) `0x01`).
     pub msc: MscTarget,
-    /// Device buffer size and sample format (cpal devices only).
+    /// Device buffer size, sample format and input channel (cpal devices
+    /// only).
     pub audio: AudioOptions,
 }
 
-/// A running decoder worker. Dropping it stops the worker.
+/// A running decoder worker. Dropping it stops the worker (which sends the
+/// fail-safe burst to MIDI out first).
 pub struct DecoderHandle {
     worker: Worker,
     events: Receiver<EngineEvent>,
+    panic: Arc<AtomicBool>,
 }
 
 impl DecoderHandle {
-    /// Spawn the decoder thread. Device errors (audio or MIDI) do not fail
-    /// this call; they are reported as `Log` events, after which the worker
-    /// either continues without MIDI or ends with `Stopped`.
+    /// Spawn the decoder thread. An unknown profile name is an error here.
+    /// Device errors (audio or MIDI) do not fail this call; they are
+    /// reported as `Log` events, after which the worker either continues
+    /// without MIDI or ends with `Stopped`.
     pub fn start(config: DecoderConfig) -> Result<Self> {
-        let (worker, events) =
-            Worker::spawn("cricket-decoder", move |ev, stop| run(config, ev, stop))?;
-        Ok(Self { worker, events })
+        let phy = PhyConfig::from_name(&config.profile).ok_or_else(|| {
+            anyhow!(
+                "unknown profile {:?} (run `cricket profiles` for the list)",
+                config.profile
+            )
+        })?;
+        let panic = Arc::new(AtomicBool::new(false));
+        let panic_w = panic.clone();
+        let (worker, events) = Worker::spawn("cricket-decoder", move |ev, stop| {
+            run(config, phy, &panic_w, ev, stop)
+        })?;
+        Ok(Self {
+            worker,
+            events,
+            panic,
+        })
     }
 
     /// The worker's event channel.
@@ -85,7 +115,15 @@ impl DecoderHandle {
         self.worker.is_running()
     }
 
-    /// Stop and join the worker (waits at most [`crate::STOP_TIMEOUT`]).
+    /// Send the fail-safe burst now (Sustain off + All Notes Off on all 16
+    /// channels, pitch bend re-centered where it was left bent) to MIDI out,
+    /// as on link-dead. The decoder keeps running.
+    pub fn panic(&self) {
+        self.panic.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop and join the worker (waits at most [`crate::STOP_TIMEOUT`]). The
+    /// worker sends the fail-safe burst to MIDI out before it exits.
     /// Returns false if the worker did not exit in time.
     pub fn stop(&mut self) -> bool {
         self.worker.stop()
@@ -106,10 +144,73 @@ const IDLE_WAIT: Duration = Duration::from_millis(5);
 /// Minimum interval between `Stats` events.
 const STATS_INTERVAL: Duration = Duration::from_millis(200);
 
-fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
-    ev.log(format!("Starting decoder (profile={})...", cfg.profile));
+/// The MIDI sink plus the state of its send-failure alarm.
+struct MidiOutState {
+    sink: Option<Box<dyn MidiSink>>,
+    /// A send has failed and no send has succeeded since.
+    failing: bool,
+    /// Messages lost in the current failure streak.
+    lost: u64,
+}
 
-    let mut config = PhyConfig::from_name(&cfg.profile);
+impl MidiOutState {
+    fn is_connected(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    fn send(&mut self, bytes: &[u8], ev: &Emitter) {
+        let Some(sink) = self.sink.as_mut() else {
+            return;
+        };
+        match sink.send(bytes) {
+            Ok(()) => {
+                if std::mem::take(&mut self.failing) {
+                    let message = format!(
+                        "MIDI out is working again ({} message{} lost meanwhile)",
+                        self.lost,
+                        if self.lost == 1 { "" } else { "s" }
+                    );
+                    self.lost = 0;
+                    ev.log(message.clone());
+                    ev.send(EngineEvent::AlarmCleared {
+                        kind: AlarmKind::MidiOutputError,
+                        message,
+                    });
+                }
+            }
+            Err(e) => {
+                self.lost += 1;
+                if !self.failing {
+                    self.failing = true;
+                    let message = format!(
+                        "MIDI out failed: {} — decoded MIDI is not reaching the device",
+                        e
+                    );
+                    ev.log(message.clone());
+                    ev.send(EngineEvent::Alarm {
+                        kind: AlarmKind::MidiOutputError,
+                        message,
+                    });
+                }
+            }
+        }
+    }
+
+    fn send_all(&mut self, messages: &[Vec<u8>], ev: &Emitter) {
+        for bytes in messages {
+            self.send(bytes, ev);
+        }
+    }
+}
+
+/// The fail-safe burst as a log line.
+const BURST_TEXT: &str = "Sustain off + All Notes Off sent on all 16 channels";
+
+fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, stop: &AtomicBool) {
+    let name = PhyConfig::canonical_name(&cfg.profile).unwrap_or_else(|| cfg.profile.clone());
+    ev.log(format!("Starting decoder (profile={})...", name));
+
+    let mut config = phy;
     if let Some(ms) = cfg.link_dead_ms {
         config.link_dead_ms = ms;
     }
@@ -117,19 +218,23 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     let est_latency = config.estimated_first_copy_ms();
     let preferred_sample_rate = config.sample_rate_hz;
 
-    let mut midi_out: Option<Box<dyn MidiSink>> = match cfg.midi_out {
-        MidiOut::None => {
-            ev.log("No MIDI out selected — decode to UI only.");
-            None
-        }
-        MidiOut::Device(sel) => match midi::open_output(&sel) {
-            Ok(c) => Some(Box::new(c)),
-            Err(e) => {
-                ev.log(format!("MIDI out error: {}", e));
+    let mut midi_out = MidiOutState {
+        sink: match cfg.midi_out {
+            MidiOut::None => {
+                ev.log("No MIDI out selected — decode to UI only.");
                 None
             }
+            MidiOut::Device(sel) => match midi::open_output(&sel) {
+                Ok(c) => Some(Box::new(c) as Box<dyn MidiSink>),
+                Err(e) => {
+                    ev.log(format!("MIDI out error: {}", e));
+                    None
+                }
+            },
+            MidiOut::Custom(sink) => Some(sink),
         },
-        MidiOut::Custom(sink) => Some(sink),
+        failing: false,
+        lost: 0,
     };
 
     let mut audio = cfg.audio.clone();
@@ -149,8 +254,9 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
 
     let details = source.describe();
     ev.log(format!(
-        "Audio in {} Hz, {} ch (ch0){}. est latency {:.1} ms.",
+        "Audio in {} Hz, listening on ch {} of {}{}. First-copy airtime {:.1} ms.",
         stream_sample_rate,
+        source.channel() + 1,
         source.channels(),
         if details.is_empty() {
             String::new()
@@ -180,6 +286,8 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     let mut last_stats_emit = Instant::now();
     let mut sync_lost: u64 = 0;
     let mut link_alive = false;
+    // Set when `Alarm { LinkDead }` was sent; the next valid packet clears it.
+    let mut dead_since: Option<Instant> = None;
     let mut buf = [0.0f32; CHUNK];
     // Wall-clock watchdog state: when the last sample was pulled, and whether
     // the current gap has already been reported as a stall.
@@ -193,6 +301,12 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
                 message: format!("Audio input device error: {}", err),
             });
             ev.log(format!("Audio input device error: {}", err));
+        }
+
+        if panic.swap(false, Ordering::SeqCst) {
+            let burst = rx.fail_safe_burst();
+            midi_out.send_all(&burst, ev);
+            ev.log(format!("Panic — {}", BURST_TEXT));
         }
 
         let n = source.pull(&mut buf);
@@ -229,15 +343,11 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
                 let silent_ms = last_sample_at.elapsed().as_millis();
                 if rx.declare_link_dead() {
                     let burst = rx.fail_safe_burst();
-                    if let Some(sink) = midi_out.as_mut() {
-                        for bytes in burst {
-                            let _ = sink.send(&bytes);
-                        }
-                    }
+                    midi_out.send_all(&burst, ev);
                     link_alive = false;
                     let message = format!(
-                        "Audio input stalled ({} ms without samples) — All Notes Off sent",
-                        silent_ms
+                        "Audio input stalled ({} ms without samples) — {}",
+                        silent_ms, BURST_TEXT
                     );
                     ev.send(EngineEvent::Alarm {
                         kind: AlarmKind::AudioInputStalled,
@@ -269,21 +379,35 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
         for out in rx.push_samples(chunk) {
             match out {
                 ModemOutput::Message(msg) => {
-                    if matches!(msg, TransportMessage::Heartbeat) {
-                        link_alive = true;
+                    // Any valid packet (heartbeats included) means the link is up.
+                    link_alive = true;
+                    if let Some(since) = dead_since.take() {
+                        let message = format!(
+                            "Link restored after {:.1} s (valid packet received)",
+                            since.elapsed().as_secs_f32()
+                        );
+                        ev.log(message.clone());
+                        ev.send(EngineEvent::AlarmCleared {
+                            kind: AlarmKind::LinkDead,
+                            message,
+                        });
                     }
                     ev.send(EngineEvent::Decoded(msg));
                 }
                 ModemOutput::Midi(bytes) => {
-                    if let Some(sink) = midi_out.as_mut() {
-                        let _ = sink.send(&bytes);
-                    }
+                    midi_out.send(&bytes, ev);
                 }
                 ModemOutput::LinkDead => {
                     link_alive = false;
+                    dead_since = Some(Instant::now());
+                    let message = format!(
+                        "Link dead: no valid packet for {} ms — {}",
+                        link_dead_timeout.as_millis(),
+                        BURST_TEXT
+                    );
                     ev.send(EngineEvent::Alarm {
                         kind: AlarmKind::LinkDead,
-                        message: "Link dead — All Notes Off sent".into(),
+                        message,
                     });
                     ev.log("Link dead — All Notes Off");
                 }
@@ -292,12 +416,6 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
                 }
                 ModemOutput::Stats(stats) => {
                     if last_stats_emit.elapsed() >= STATS_INTERVAL {
-                        if matches!(stats.link_state, LinkState::Locked) {
-                            link_alive = true;
-                        }
-                        if matches!(stats.link_state, LinkState::Dead) {
-                            link_alive = false;
-                        }
                         ev.send(EngineEvent::Stats(link_stats(
                             &stats,
                             sync_lost,
@@ -312,6 +430,12 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
         }
     }
 
+    // Orderly stop: never leave a note hanging on the far end.
+    if midi_out.is_connected() {
+        let burst = rx.fail_safe_burst();
+        midi_out.send_all(&burst, ev);
+        ev.log(format!("Stop — {}", BURST_TEXT));
+    }
     ev.log("Decoder stopped.");
 }
 
@@ -332,6 +456,7 @@ fn link_stats(
         state: stats.link_state,
         crc_pass: stats.crc_pass,
         crc_fail: stats.crc_fail,
+        fec_corrected: stats.fec_corrected,
         confidence_db: stats.last_confidence_db,
         last_seq: stats.last_seq,
         sync_lost,

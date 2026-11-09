@@ -569,7 +569,7 @@ fn worst_case_audio_rarely_reaches_the_crc() {
     let cases = [
         (
             "MFSK traffic -> ltc2400_fec",
-            PhyConfig::from_name("ltc2400_fec"),
+            PhyConfig::from_name("ltc2400_fec").unwrap(),
             mfsk_traffic(6.0, 21, &mfsk),
             0.9,
         ),
@@ -581,10 +581,10 @@ fn worst_case_audio_rarely_reaches_the_crc() {
         ),
         (
             "uncoded LTC -> ltc14400_fec",
-            PhyConfig::from_name("ltc14400_fec"),
+            PhyConfig::from_name("ltc14400_fec").unwrap(),
             // Fewer false bodies per second (the next burst's sync
             // replaces most false locks), so more audio.
-            bmc_traffic(&PhyConfig::from_name("ltc14400"), 20.0, 24),
+            bmc_traffic(&PhyConfig::from_name("ltc14400").unwrap(), 20.0, 24),
             0.4,
         ),
         (
@@ -656,7 +656,7 @@ fn false_accept_report() {
         let handles: Vec<_> = keys
             .iter()
             .flat_map(|k| {
-                let config = PhyConfig::from_name(k);
+                let config = PhyConfig::from_name(k).unwrap();
                 signals(&config, seconds)
                     .into_iter()
                     .map(move |(name, audio)| (k.clone(), config.clone(), name, audio))

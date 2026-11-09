@@ -44,7 +44,9 @@ fn profile(key: &str) -> PhyConfig {
         None => (head, None),
     };
     let known = PhyConfig::from_name(name);
-    let mut config = if matches!(known.modulation, Modulation::Bmc(_)) || !name.starts_with("ltc") {
+    let mut config = if let Some(known) =
+        known.filter(|k| matches!(k.modulation, Modulation::Bmc(_)) || !name.starts_with("ltc"))
+    {
         known
     } else {
         let (rate, parity) = match name.split_once("_fec") {

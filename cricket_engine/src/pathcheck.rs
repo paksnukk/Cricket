@@ -61,7 +61,8 @@ pub fn play_pattern(
     Ok(())
 }
 
-/// Record `duration` of `audio_in` (channel 0). Returns the samples and the
+/// Record `duration` of `audio_in` (the channel selected in `options`).
+/// Returns the samples and the
 /// stream details.
 pub fn capture(
     audio_in: AudioIn,

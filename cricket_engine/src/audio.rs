@@ -2,8 +2,11 @@
 //! their cpal implementations (the single copy of the stream setup formerly
 //! duplicated in the GUI and CLI).
 //!
-//! Workers see mono `f32` samples only. The cpal source takes channel 0 of
-//! the input; the cpal sink writes the mono signal to every output channel.
+//! Workers see mono `f32` samples only. The cpal source takes one channel of
+//! the input ([`AudioOptions::input_channel`]); the cpal sink writes the mono
+//! signal to one output channel ([`AudioOptions::output_channel`]) and
+//! silence to the others, so a Cricket bus never leaks into a neighbouring
+//! channel of a multichannel interface.
 //! Integer device formats are converted with power-of-two scaling and
 //! rounding (2¹⁵ for 16-bit, 2³¹ for 32-bit), so a 24-bit sample value
 //! survives the trip through `f32` exactly in both directions: the
@@ -21,6 +24,7 @@
 use crate::devices::DeviceSelector;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cricket_core::phy::{Modulation, PhyConfig};
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 use std::collections::VecDeque;
 use std::fmt;
@@ -137,14 +141,24 @@ pub struct AudioOptions {
     /// Set by the workers: the profile is `digital` (for
     /// [`SampleFormatPref::Auto`]).
     pub digital: bool,
+    /// Input channel the decoder listens on, 0-based (the UI shows it
+    /// 1-based). Opening fails if the device has fewer channels.
+    pub input_channel: usize,
+    /// Output channel the encoder sends on, 0-based; the other channels
+    /// get silence. Opening fails if the device has fewer channels.
+    pub output_channel: usize,
 }
 
 /// A live mono capture stream.
 pub trait AudioSource {
     /// Actual stream sample rate (may differ from the preferred one).
     fn sample_rate(&self) -> u32;
-    /// Channel count of the underlying device (informational; only ch0 is used).
+    /// Channel count of the underlying device.
     fn channels(&self) -> usize;
+    /// The device channel delivered (0-based).
+    fn channel(&self) -> usize {
+        0
+    }
     /// Start delivering samples.
     fn start(&mut self) -> Result<()>;
     /// Non-blocking: copy up to `out.len()` buffered samples into `out` and
@@ -176,8 +190,12 @@ pub trait AudioSource {
 pub trait AudioSink {
     /// Actual stream sample rate (may differ from the preferred one).
     fn sample_rate(&self) -> u32;
-    /// Channel count of the underlying device (the signal goes to all of them).
+    /// Channel count of the underlying device.
     fn channels(&self) -> usize;
+    /// The device channel the signal goes to (0-based).
+    fn channel(&self) -> usize {
+        0
+    }
     /// Start playback.
     fn start(&mut self) -> Result<()>;
     /// Non-blocking: queue as many of `samples` as fit and return that count.
@@ -280,6 +298,142 @@ impl AudioOut {
 /// Name of the default cpal host (e.g. "ALSA").
 pub fn host_name() -> &'static str {
     cpal::default_host().id().name()
+}
+
+/// Name of the host's default input (`input`) or output device, if any.
+pub fn default_device_name(input: bool) -> Option<String> {
+    let host = cpal::default_host();
+    let device = if input {
+        host.default_input_device()?
+    } else {
+        host.default_output_device()?
+    };
+    Some(device_name(&device))
+}
+
+/// Channel count of the selected input (`input`) or output device in its
+/// default configuration (what the channel selectors offer).
+pub fn channel_count(selector: &DeviceSelector, input: bool) -> Result<usize> {
+    let device = find_device(selector, input)?;
+    let config = if input {
+        device.default_input_config()?
+    } else {
+        device.default_output_config()?
+    };
+    Ok(usize::from(config.channels()))
+}
+
+/// Resolve `selector` to the device's name (the default device's name for
+/// [`DeviceSelector::Default`]), for warnings and logs.
+pub fn resolve_device_name(selector: &DeviceSelector, input: bool) -> Result<String> {
+    Ok(device_name(&find_device(selector, input)?))
+}
+
+/// Does this device name look like a laptop's built-in microphone (`input`)
+/// or speaker? Cricket needs a line in/out: a microphone hears the room,
+/// not the bus, and tones from a speaker go into the room instead of the
+/// bus. Returns the warning to show, or `None`.
+pub fn builtin_device_warning(name: &str, input: bool) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    const BUILTIN: &[&str] = &[
+        "built-in",
+        "builtin",
+        "internal",
+        "macbook",
+        "imac",
+        "mac mini",
+        "laptop",
+        "realtek",
+        "hda intel",
+        "conexant",
+        "cirrus",
+        "sof-hda",
+        "webcam",
+        "camera",
+    ];
+    let generic = BUILTIN.iter().any(|w| lower.contains(w));
+    if input {
+        let mic = lower.contains("microphone")
+            || lower.contains("mic ")
+            || lower.ends_with(" mic")
+            || lower.contains(" mic)")
+            || lower.contains("(mic");
+        (generic || mic).then(|| {
+            format!(
+                "Audio in \"{}\" looks like a built-in microphone. Cricket needs a line input: \
+                 a microphone hears the room, not the Cricket bus.",
+                name
+            )
+        })
+    } else {
+        let speaker = lower.contains("speaker")
+            || lower.contains("headphone")
+            || lower.contains("hdmi")
+            || lower.contains("displayport");
+        (generic || speaker).then(|| {
+            format!(
+                "Audio out \"{}\" looks like a built-in speaker. Cricket needs a line output: \
+                 the tones would play into the room instead of the Cricket bus.",
+                name
+            )
+        })
+    }
+}
+
+/// Setup problems worth a warning before going on air (none is an error):
+/// built-in microphones / speakers (see [`builtin_device_warning`]) and, on
+/// Windows, the bit-exact and 14400 bit/s profiles through WASAPI shared
+/// mode (the Windows mixer processes the audio; see the README's digital
+/// section). `input_device` / `output_device` are the resolved device names
+/// of the devices in use.
+pub fn setup_warnings(
+    config: &PhyConfig,
+    input_device: Option<&str>,
+    output_device: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(w) = input_device.and_then(|n| builtin_device_warning(n, true)) {
+        out.push(w);
+    }
+    if let Some(w) = output_device.and_then(|n| builtin_device_warning(n, false)) {
+        out.push(w);
+    }
+    let needs_clean_digital_path = match &config.modulation {
+        Modulation::Digital => true,
+        Modulation::Bmc(p) => p.bit_rate >= 14_400,
+        Modulation::Mfsk => false,
+    };
+    if cfg!(target_os = "windows") && needs_clean_digital_path {
+        out.push(
+            "On Windows, Cricket uses WASAPI shared mode: the Windows mixer applies volume, \
+             enhancements and format conversion. digital-bit-exact needs an unchanged path and \
+             digital-line / ltc14400 need 16 kHz of bandwidth: run `cricket pathcheck`, set the \
+             device to 24-bit / 48 kHz with enhancements off and volume at 100 %, or use \
+             clean-line (or macOS / Linux) instead."
+                .to_string(),
+        );
+    }
+    out
+}
+
+/// The selected device (the host default for [`DeviceSelector::Default`]).
+fn find_device(selector: &DeviceSelector, input: bool) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    let (mut devices, what): (Vec<cpal::Device>, &str) = if input {
+        (host.input_devices()?.collect(), "Input device")
+    } else {
+        (host.output_devices()?.collect(), "Output device")
+    };
+    let names: Vec<String> = devices.iter().map(device_name).collect();
+    Ok(match selector.resolve(&names, what)? {
+        Some(index) => devices.swap_remove(index),
+        None if input => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("No default input device available"))?,
+        None => host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("No default output device available"))?,
+    })
 }
 
 fn device_name(device: &cpal::Device) -> String {
@@ -436,11 +590,13 @@ impl Pcm for u16 {
     }
 }
 
-/// The selected device, its stream config (buffer size applied) and format.
+/// The selected device, its stream config (buffer size applied), format and
+/// the channel in use.
 struct Opened {
     device: cpal::Device,
     config: cpal::StreamConfig,
     format: cpal::SampleFormat,
+    channel: usize,
 }
 
 fn open_device(
@@ -449,21 +605,11 @@ fn open_device(
     preferred_rate: u32,
     options: &AudioOptions,
 ) -> Result<Opened> {
-    let host = cpal::default_host();
-    let (mut devices, what): (Vec<cpal::Device>, &str) = if input {
-        (host.input_devices()?.collect(), "Input device")
+    let device = find_device(selector, input)?;
+    let channel = if input {
+        options.input_channel
     } else {
-        (host.output_devices()?.collect(), "Output device")
-    };
-    let names: Vec<String> = devices.iter().map(device_name).collect();
-    let device = match selector.resolve(&names, what)? {
-        Some(index) => devices.swap_remove(index),
-        None if input => host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("No default input device available"))?,
-        None => host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("No default output device available"))?,
+        options.output_channel
     };
     let formats = options.sample_format.formats(options.digital);
     let selected = if input {
@@ -481,10 +627,25 @@ fn open_device(
     let buffer = buffer_size(&selected, options);
     let mut config: cpal::StreamConfig = selected.into();
     config.buffer_size = buffer;
+    if channel >= usize::from(config.channels) {
+        return Err(anyhow!(
+            "{} \"{}\" has {} channel{}; channel {} is not available",
+            if input {
+                "Input device"
+            } else {
+                "Output device"
+            },
+            device_name(&device),
+            config.channels,
+            if config.channels == 1 { "" } else { "s" },
+            channel + 1
+        ));
+    }
     Ok(Opened {
         device,
         config,
         format,
+        channel,
     })
 }
 
@@ -496,11 +657,12 @@ fn build_input<T: Pcm>(
     waiter: Thread,
 ) -> Result<cpal::Stream> {
     let channels = (opened.config.channels as usize).max(1);
+    let channel = opened.channel.min(channels - 1);
     Ok(opened.device.build_input_stream(
         &opened.config,
         move |data: &[T], _: &_| {
             for frame in data.chunks(channels) {
-                if let Some(&s) = frame.first() {
+                if let Some(&s) = frame.get(channel) {
                     if producer.push(s.to_f32()).is_err() {
                         drops.fetch_add(1, Ordering::Relaxed);
                     }
@@ -520,12 +682,16 @@ fn build_output<T: Pcm>(
     mut consumer: HeapConsumer<f32>,
 ) -> Result<cpal::Stream> {
     let channels = (opened.config.channels as usize).max(1);
+    let channel = opened.channel.min(channels - 1);
+    let silence = T::from_f32(0.0);
     Ok(opened.device.build_output_stream(
         &opened.config,
         move |data: &mut [T], _: &_| {
             for frame in data.chunks_mut(channels) {
                 let s = T::from_f32(consumer.pop().unwrap_or(0.0));
-                frame.iter_mut().for_each(|o| *o = s);
+                for (i, o) in frame.iter_mut().enumerate() {
+                    *o = if i == channel { s } else { silence };
+                }
             }
         },
         error_callback(errors, "output"),
@@ -533,7 +699,7 @@ fn build_output<T: Pcm>(
     )?)
 }
 
-/// cpal capture: channel 0 of the device into a lock-free ring buffer.
+/// cpal capture: one channel of the device into a lock-free ring buffer.
 pub struct CpalSource {
     stream: cpal::Stream,
     consumer: HeapConsumer<f32>,
@@ -541,6 +707,7 @@ pub struct CpalSource {
     errors: DeviceErrorQueue,
     sample_rate: u32,
     channels: usize,
+    channel: usize,
     describe: String,
 }
 
@@ -586,6 +753,7 @@ impl CpalSource {
             errors,
             sample_rate: opened.config.sample_rate.0,
             channels: opened.config.channels as usize,
+            channel: opened.channel,
             describe: describe_stream(opened.format, &opened.config.buffer_size),
         })
     }
@@ -597,6 +765,9 @@ impl AudioSource for CpalSource {
     }
     fn channels(&self) -> usize {
         self.channels
+    }
+    fn channel(&self) -> usize {
+        self.channel
     }
     fn start(&mut self) -> Result<()> {
         self.stream.play()?;
@@ -621,14 +792,15 @@ impl AudioSource for CpalSource {
     }
 }
 
-/// cpal playback: mono ring buffer copied to every device channel; silence
-/// on underrun.
+/// cpal playback: mono ring buffer to one device channel (silence on the
+/// others and on underrun).
 pub struct CpalSink {
     stream: cpal::Stream,
     producer: HeapProducer<f32>,
     errors: DeviceErrorQueue,
     sample_rate: u32,
     channels: usize,
+    channel: usize,
     describe: String,
 }
 
@@ -670,6 +842,7 @@ impl CpalSink {
             errors,
             sample_rate: opened.config.sample_rate.0,
             channels: opened.config.channels as usize,
+            channel: opened.channel,
             describe: describe_stream(opened.format, &opened.config.buffer_size),
         })
     }
@@ -681,6 +854,9 @@ impl AudioSink for CpalSink {
     }
     fn channels(&self) -> usize {
         self.channels
+    }
+    fn channel(&self) -> usize {
+        self.channel
     }
     fn start(&mut self) -> Result<()> {
         self.stream.play()?;
@@ -746,5 +922,45 @@ mod tests {
             SampleFormatPref::Auto.formats(true)[0],
             cpal::SampleFormat::I32
         );
+    }
+
+    #[test]
+    fn builtin_devices_are_recognized() {
+        for name in [
+            "MacBook Pro Microphone",
+            "Built-in Audio Analog Stereo",
+            "Microphone Array (Realtek(R) Audio)",
+            "HDA Intel PCH: ALC256 Analog (hw:0,0)",
+            "Internal Microphone",
+        ] {
+            assert!(builtin_device_warning(name, true).is_some(), "{name}");
+        }
+        for name in [
+            "MacBook Pro Speakers",
+            "Speakers (Realtek(R) Audio)",
+            "HDMI / DisplayPort 1 Output",
+            "Headphones",
+        ] {
+            assert!(builtin_device_warning(name, false).is_some(), "{name}");
+        }
+        for name in [
+            "Dante Virtual Soundcard",
+            "Scarlett 18i20 USB",
+            "RME MADIface",
+            "UltraLite-mk5",
+            "hw:CARD=USB,DEV=0",
+        ] {
+            assert!(builtin_device_warning(name, true).is_none(), "{name}");
+            assert!(builtin_device_warning(name, false).is_none(), "{name}");
+        }
+        let warnings = setup_warnings(
+            &PhyConfig::robust(),
+            Some("MacBook Pro Microphone"),
+            Some("Dante Virtual Soundcard"),
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("built-in microphone"));
+        let windows_only = setup_warnings(&PhyConfig::digital(), None, None);
+        assert_eq!(windows_only.len(), usize::from(cfg!(target_os = "windows")));
     }
 }

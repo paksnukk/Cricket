@@ -57,14 +57,14 @@ Used by Robust, Robust repeat and Fast. Per-profile values are in §6.
 | Guard gap (silence after every symbol) | 0.5 ms (24 samples) | 0 |
 | Symbol period | 6.5 ms (312 samples) | 3.0 ms (144 samples) |
 | Attack / release (linear ramps inside the symbol) | 0.3 ms (14 samples) | 0.15 ms (7 samples) |
-| Peak amplitude | 0.8 (full scale = 1.0) | 0.8 |
+| Peak amplitude `A` | 0.25 (−12 dBFS; full scale = 1.0) — SHOULD, see §6 | same |
 | Preamble | `A 5 C 3` (4 symbols) | `A 5` (2 symbols) |
 
 Symbol `n` (`N` samples, attack `A` and release `R` samples, tone `f`, sample rate `fs`) is, for
 `i = 0 … N−1`:
 
 ```
-s[i] = 0.8 · env[i] · sin(2π f i / fs)          (every symbol starts at phase 0)
+s[i] = A · env[i] · sin(2π f i / fs)            (every symbol starts at phase 0)
 env[i] = i / A           for i < A
        = (N − i) / R     for i ≥ N − R
        = 1               otherwise
@@ -533,15 +533,21 @@ message is playing waits for that message only, not for one already encoded behi
 Profile identifiers (case-insensitive; `-` and `_` are equivalent): `robust`, `robust_repeat`,
 `fast`, `ltc2400`, `ltc` (= `ltc4800`), `ltc9600`, `ltc2400_fec`, `ltc_fec` (= `ltc4800_fec`),
 `ltc9600_fec`. The reference implementation also accepts `robust_fec`, the former name of `robust`,
-and treats an unknown name as `robust`.
+and rejects an unknown name (it MUST NOT substitute another profile: both ends have to match).
+
+User-facing names (Cricket; informative, equivalent to the identifiers above): `analog-safe` =
+`robust`, `analog-safe-repeat` = `robust_repeat`, `analog-fast` = `fast`, `clean-line` = `ltc_fec`,
+`clean-line-fast` = `ltc9600_fec`, `digital-line` = `ltc14400_fec` (not in this spec),
+`digital-bit-exact` = `digital` (not in this spec). The uncoded LTC profiles keep their identifiers.
 
 | | Robust (default) | Robust repeat | Fast | LTC family (§6.5) |
 |---|---|---|---|---|
+| User-facing name | `analog-safe` | `analog-safe-repeat` | `analog-fast` | `clean-line` (`ltc_fec`), `clean-line-fast` (`ltc9600_fec`); uncoded: `ltc*` |
 | Phy | MFSK-16 (§3) | MFSK-16 | MFSK-16 | biphase mark, 2400 / 4800 / 9600 bit/s |
 | Tones | 2500 + 100 k Hz | 2500 + 100 k Hz | 2500 + 200 k Hz | — |
 | Symbol + guard | 6.0 + 0.5 ms | 6.0 + 0.5 ms | 3.0 + 0 ms | 4 bits per nibble |
 | Ramps | 0.3 ms | 0.3 ms | 0.15 ms | raised-cosine edges, ½ half cell |
-| Amplitude (peak) | 0.8 | 0.8 | 0.8 | 0.8 / √2 ≈ 0.566 |
+| Amplitude `A` (peak; SHOULD) | 0.25 (−12 dBFS) | 0.25 | 0.25 | `A` / √2 ≈ 0.177 |
 | Preamble / sync | `A 5 C 3` | `A 5 C 3` | `A 5` | 8 × `1` + 2 code violations |
 | Body | 22, RS(11,7) × 2, whitened (§4.6) | 16, interleaved (§4.3) | 16, interleaved | 16 (`ltc*`) or 22 coded (`ltc*_fec`) |
 | Copies K | 1 | 2 | 1 | 1 |
@@ -554,7 +560,10 @@ and treats an unknown name as `robust`.
 | Body erasures kept (RX) | ≤ 8 | 0 | 0 | ≤ 8 coded, unlimited uncoded |
 | Heartbeat / link-dead | 500 ms / 2000 ms | same | same | same |
 
-Rows marked RX are reference receiver settings (§3.2, SHOULD); everything else is wire format (MUST).
+Rows marked RX are reference receiver settings (§3.2, SHOULD); everything else is wire format (MUST),
+except the amplitude: receivers are level-independent (§3.2, silence floor −60 dBFS), so a
+transmitter SHOULD send at `A` = 0.25 (−12 dBFS peak, headroom on the bus) and MAY use another level
+between −30 dB below that and full scale. (Before v1.1 the reference transmitter used 0.8.)
 
 ### 6.1 Robust (default)
 
@@ -616,14 +625,14 @@ EQ (an in-band boost of +12 dB at 3 kHz breaks 4800 bit/s), no compression, gate
 dropouts for the uncoded profiles. 9600 bit/s needs more than ~6 kHz of bandwidth (digital lines);
 2400 bit/s does not survive a 1 kHz high-pass.
 
-| Profile | Bit rate | Half cell @ 48 kHz | Body | Burst | Burst + gap |
-|---|---|---|---|---|---|
-| `ltc2400` | 2400 bit/s | 10 samples | 16 nibbles (§4.3) | 31.9 ms | 33.5 ms |
-| `ltc` = `ltc4800` | 4800 bit/s | 5 samples | 16 nibbles | 15.9 ms | 16.8 ms |
-| `ltc9600` | 9600 bit/s | 2.5 samples | 16 nibbles | 8.0 ms | 8.4 ms |
-| `ltc2400_fec` | 2400 bit/s | 10 samples | 22 nibbles coded (§4.6) | 41.9 ms | 43.5 ms |
-| `ltc_fec` = `ltc4800_fec` | 4800 bit/s | 5 samples | 22 nibbles coded | 20.9 ms | 21.8 ms |
-| `ltc9600_fec` | 9600 bit/s | 2.5 samples | 22 nibbles coded | 10.5 ms | 10.9 ms |
+| Profile | User-facing name | Bit rate | Half cell @ 48 kHz | Body | Burst | Burst + gap |
+|---|---|---|---|---|---|---|
+| `ltc2400` | — | 2400 bit/s | 10 samples | 16 nibbles (§4.3) | 31.9 ms | 33.5 ms |
+| `ltc` = `ltc4800` | — | 4800 bit/s | 5 samples | 16 nibbles | 15.9 ms | 16.8 ms |
+| `ltc9600` | — | 9600 bit/s | 2.5 samples | 16 nibbles | 8.0 ms | 8.4 ms |
+| `ltc2400_fec` | — | 2400 bit/s | 10 samples | 22 nibbles coded (§4.6) | 41.9 ms | 43.5 ms |
+| `ltc_fec` = `ltc4800_fec` | `clean-line` | 4800 bit/s | 5 samples | 22 nibbles coded | 20.9 ms | 21.8 ms |
+| `ltc9600_fec` | `clean-line-fast` | 9600 bit/s | 2.5 samples | 22 nibbles coded | 10.5 ms | 10.9 ms |
 
 #### 6.5.1 Line code and frame
 
@@ -651,15 +660,16 @@ body bit. After each burst the transmitter sends **4 bit cells of silence** (`ro
 
 #### 6.5.2 Waveform
 
-The signal is `± 0.8 / √2` (the same RMS as an MFSK tone of amplitude 0.8). Each transition, including
+The signal is `± A / √2` (the same RMS as an MFSK tone of amplitude `A`; `A` = 0.25 by default, a
+SHOULD as in §6). Each transition, including
 the onset from 0 at the start and the fade to 0 after the tail, is a raised-cosine step of width
 `w = 0.5` half cells centred on the nominal transition time. With time measured in half cells,
 `t = (n − 0.25 · h) / h` for sample `n` (the first ramp starts at sample 0), `b = round(t)`,
 `d = t − b`, and `L(j)` the level of half cell `j` (0 before the first and after the last):
 
 ```
-s[n] = 0.8/√2 · ( L(b−1) + (L(b) − L(b−1)) · (½ + ½ · sin(π d / w)) )   if |d| < w / 2
-       0.8/√2 · L(floor(t))                                               otherwise
+s[n] = A/√2 · ( L(b−1) + (L(b) − L(b−1)) · (½ + ½ · sin(π d / w)) )     if |d| < w / 2
+       A/√2 · L(floor(t))                                                 otherwise
 ```
 
 for `n = 0 … ceil((H + w) · h)`, `H` = burst length in half cells. Half cells need not be whole

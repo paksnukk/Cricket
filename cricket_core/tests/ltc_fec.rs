@@ -15,10 +15,13 @@ use support::{decode_chunked, ChannelSim, XorShift64};
 
 fn fec_profiles() -> Vec<(&'static str, PhyConfig)> {
     vec![
-        ("ltc2400_fec", PhyConfig::from_name("ltc2400_fec")),
+        ("ltc2400_fec", PhyConfig::from_name("ltc2400_fec").unwrap()),
         ("ltc_fec", PhyConfig::ltc_fec()),
-        ("ltc9600_fec", PhyConfig::from_name("ltc9600_fec")),
-        ("ltc14400_fec", PhyConfig::from_name("ltc14400_fec")),
+        ("ltc9600_fec", PhyConfig::from_name("ltc9600_fec").unwrap()),
+        (
+            "ltc14400_fec",
+            PhyConfig::from_name("ltc14400_fec").unwrap(),
+        ),
     ]
 }
 
@@ -27,7 +30,7 @@ fn all_profiles() -> Vec<(&'static str, PhyConfig)> {
         ("ltc2400", PhyConfig::ltc_with_bit_rate(2400)),
         ("ltc", PhyConfig::ltc()),
         ("ltc9600", PhyConfig::ltc_with_bit_rate(9600)),
-        ("ltc14400", PhyConfig::from_name("ltc14400")),
+        ("ltc14400", PhyConfig::from_name("ltc14400").unwrap()),
     ];
     v.extend(fec_profiles());
     v
@@ -80,7 +83,7 @@ fn profile_selection() {
         ("ltc9600_fec", 9600),
         ("ltc14400_fec", 14400),
     ] {
-        let c = PhyConfig::from_name(name);
+        let c = PhyConfig::from_name(name).unwrap();
         assert_eq!(c.fec, FecMode::Rs16 { parity: 4 }, "{name}");
         match c.modulation {
             Modulation::Bmc(p) => assert_eq!(p.bit_rate, rate, "{name}"),

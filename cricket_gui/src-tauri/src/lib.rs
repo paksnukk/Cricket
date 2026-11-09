@@ -1,7 +1,10 @@
 //! Tauri shell over `cricket_engine`: commands start/stop engine handles kept in
 //! app state, and one forwarder thread per handle turns `EngineEvent`s into
 //! the frontend's Tauri events (`log`, `input_level`, `decoded_frame`,
-//! `link_stats`, `alarm`, `alarm_cleared`, `worker_stopped`).
+//! `link_stats`, `alarm`, `alarm_cleared`, `tx_status`, `worker_stopped`).
+//! The profile catalog (`get_profiles`), device channel counts and the
+//! setup warnings (built-in mic / speaker, WASAPI) come from the engine and
+//! core too, so the GUI shows the same names and advice as the CLI.
 //!
 //! Each start command returns a run id that is also carried by that run's
 //! `worker_stopped` event, so the frontend can tell "the worker I just
@@ -14,11 +17,12 @@
 
 pub mod settings;
 
-use cricket_core::phy::PhyConfig;
+use cricket_core::modem::repetition_samples;
+use cricket_core::phy::{PhyConfig, ProfileTier, PROFILES};
 use cricket_engine::{
     audio, format_message, link_state_name, midi, AudioIn, AudioOptions, AudioOut, DecoderConfig,
     DecoderHandle, DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
-    MscTarget, TransportMessage,
+    MscTarget, TransportMessage, MIN_TX_LEVEL_DBFS,
 };
 use settings::{load_settings, save_settings, AppSettings};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +83,7 @@ struct LinkStatsEvent {
     state: String,
     crc_pass: u64,
     crc_fail: u64,
+    fec_corrected: u64,
     confidence_db: f32,
     last_seq: Option<u8>,
     sync_lost: u64,
@@ -91,6 +96,8 @@ struct LinkStatsEvent {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct AlarmEvent {
     kind: String,
+    /// Plain-language title of the kind ("Link dead", "Message not sent").
+    title: String,
     message: String,
 }
 
@@ -135,8 +142,58 @@ impl FrontendEvent {
     }
 }
 
-fn parse_profile(profile: &str) -> PhyConfig {
+/// The profile, or the error the frontend shows (never another profile).
+fn parse_profile(profile: &str) -> Result<PhyConfig, String> {
     PhyConfig::from_name(profile)
+        .ok_or_else(|| format!("unknown profile {:?}: choose one from the list", profile))
+}
+
+/// One entry of the GUI's profile selector (from the core catalog).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct ProfileEntry {
+    /// Canonical name (the value stored in settings and sent to the engine).
+    name: String,
+    display: String,
+    /// `"standard"` or `"advanced"` (no error correction).
+    tier: String,
+    is_default: bool,
+    coded: bool,
+    aliases: Vec<String>,
+    line: String,
+    processing: String,
+    latency: String,
+    use_when: String,
+    /// Airtime of one full message (all copies), ms.
+    airtime_ms: f32,
+    /// Confidence (dB) below which the receiver does not accept a packet.
+    min_confidence_db: f32,
+}
+
+fn profile_entries() -> Vec<ProfileEntry> {
+    PROFILES
+        .iter()
+        .map(|p| {
+            let c = (p.build)();
+            ProfileEntry {
+                name: p.name.into(),
+                display: p.display.into(),
+                tier: match p.tier {
+                    ProfileTier::Standard => "standard".into(),
+                    ProfileTier::Advanced => "advanced".into(),
+                },
+                is_default: p.is_default(),
+                coded: p.coded,
+                aliases: p.aliases.iter().map(|a| a.to_string()).collect(),
+                line: p.line.into(),
+                processing: p.processing.into(),
+                latency: p.latency.into(),
+                use_when: p.use_when.into(),
+                airtime_ms: repetition_samples(&c) as f32 * c.repetition_k.max(1) as f32 * 1000.0
+                    / c.sample_rate_hz as f32,
+                min_confidence_db: c.min_confidence_db,
+            }
+        })
+        .collect()
 }
 
 /// Map one engine event of `run` to the frontend's Tauri event, if it has
@@ -158,6 +215,7 @@ fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
             state: link_state_name(s.state).into(),
             crc_pass: s.crc_pass,
             crc_fail: s.crc_fail,
+            fec_corrected: s.fec_corrected,
             confidence_db: s.confidence_db,
             last_seq: s.last_seq,
             sync_lost: s.sync_lost,
@@ -168,10 +226,12 @@ fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
         }),
         EngineEvent::Alarm { kind, message } => FrontendEvent::Alarm(AlarmEvent {
             kind: kind.as_str().into(),
+            title: kind.title().into(),
             message,
         }),
         EngineEvent::AlarmCleared { kind, message } => FrontendEvent::AlarmCleared(AlarmEvent {
             kind: kind.as_str().into(),
+            title: kind.title().into(),
             message,
         }),
         EngineEvent::Stopped => FrontendEvent::WorkerStopped(WorkerStoppedEvent {
@@ -244,17 +304,72 @@ fn set_settings(settings: AppSettings) -> Result<(), String> {
     save_settings(&settings)
 }
 
+/// The profile selector's entries: standard tiers first, then the
+/// advanced (uncoded) group.
+#[tauri::command]
+fn get_profiles() -> Vec<ProfileEntry> {
+    profile_entries()
+}
+
+/// Details of one profile by any accepted name; an unknown name is an
+/// error (the frontend then falls back to the default and says so).
 #[tauri::command]
 fn get_profile_info(profile: String) -> Result<serde_json::Value, String> {
-    let cfg = parse_profile(&profile);
+    let cfg = parse_profile(&profile)?;
+    let canonical = PhyConfig::canonical_name(&profile).unwrap_or_else(|| profile.clone());
     Ok(serde_json::json!({
         "profile": profile,
+        "canonical": canonical,
         "est_latency_ms": cfg.estimated_first_copy_ms(),
+        "airtime_ms": repetition_samples(&cfg) as f32 * cfg.repetition_k.max(1) as f32 * 1000.0
+            / cfg.sample_rate_hz as f32,
         "symbol_duration_ms": cfg.symbol_duration_ms,
         "guard_gap_ms": cfg.guard_gap_ms,
         "repetition_k": cfg.repetition_k,
         "sample_rate_hz": cfg.sample_rate_hz,
+        "min_confidence_db": cfg.min_confidence_db,
+        "tx_level_dbfs": cfg.tx_level_dbfs(),
     }))
+}
+
+/// Channel count of a device (`None` = the default device) in its default
+/// configuration, for the channel selectors.
+#[tauri::command]
+fn get_device_channels(name: Option<String>, input: bool) -> Result<usize, String> {
+    audio::channel_count(&DeviceSelector::from_name(name), input).map_err(|e| e.to_string())
+}
+
+/// Warnings for the chosen setup (built-in microphone / speaker, Windows
+/// shared-mode audio with the digital profiles). Devices are names as
+/// listed (`None` = default device); a device that cannot be resolved
+/// produces no warning here (starting it reports the error).
+#[tauri::command]
+fn check_setup(
+    profile: String,
+    audio_in: Option<String>,
+    audio_out: Option<String>,
+    check_in: bool,
+    check_out: bool,
+) -> Result<Vec<String>, String> {
+    let cfg = parse_profile(&profile)?;
+    let resolve = |name: Option<String>, input: bool| {
+        audio::resolve_device_name(&DeviceSelector::from_name(name), input).ok()
+    };
+    let in_name = if check_in {
+        resolve(audio_in, true)
+    } else {
+        None
+    };
+    let out_name = if check_out {
+        resolve(audio_out, false)
+    } else {
+        None
+    };
+    Ok(audio::setup_warnings(
+        &cfg,
+        in_name.as_deref(),
+        out_name.as_deref(),
+    ))
 }
 
 const SELF_TEST_NOTES: usize = 8;
@@ -272,7 +387,7 @@ fn format_latency_line(profile: &str, s: &cricket_engine::LatencySummary) -> Str
 async fn run_self_test() -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let mut lines = Vec::new();
-        for profile in ["fast", "robust"] {
+        for profile in ["analog-fast", "analog-safe"] {
             let s = cricket_engine::measure_midi_loopback(profile, SELF_TEST_NOTES)
                 .map_err(|e| format!("{}: {}", profile, e))?;
             lines.push(format_latency_line(profile, &s));
@@ -283,6 +398,7 @@ async fn run_self_test() -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Encoder-side Panic: an All Notes Off message over the link.
 #[tauri::command]
 fn encoder_panic(state: State<'_, AppState>) -> Result<(), String> {
     let slot = state.encoder.lock().unwrap();
@@ -293,22 +409,45 @@ fn encoder_panic(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Decoder-side Panic: the fail-safe burst (Sustain off + All Notes Off on
+/// all 16 channels) straight to MIDI out, as on link-dead.
+#[tauri::command]
+fn decoder_panic(state: State<'_, AppState>) -> Result<(), String> {
+    let slot = state.decoder.lock().unwrap();
+    let Some(running) = slot.as_ref() else {
+        return Err("Decoder is not running".into());
+    };
+    running.handle.panic();
+    Ok(())
+}
+
+/// 1-based channel from the UI to the engine's 0-based one (`None` = 1).
+fn channel_index(channel: Option<u16>) -> usize {
+    usize::from(channel.unwrap_or(1).max(1)) - 1
+}
+
 /// Start the decoder. `audio_in` / `midi_out` are device names as listed by
 /// `get_input_devices` / `get_midi_outputs` (`None` = default audio input /
-/// no MIDI out). `msc_device_id` / `msc_command_format` address the MSC
-/// SysEx sent to MIDI out (`None` = all-call `0x7F` / Lighting `0x01`). A name that is not present fails in the engine (reported as
-/// a log line); no other device is picked. Returns the run id carried by
-/// this run's `worker_stopped` event.
+/// no MIDI out); `audio_in_channel` is 1-based (`None` = 1).
+/// `msc_device_id` / `msc_command_format` address the MSC SysEx sent to
+/// MIDI out (`None` = all-call `0x7F` / Lighting `0x01`). A name that is
+/// not present fails in the engine (reported as a log line); no other
+/// device is picked. An unknown profile is an error. Returns the run id
+/// carried by this run's `worker_stopped` event. Stopping (or restarting)
+/// sends the fail-safe burst to MIDI out first.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_decoder(
     app: AppHandle,
     state: State<'_, AppState>,
     audio_in: Option<String>,
+    audio_in_channel: Option<u16>,
     midi_out: Option<String>,
     profile: String,
     msc_device_id: Option<u8>,
     msc_command_format: Option<u8>,
 ) -> Result<u64, String> {
+    parse_profile(&profile)?;
     let mut slot = state.decoder.lock().unwrap();
     let defaults = MscTarget::default();
     let msc = MscTarget {
@@ -326,7 +465,10 @@ fn start_decoder(
         profile,
         link_dead_ms: None,
         msc,
-        audio: AudioOptions::default(),
+        audio: AudioOptions {
+            input_channel: channel_index(audio_in_channel),
+            ..AudioOptions::default()
+        },
     })
     .map_err(|e| e.to_string())?;
     let run = Run {
@@ -347,19 +489,25 @@ fn stop_decoder(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Start the encoder. `audio_out` / `midi_in` are device names as listed by
 /// `get_output_devices` / `get_midi_inputs` (`None` = default audio output /
-/// no MIDI in). A name that is not present fails in the engine; no other
-/// device is picked. Returns the run id carried by this run's
-/// `worker_stopped` event. With no MIDI in, the engine sends the simulated
-/// test scale regardless of `simulate`.
+/// no MIDI in); `audio_out_channel` is 1-based (`None` = 1), the other
+/// channels stay silent; `tx_level_db` is the peak level in dBFS (`None` =
+/// the default, −12). A name that is not present fails in the engine; no
+/// other device is picked. An unknown profile is an error. Returns the run
+/// id carried by this run's `worker_stopped` event. With no MIDI in the
+/// encoder sends heartbeats only; `simulate` adds the test scale.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_encoder(
     app: AppHandle,
     state: State<'_, AppState>,
     audio_out: Option<String>,
+    audio_out_channel: Option<u16>,
     midi_in: Option<String>,
     profile: String,
     simulate: bool,
+    tx_level_db: Option<f32>,
 ) -> Result<u64, String> {
+    parse_profile(&profile)?;
     let mut slot = state.encoder.lock().unwrap();
     shutdown(slot.take(), EncoderHandle::stop);
 
@@ -371,7 +519,11 @@ fn start_encoder(
         },
         profile,
         simulate,
-        audio: AudioOptions::default(),
+        tx_level_dbfs: tx_level_db.map(|db| db.clamp(MIN_TX_LEVEL_DBFS, 0.0)),
+        audio: AudioOptions {
+            output_channel: channel_index(audio_out_channel),
+            ..AudioOptions::default()
+        },
     })
     .map_err(|e| e.to_string())?;
     let run = Run {
@@ -402,9 +554,13 @@ pub fn run() {
             get_midi_outputs,
             get_settings,
             set_settings,
+            get_profiles,
             get_profile_info,
+            get_device_channels,
+            check_setup,
             run_self_test,
             encoder_panic,
+            decoder_panic,
             start_decoder,
             stop_decoder,
             start_encoder,
@@ -472,6 +628,7 @@ mod tests {
             ),
             Some(FrontendEvent::Alarm(AlarmEvent {
                 kind: "audio_device_error".into(),
+                title: "Audio device error".into(),
                 message: "x".into()
             }))
         );
@@ -488,6 +645,25 @@ mod tests {
                 latency_ms: 12.5
             }))
         );
+    }
+
+    #[test]
+    fn profile_catalog_and_parsing() {
+        let entries = profile_entries();
+        assert_eq!(entries.iter().filter(|e| e.is_default).count(), 1);
+        assert_eq!(entries[0].name, "analog-safe");
+        assert!(entries
+            .iter()
+            .any(|e| e.tier == "advanced" && e.name == "ltc"));
+        assert!(entries.iter().all(|e| e.airtime_ms > 0.0));
+        assert!(parse_profile("robust").is_ok());
+        assert!(parse_profile("Clean-Line").is_ok());
+        assert!(parse_profile("robsut")
+            .unwrap_err()
+            .contains("unknown profile"));
+        assert_eq!(channel_index(None), 0);
+        assert_eq!(channel_index(Some(0)), 0);
+        assert_eq!(channel_index(Some(3)), 2);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! let dec = DecoderHandle::start(DecoderConfig {
 //!     audio_in: AudioIn::Device(DeviceSelector::Default),
 //!     midi_out: MidiOut::Device(DeviceSelector::Index(0)),
-//!     profile: "robust".into(),
+//!     profile: "analog-safe".into(),
 //!     link_dead_ms: None,
 //!     msc: MscTarget::default(),
 //!     audio: AudioOptions::default(),
@@ -17,13 +17,16 @@
 //! let enc = EncoderHandle::start(EncoderConfig {
 //!     audio_out: AudioOut::Device(DeviceSelector::Default),
 //!     midi_in: MidiIn::None,
-//!     profile: "robust".into(),
+//!     profile: "analog-safe".into(),
 //!     simulate: false,
+//!     tx_level_dbfs: None,
 //!     audio: AudioOptions { buffer_frames: Some(256), ..Default::default() },
 //! })?;
 //! enc.send(TransportMessage::Panic);
+//! dec.panic(); // fail-safe burst to MIDI out, as on link-dead
 //! for ev in dec.events().try_iter() { println!("{:?}", ev); }
-//! // Drop or `.stop()` shuts the workers down and joins them.
+//! // Drop or `.stop()` shuts the workers down and joins them; the decoder
+//! // sends the fail-safe burst before it closes MIDI out.
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
@@ -54,8 +57,11 @@ pub use audio::{
 pub use cricket_core::transport::{MscTarget, TransportMessage};
 pub use decoder::{DecoderConfig, DecoderHandle};
 pub use devices::DeviceSelector;
-pub use encoder::{EncoderConfig, EncoderHandle};
-pub use events::{format_message, link_state_name, AlarmKind, EngineEvent, LinkStats};
+pub use encoder::{EncoderConfig, EncoderHandle, MIN_TX_LEVEL_DBFS};
+pub use events::{
+    format_message, link_state_name, rms_to_dbfs, AlarmKind, EngineEvent, LinkLight, LinkStats,
+    NO_SIGNAL_DBFS,
+};
 pub use loopback::{
     jitter_ms, mean_ms, measure_chord_loopback, measure_midi_loopback, measure_midi_loopback_with,
     measure_throughput, percentile_nearest_rank_ms, ChordSummary, LatencySummary, Pacing,

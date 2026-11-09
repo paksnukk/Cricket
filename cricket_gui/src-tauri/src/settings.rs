@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// Profile name as the UI stores it (canonical user-facing name; older
+    /// files hold wire-format names, which the UI maps when it loads).
     pub profile: String,
     pub mode: String,
     /// Device / port names as listed by the `get_*` commands; `None` = not set
@@ -24,12 +26,28 @@ pub struct AppSettings {
     /// MSC device ID and command format of the decoder's MSC output.
     pub msc_device_id: u8,
     pub msc_command_format: u8,
+    /// Audio channels, 1-based (1 = the device's first channel).
+    #[serde(default = "default_channel")]
+    pub audio_in_channel: u16,
+    #[serde(default = "default_channel")]
+    pub audio_out_channel: u16,
+    /// Encoder transmit level, peak dBFS.
+    #[serde(default = "default_tx_level_db")]
+    pub tx_level_db: f32,
+}
+
+fn default_channel() -> u16 {
+    1
+}
+
+fn default_tx_level_db() -> f32 {
+    cricket_core::phy::DEFAULT_TX_LEVEL_DBFS
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            profile: "robust".into(),
+            profile: cricket_core::phy::DEFAULT_PROFILE.into(),
             mode: "both".into(),
             audio_in: None,
             audio_out: None,
@@ -37,6 +55,9 @@ impl Default for AppSettings {
             midi_out: None,
             msc_device_id: 0x7F,
             msc_command_format: 0x01,
+            audio_in_channel: 1,
+            audio_out_channel: 1,
+            tx_level_db: default_tx_level_db(),
         }
     }
 }
@@ -69,6 +90,12 @@ struct StoredSettings {
     msc_device_id: Option<u8>,
     #[serde(default)]
     msc_command_format: Option<u8>,
+    #[serde(default)]
+    audio_in_channel: Option<u16>,
+    #[serde(default)]
+    audio_out_channel: Option<u16>,
+    #[serde(default)]
+    tx_level_db: Option<f32>,
 }
 
 impl StoredSettings {
@@ -116,7 +143,7 @@ fn to_name(device: Option<StoredDevice>, names: &[String]) -> Option<String> {
 }
 
 /// Outcome of parsing a settings file.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Parsed {
     pub settings: AppSettings,
     /// True if the file used the old index format (and should be rewritten).
@@ -155,6 +182,13 @@ pub fn parse_settings(json: &str, names: impl FnOnce() -> DeviceNames) -> Parsed
                 .msc_command_format
                 .filter(|v| *v < 0x80)
                 .unwrap_or(defaults.msc_command_format),
+            audio_in_channel: stored.audio_in_channel.filter(|c| *c >= 1).unwrap_or(1),
+            audio_out_channel: stored.audio_out_channel.filter(|c| *c >= 1).unwrap_or(1),
+            tx_level_db: stored
+                .tx_level_db
+                .filter(|db| db.is_finite())
+                .map(|db| db.clamp(cricket_engine::MIN_TX_LEVEL_DBFS, 0.0))
+                .unwrap_or(defaults.tx_level_db),
         },
         migrated,
     }
@@ -236,6 +270,9 @@ mod tests {
                 midi_out: Some("UM-ONE".into()),
                 msc_device_id: 0x7F,
                 msc_command_format: 0x01,
+                audio_in_channel: 1,
+                audio_out_channel: 1,
+                tx_level_db: -12.0,
             }
         );
         // The new JSON stores names.
@@ -250,7 +287,10 @@ mod tests {
                 "midi_in": null,
                 "midi_out": "UM-ONE",
                 "msc_device_id": 127,
-                "msc_command_format": 1
+                "msc_command_format": 1,
+                "audio_in_channel": 1,
+                "audio_out_channel": 1,
+                "tx_level_db": -12.0
             })
         );
     }
@@ -275,6 +315,9 @@ mod tests {
             midi_out: None,
             msc_device_id: 3,
             msc_command_format: 0x10,
+            audio_in_channel: 3,
+            audio_out_channel: 2,
+            tx_level_db: -18.0,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed = parse_settings(&json, || panic!("must not enumerate devices"));
@@ -291,6 +334,16 @@ mod tests {
         let parsed = parse_settings(r#"{"profile":"fast"}"#, || panic!());
         assert_eq!(parsed.settings.profile, "fast");
         assert_eq!(parsed.settings.mode, "both");
+        assert_eq!(parsed.settings.audio_in_channel, 1);
+        assert_eq!(parsed.settings.tx_level_db, -12.0);
+        // Out-of-range values fall back to safe ones.
+        let parsed = parse_settings(
+            r#"{"audio_in_channel":0,"audio_out_channel":4,"tx_level_db":6.0}"#,
+            || panic!(),
+        );
+        assert_eq!(parsed.settings.audio_in_channel, 1);
+        assert_eq!(parsed.settings.audio_out_channel, 4);
+        assert_eq!(parsed.settings.tx_level_db, 0.0);
     }
 
     #[test]

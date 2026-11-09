@@ -111,16 +111,16 @@ fn score(sent: &[TransportMessage], got: &[TransportMessage]) -> (usize, usize) 
 
 #[test]
 fn profile_selection_and_airtime() {
-    let c = PhyConfig::from_name("digital");
+    let c = PhyConfig::from_name("digital").unwrap();
     assert!(matches!(c.modulation, Modulation::Digital));
     assert_eq!(c.repetition_k, 2);
     assert!((c.estimated_first_copy_ms() - 21.0 / 48.0).abs() < 1e-4);
     assert_eq!(cricket_core::modem::repetition_samples(&c), 21);
     assert_eq!(cricket_core::modem::dedup_window_samples(&c), 52);
-    let auto = PhyConfig::from_name("LTC9600+digital");
+    let auto = PhyConfig::from_name("LTC9600+digital").unwrap();
     assert!(auto.digital_detect);
     assert!(matches!(auto.modulation, Modulation::Bmc(ref p) if p.bit_rate == 9600));
-    assert!(!PhyConfig::from_name("ltc9600").digital_detect);
+    assert!(!PhyConfig::from_name("ltc9600").unwrap().digital_detect);
 
     // One NoteOn: 2 x 21 samples, nothing else.
     let mut tx = CricketModemTx::new(c);
@@ -487,7 +487,10 @@ fn foreign_audio_never_becomes_a_message() {
         "ltc14400",
         "ltc14400_fec",
     ] {
-        let r = foreign(&config, &other_traffic(&PhyConfig::from_name(name), n, 4));
+        let r = foreign(
+            &config,
+            &other_traffic(&PhyConfig::from_name(name).unwrap(), n, 4),
+        );
         assert_eq!(r.syncs, 0, "{name}");
         assert_eq!(r.messages, 0, "{name}");
     }
@@ -506,9 +509,9 @@ fn coexists_with_other_profiles() {
         "ltc14400",
         "ltc14400_fec",
     ] {
-        let c = PhyConfig::from_name(name);
+        let c = PhyConfig::from_name(name).unwrap();
         assert!(decode(&c, &digital_audio, 512).is_empty(), "{name}");
-        let auto = PhyConfig::from_name(&format!("{name}+digital"));
+        let auto = PhyConfig::from_name(&format!("{name}+digital")).unwrap();
         assert_eq!(decode(&auto, &digital_audio, 512), sent, "{name}+digital");
         let (own, own_audio) = traffic(&c, 6, 22);
         assert_eq!(decode(&auto, &own_audio, 512), own, "{name}+digital own");
@@ -692,7 +695,7 @@ fn digital_report() {
     ] {
         rows.push((
             format!("{name} traffic"),
-            other_traffic(&PhyConfig::from_name(name), n, 5),
+            other_traffic(&PhyConfig::from_name(name).unwrap(), n, 5),
         ));
     }
     for (label, audio) in &rows {
