@@ -405,8 +405,8 @@ cricket hf-scan --wav-in recording.wav
 Ultrasonic data-over-audio is a patented field: LISNR (18.7–19.2 kHz, ~130 patents), Chirp (now
 Sonos), CUE Audio, Intrasonics; Nielsen and Verance for masking-based watermarks. No product was
 found that hides MIDI or timecode in an instrument's or a playback signal ultrasonically, and AML's
-mechanism (MFSK packets with FEC and CRC, a published open protocol) predates nothing here on its
-own merits; still, a freedom-to-operate search in CPC G10H 1/0058, G10H 3/18, H04B 11/00 and H04H
+mechanism (MFSK packets with FEC and CRC, an open protocol) is textbook signalling, but none of this
+is a legal opinion: a freedom-to-operate search in CPC G10H 1/0058, G10H 3/18, H04B 11/00 and H04H
 20/31 is due **before a product launch**, not before field tests.
 
 ## 12. Negative results, for the record
