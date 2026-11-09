@@ -5,11 +5,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 [Semantic Versioning](https://semver.org/) with the whole workspace on one version.
 
 > **Note on numbering.** The entries under *Unreleased* were drafted as "1.1.0" while the project was
-> still called AML. The next tagged release is **0.2.0**: 1.0.0 is reserved for "field test passed
+> still called AML. The first tagged release is **0.2.0**: 1.0.0 is reserved for "field test passed
 > and API frozen" (see [`ROADMAP.md`](ROADMAP.md)). The 1.0.0 the GUI used to display was the app's
 > own number, not a workspace release; it is listed below as 0.1.0.
 
 ## [Unreleased]
+
+_Nothing yet._
+
+## [0.2.0] — 2026-11-09
+
+First tagged release. Spec revision **r5** of AML v1 is the wire format this release freezes for the
+stable sections (see the spec header policy). Everything below was measured in the channel simulator
+and in-process loopback; nothing has been proven on a real show chain yet.
 
 ### Breaking
 
@@ -443,5 +451,6 @@ with later ones.
 - The earlier sequential-tone prototype (March 2026, "V1", semantic tone symbols without CRC) was
   kept as a legacy debug phy (`docs/history/aml-prototype-protocol.md`).
 
-[Unreleased]: https://github.com/paksnukk/Cricket/compare/7ce0be8...HEAD
+[Unreleased]: https://github.com/paksnukk/Cricket/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/paksnukk/Cricket/compare/7ce0be8...v0.2.0
 [0.1.0]: https://github.com/paksnukk/Cricket/commit/7ce0be8
