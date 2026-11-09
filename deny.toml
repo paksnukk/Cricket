@@ -1,0 +1,84 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/).
+# Run locally with `cargo deny check`; CI runs it in the supply-chain job.
+
+[graph]
+all-features = false
+# Desktop targets the GUI/CLI ship on, plus the bare-metal targets cricket_core
+# is built for. Keeps platform-only crates (windows-sys, coreaudio) in scope.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "thumbv8m.main-none-eabihf",
+    "riscv32imac-unknown-none-elf",
+]
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Unmaintained-crate advisories only fail for crates the workspace depends on
+# directly; the Tauri/GTK stack drags in several (fxhash, proc-macro-error,
+# unic-*, pin-utils) that we cannot replace from here.
+unmaintained = "workspace"
+ignore = [
+    # ringbuf 0.3: double free when an element's Drop panics. Cricket's rings
+    # hold `f32` samples (no Drop), so it cannot trigger. Fixed by the ringbuf
+    # 0.5 upgrade tracked in ROADMAP.md (API change, not this sprint).
+    { id = "RUSTSEC-2026-0293", reason = "f32 elements have no Drop; upgrade tracked in ROADMAP.md" },
+    # quick-xml 0.38 via plist (Tauri, macOS only): parses the app's own
+    # Info.plist at build time, never untrusted input. Pinned by plist.
+    { id = "RUSTSEC-2026-0194", reason = "build-time plist parsing of our own files" },
+    { id = "RUSTSEC-2026-0195", reason = "build-time plist parsing of our own files" },
+]
+
+[licenses]
+version = 2
+# The product built on top of Cricket may be proprietary, so only permissive
+# and weak-copyleft (file-level) licenses are allowed. GPL/AGPL/LGPL are denied
+# by not being listed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "0BSD",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # Crates whose license is fine for this project but not in the list above
+    # go here, one entry each: { allow = ["..."], crate = "name" }.
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # Copyleft or otherwise unwanted crates can be listed here by name.
+]
+skip = [
+    # Duplicate-version noise from the Tauri/GTK stack and the two ALSA
+    # bindings (midir pulls alsa 0.7, cpal alsa 0.9) is tracked in ROADMAP.md.
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
