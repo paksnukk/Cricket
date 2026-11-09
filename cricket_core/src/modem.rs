@@ -3,12 +3,12 @@ use crate::link::{
     fec_candidate_is_valid_keyed, interleave, nibbles_to_bytes, packet_structure_is_valid,
     BodySymbol, FecCodec, Packet, SEQ_MODULUS,
 };
-use crate::phy::digital::{self, DigitalFrame, DigitalRx};
-use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
+use crate::phy::digital::{DigitalFrame, DigitalRx};
+use crate::phy::{BodyCoding, LinkState, PhyConfig, PhyRx, PhyTx, RxEvent};
 use crate::transport::{
     FailSafeMonitor, MessageType, MidiOutput, MscTarget, RefreshSchedule, TransportMessage,
-    REFRESH_SCHEDULE_CONSECUTIVE, REFRESH_SCHEDULE_SPREAD,
 };
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -41,6 +41,7 @@ pub struct ModemStats {
     pub fec_corrected: u64,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ModemOutput {
     Message(TransportMessage),
@@ -50,22 +51,27 @@ pub enum ModemOutput {
     Stats(ModemStats),
 }
 
-/// High-level TX: transport message → repeated interleaved audio (MFSK, the
-/// BMC (LTC) phy, or the digital phy, per `config.modulation`).
+/// High-level TX: transport message → repeated interleaved audio through
+/// the phy `config.modulation` selects (MFSK, the BMC (LTC) phy, the
+/// digital phy, or a custom one; see [`crate::phy::traits`]).
 pub struct CricketModemTx {
-    phy: PhyTx,
+    phy: Box<dyn PhyTx>,
     config: PhyConfig,
+    /// How the packet bytes are laid out in the body, as the phy declares.
+    coding: BodyCoding,
     seq: u8,
     fec: Option<FecCodec>,
 }
 
 impl CricketModemTx {
     pub fn new(config: PhyConfig) -> Self {
-        let phy = PhyTx::new(config.clone());
-        let fec = FecCodec::new(config.fec);
+        let phy = config.modulation.phy().tx(&config);
+        let coding = config.body_coding();
+        let fec = FecCodec::new(coding.fec_mode());
         Self {
             phy,
             config,
+            coding,
             seq: 0,
             fec,
         }
@@ -96,19 +102,19 @@ impl CricketModemTx {
         };
         let bytes = encode_packet_bytes_keyed(&packet, self.config.link_key).expect("valid packet");
         let mut nibbles = bytes_to_nibbles(&bytes);
-        let interleaved = if matches!(self.config.modulation, Modulation::Digital) {
-            // The digital frame carries the packet nibbles as they are: its
-            // length follows from the type nibble, there is no pad.
-            nibbles
-        } else if let Some(fec) = &self.fec {
+        let interleaved = match (self.coding, &self.fec) {
+            // The phy frames the packet nibbles as they are (the frame
+            // carries its length), there is no pad.
+            (BodyCoding::Raw, _) => nibbles,
             // FEC replaces padding + block interleave (codeword interleave).
-            fec.encode_body(&nibbles)
-        } else {
-            while nibbles.len() < MAX_BODY_NIBBLES {
-                nibbles.push(0);
+            (BodyCoding::Fec(_), Some(fec)) => fec.encode_body(&nibbles),
+            _ => {
+                while nibbles.len() < MAX_BODY_NIBBLES {
+                    nibbles.push(0);
+                }
+                nibbles.truncate(MAX_BODY_NIBBLES);
+                interleave(&nibbles, self.config.interleave_depth)
             }
-            nibbles.truncate(MAX_BODY_NIBBLES);
-            interleave(&nibbles, self.config.interleave_depth)
         };
 
         let mut audio = Vec::new();
@@ -126,36 +132,31 @@ impl CricketModemTx {
     }
 }
 
-/// Samples one on-wire repetition occupies: preamble + body symbol periods
-/// plus the one-period gap `CricketModemTx` inserts after each repetition.
-/// The body is [`MAX_BODY_NIBBLES`], or the coded length when FEC is enabled.
+/// Samples one on-wire repetition occupies: the phy's burst
+/// ([`crate::phy::PhyFactory::frame_samples`]: preamble or sync plus the
+/// body) plus the gap `CricketModemTx` inserts after each repetition
+/// ([`repetition_gap_samples`]). The body is [`MAX_BODY_NIBBLES`], or the
+/// coded length when FEC is enabled (MFSK: `(preamble + body symbols + 1)`
+/// symbol periods; BMC: the burst plus `gap_bits` cells; digital: the
+/// largest frame, 21 samples, copies following each other without a gap).
 pub fn repetition_samples(config: &PhyConfig) -> u64 {
-    let body_nibbles = config.fec.body_nibbles();
-    match &config.modulation {
-        Modulation::Bmc(p) => {
-            return p.repetition_samples(config.sample_rate_hz, body_nibbles) as u64
-        }
-        // The largest frame; copies follow each other without a gap.
-        Modulation::Digital => return digital::MAX_FRAME_SAMPLES as u64,
-        Modulation::Mfsk => {}
-    }
-    ((config.preamble.len() + config.body_symbols() + 1) * config.samples_per_symbol_period())
-        as u64
+    let phy = config.modulation.phy();
+    (phy.frame_samples(config, config.body_nibbles()) + phy.gap_samples(config)) as u64
 }
 
 /// Least spacing between the repeats of one released note for `config` at
 /// `sample_rate_hz` (for [`crate::transport::TxScheduler::with_refresh_spacing`]):
+/// the phy's [`RefreshPolicy::spacing_ms`](crate::phy::RefreshPolicy::spacing_ms),
 /// 0 (the schedule of spec §5.5 alone) except for the digital profile
-/// ([`digital::REFRESH_SPACING_MS`]).
+/// ([`crate::phy::digital::REFRESH_SPACING_MS`]).
 pub fn refresh_spacing_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
-    match config.modulation {
-        Modulation::Digital => sample_rate_hz as u64 * digital::REFRESH_SPACING_MS as u64 / 1000,
-        _ => 0,
-    }
+    let policy = config.modulation.phy().refresh_policy(config);
+    sample_rate_hz as u64 * policy.spacing_ms as u64 / 1000
 }
 
 /// The repeat schedule of a released note for `config` (for
-/// [`crate::transport::TxScheduler::with_refresh_schedule`], spec §5.5):
+/// [`crate::transport::TxScheduler::with_refresh_schedule`], spec §5.5), as
+/// the phy declares it ([`crate::phy::RefreshPolicy::schedule`]):
 /// the Fibonacci spread on the MFSK profiles, whose messages are 57–273 ms
 /// (consecutive copies would fall into one dropout, and six back to back
 /// held the line for 0.35–1.6 s); the first six free slots on the LTC and
@@ -164,10 +165,7 @@ pub fn refresh_spacing_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
 /// measured on `ltc_fec`, the spread put a repeat where the next note lands
 /// and moved the loopback p95 from 21 to 38 ms).
 pub fn refresh_schedule(config: &PhyConfig) -> RefreshSchedule {
-    match config.modulation {
-        Modulation::Mfsk => REFRESH_SCHEDULE_SPREAD,
-        Modulation::Bmc(_) | Modulation::Digital => REFRESH_SCHEDULE_CONSECUTIVE,
-    }
+    config.modulation.phy().refresh_policy(config).schedule
 }
 
 /// Idle line a NoteOff repeat waits for, for `config` at `sample_rate_hz`
@@ -178,9 +176,10 @@ pub fn refresh_schedule(config: &PhyConfig) -> RefreshSchedule {
 /// another never waits behind a repeat; 0 (the first free slot) on the
 /// uncoded MFSK profiles, which lose far more (Fast: 23 %) and need their
 /// repeats promptly, and on the LTC and digital profiles, whose repeats are
-/// over in a few tens of ms.
+/// over in a few tens of ms ([`crate::phy::RefreshPolicy::quiet_when_coded`]).
 pub fn refresh_quiet_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
-    if config.fec.is_enabled() && matches!(config.modulation, Modulation::Mfsk) {
+    let policy = config.modulation.phy().refresh_policy(config);
+    if policy.quiet_when_coded && matches!(config.body_coding(), BodyCoding::Fec(_)) {
         repetition_samples(&config.clone().with_sample_rate(sample_rate_hz))
             * config.repetition_k.max(1) as u64
     } else {
@@ -188,15 +187,12 @@ pub fn refresh_quiet_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
     }
 }
 
-/// Silence `CricketModemTx` appends after each repetition: one symbol
-/// period (MFSK), `gap_bits` cells (BMC) or none (digital: frames are
-/// delimited by their sync and END symbols).
+/// Silence `CricketModemTx` appends after each repetition
+/// ([`crate::phy::PhyFactory::gap_samples`]): one symbol period (MFSK),
+/// `gap_bits` cells (BMC) or none (digital: frames are delimited by their
+/// sync and END symbols).
 pub fn repetition_gap_samples(config: &PhyConfig) -> usize {
-    match &config.modulation {
-        Modulation::Mfsk => config.samples_per_symbol_period(),
-        Modulation::Bmc(p) => p.gap_samples(config.sample_rate_hz),
-        Modulation::Digital => 0,
-    }
+    config.modulation.phy().gap_samples(config)
 }
 
 /// Duplicate-suppression window in samples (docs/aml-v1-spec.md §4.4): one
@@ -221,7 +217,7 @@ pub fn dedup_window_samples(config: &PhyConfig) -> u64 {
 /// that sample (resolution: one chunk); the exact sample is available from
 /// [`CricketModemRx::last_link_dead_sample`].
 pub struct CricketModemRx {
-    phy: PhyRx,
+    phy: Box<dyn PhyRx>,
     config: PhyConfig,
     body_nibbles: Vec<u8>,
     /// Per-symbol detail for the FEC decoder (filled only when FEC is on).
@@ -253,13 +249,15 @@ pub struct CricketModemRx {
 
 impl CricketModemRx {
     pub fn new(config: PhyConfig) -> Self {
-        let mut phy = PhyRx::new(config.clone());
-        let body_len = config.fec.body_nibbles();
+        let mut phy = config.modulation.phy().rx(&config);
+        let coding = config.body_coding();
+        let body_len = coding.body_nibbles();
         phy.set_expected_body_nibbles(body_len);
         let fail_safe = FailSafeMonitor::new(config.link_dead_ms, config.sample_rate_hz);
         let dedup_window = dedup_window_samples(&config);
-        let fec = FecCodec::new(config.fec);
-        let digital = (config.digital_detect && !matches!(config.modulation, Modulation::Digital))
+        let fec = FecCodec::new(coding.fec_mode());
+        // A phy that carries raw packet frames reports them itself.
+        let digital = (config.digital_detect && coding != BodyCoding::Raw)
             .then(|| DigitalRx::new(config.clone()));
         Self {
             phy,

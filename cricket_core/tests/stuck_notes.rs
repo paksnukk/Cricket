@@ -202,7 +202,7 @@ impl StreamBuilder {
         };
         self.audio.extend(samples);
         debug_assert!(
-            !matches!(self.tx.config().modulation, Modulation::Mfsk)
+            !matches!(self.tx.config().modulation, Modulation::Mfsk(_))
                 || self.audio.len().is_multiple_of(self.period)
         );
         self.sent.push(Sent { msg, start });

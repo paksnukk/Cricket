@@ -56,15 +56,18 @@ fn trials(
 
 #[test]
 fn profile_selection() {
-    assert!(matches!(PhyConfig::robust().modulation, Modulation::Mfsk));
+    assert!(matches!(
+        PhyConfig::robust().modulation,
+        Modulation::Mfsk(_)
+    ));
     assert!(matches!(
         PhyConfig::robust_repeat().modulation,
-        Modulation::Mfsk
+        Modulation::Mfsk(_)
     ));
-    assert!(matches!(PhyConfig::fast().modulation, Modulation::Mfsk));
+    assert!(matches!(PhyConfig::fast().modulation, Modulation::Mfsk(_)));
     assert!(matches!(
         PhyConfig::from_name("robust").unwrap().modulation,
-        Modulation::Mfsk
+        Modulation::Mfsk(_)
     ));
     for name in ["ltc", "LTC", "ltc4800"] {
         match PhyConfig::from_name(name).unwrap().modulation {

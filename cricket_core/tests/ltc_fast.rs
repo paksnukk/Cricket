@@ -26,7 +26,7 @@ fn fast_profiles() -> Vec<(&'static str, PhyConfig)> {
 fn bmc(config: &PhyConfig) -> &BmcParams {
     match &config.modulation {
         Modulation::Bmc(p) => p,
-        Modulation::Mfsk | Modulation::Digital => panic!("BMC profile expected"),
+        _ => panic!("BMC profile expected"),
     }
 }
 

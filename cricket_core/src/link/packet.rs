@@ -20,6 +20,7 @@ pub struct Packet {
     pub payload: Vec<u8>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketDecodeError {
     TooShort,

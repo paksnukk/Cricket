@@ -64,8 +64,12 @@
 //! packet validation of spec §4.7 (CRC-16, version, type, SEQ, canonical
 //! payload) and duplicate suppression.
 
-use super::{LinkState, PhyConfig, RxEvent, LOCK_HOLD_MS};
+use super::{
+    BodyCoding, LinkState, PhyConfig, PhyFactory, PhyRx, PhyTx, RefreshPolicy, RxEvent,
+    LOCK_HOLD_MS,
+};
 use crate::link::nibbles_to_bytes;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 /// Bit position of the symbol LSB in the 24-bit code.
@@ -160,6 +164,69 @@ pub fn frame(body_nibbles: &[u8]) -> Vec<f32> {
     out
 }
 
+/// Parameters of the digital phy. The sample layout is fixed by the wire
+/// format (the constants of this module), so there is nothing to set yet;
+/// the struct exists so [`Modulation::Digital`](super::Modulation::Digital)
+/// can grow parameters without a breaking change. `DigitalParams::default()`
+/// is the only way to make one outside the crate.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DigitalParams {}
+
+impl PhyFactory for DigitalParams {
+    fn name(&self) -> &str {
+        "digital"
+    }
+
+    fn clone_box(&self) -> Box<dyn PhyFactory> {
+        Box::new(*self)
+    }
+
+    fn tx(&self, config: &PhyConfig) -> Box<dyn PhyTx> {
+        Box::new(DigitalTx::new(config.clone()))
+    }
+
+    fn rx(&self, config: &PhyConfig) -> Box<dyn PhyRx> {
+        Box::new(DigitalRx::new(config.clone()))
+    }
+
+    /// The packet nibbles as they are: the frame carries its length in the
+    /// type nibble, there is no pad, interleave or code.
+    fn body_coding(&self, _config: &PhyConfig) -> BodyCoding {
+        BodyCoding::Raw
+    }
+
+    /// The largest frame ([`MAX_FRAME_SAMPLES`]), whatever the body.
+    fn frame_samples(&self, _config: &PhyConfig, _body_nibbles: usize) -> usize {
+        MAX_FRAME_SAMPLES
+    }
+
+    /// None: frames are delimited by their sync and END symbols.
+    fn gap_samples(&self, _config: &PhyConfig) -> usize {
+        0
+    }
+
+    /// One sample at the profile's 48 kHz (the timing unit of the generic
+    /// helpers, whatever the stream rate).
+    fn symbol_duration_ms(&self, _config: &PhyConfig) -> f32 {
+        1000.0 / 48_000.0
+    }
+
+    /// The first six free slots, [`REFRESH_SPACING_MS`] apart.
+    fn refresh_policy(&self, _config: &PhyConfig) -> RefreshPolicy {
+        RefreshPolicy::consecutive_spaced(REFRESH_SPACING_MS)
+    }
+
+    /// The level is the sample layout.
+    fn fixed_tx_level(&self) -> bool {
+        true
+    }
+
+    fn needs_bit_exact_path(&self) -> bool {
+        true
+    }
+}
+
 /// Transmit side of the digital phy.
 pub struct DigitalTx {
     config: PhyConfig,
@@ -177,6 +244,12 @@ impl DigitalTx {
     /// One frame for the packet nibbles `body_nibbles` (see [`frame`]).
     pub fn synthesize_framed(&self, body_nibbles: &[u8]) -> Vec<f32> {
         frame(body_nibbles)
+    }
+}
+
+impl PhyTx for DigitalTx {
+    fn synthesize_framed(&self, body_nibbles: &[u8]) -> Vec<f32> {
+        DigitalTx::synthesize_framed(self, body_nibbles)
     }
 }
 
@@ -403,6 +476,31 @@ impl DigitalRx {
         (1..SYNC_LEN)
             .all(|i| at(i) == sign * SYNC[i] as i32)
             .then_some(inverted)
+    }
+}
+
+/// A frame phy: its frames carry their length and a sync can never occur
+/// inside a valid body, so there is nothing to expect, confirm or rewind
+/// (the trait defaults).
+impl PhyRx for DigitalRx {
+    fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
+        DigitalRx::push_samples(self, samples)
+    }
+
+    fn link_state(&self) -> LinkState {
+        DigitalRx::link_state(self)
+    }
+
+    fn last_confidence_db(&self) -> f32 {
+        DigitalRx::last_confidence_db(self)
+    }
+
+    fn samples_pushed(&self) -> u64 {
+        DigitalRx::samples_pushed(self)
+    }
+
+    fn reset(&mut self) {
+        DigitalRx::reset(self)
     }
 }
 

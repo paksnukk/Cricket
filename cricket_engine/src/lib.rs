@@ -185,10 +185,10 @@ pub fn hf_rate_warning(
     config: &cricket_core::PhyConfig,
     stream_sample_rate: u32,
 ) -> Option<String> {
-    if config.n_tones == 0 {
+    if config.n_tones() == 0 {
         return None;
     }
-    let top = config.tone_hz(config.n_tones as u8 - 1);
+    let top = config.tone_hz(config.n_tones() as u8 - 1);
     let edge = 0.4535 * stream_sample_rate as f32;
     (top > edge).then(|| {
         format!(

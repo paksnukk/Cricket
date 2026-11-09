@@ -296,13 +296,13 @@ pub struct TxScheduler {
     /// [`with_refresh_quiet`](Self::with_refresh_quiet).
     refresh_quiet_samples: u64,
     /// NoteOns refused because the NoteOn limit ([`max_note_ons`](Self::max_note_ons))
-    /// was reached, since the caller last cleared it. The caller reports
-    /// and clears it.
-    pub note_ons_dropped: u32,
+    /// was reached, since the caller last took it
+    /// ([`take_dropped`](Self::take_dropped)).
+    note_ons_dropped: u32,
     /// Tier-3 messages dropped because the queue exceeded its airtime bound
     /// ([`with_queue_budget`](Self::with_queue_budget)), since the caller
-    /// last cleared it.
-    pub queue_dropped: u32,
+    /// last took it.
+    queue_dropped: u32,
 }
 
 impl TxScheduler {
@@ -357,6 +357,28 @@ impl TxScheduler {
     /// [`with_queue_budget`](Self::with_queue_budget)).
     pub fn queue_budget_samples(&self) -> u64 {
         self.queue_budget_samples
+    }
+
+    /// NoteOns refused because the NoteOn limit ([`max_note_ons`](Self::max_note_ons))
+    /// was reached, since the caller last called [`take_dropped`](Self::take_dropped).
+    pub fn note_ons_dropped(&self) -> u32 {
+        self.note_ons_dropped
+    }
+
+    /// Tier-3 messages dropped because the queue exceeded its airtime bound
+    /// ([`with_queue_budget`](Self::with_queue_budget)), since the caller
+    /// last called [`take_dropped`](Self::take_dropped).
+    pub fn queue_dropped(&self) -> u32 {
+        self.queue_dropped
+    }
+
+    /// Both drop counters `(note_ons_dropped, queue_dropped)` since the last
+    /// call, which clears them: the caller reports them as one alarm.
+    pub fn take_dropped(&mut self) -> (u32, u32) {
+        (
+            core::mem::take(&mut self.note_ons_dropped),
+            core::mem::take(&mut self.queue_dropped),
+        )
     }
 
     /// Most NoteOns ever queued: ⌊250 ms / message⌋, but at least the

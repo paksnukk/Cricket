@@ -24,8 +24,8 @@ use cricket_core::modem::{
     encode_to_samples, repetition_samples, CricketModemRx, CricketModemTx, ModemOutput,
 };
 use cricket_core::phy::{
-    BandPass, PhyConfig, PhyRx, RxEvent, HF_BASE_96K_HZ, HF_BASE_HZ, HF_RX_BAND_HZ,
-    HF_RX_BAND_ORDER, HF_TX_LEVEL_DBFS,
+    BandPass, PhyConfig, RxEvent, HF_BASE_96K_HZ, HF_BASE_HZ, HF_RX_BAND_HZ, HF_RX_BAND_ORDER,
+    HF_TX_LEVEL_DBFS,
 };
 use cricket_core::transport::{MessageType, MscCommand, MscCue, MscMessage, TransportMessage};
 use std::time::Instant;
@@ -677,7 +677,7 @@ impl FalseStats {
 
 /// The receive flow of `CricketModemRx` with the candidate checks counted.
 fn run_false(config: &PhyConfig, audio: &[f32]) -> FalseStats {
-    let mut phy = PhyRx::new(config.clone());
+    let mut phy = config.modulation.phy().rx(config);
     let body_len = config.fec.body_nibbles();
     phy.set_expected_body_nibbles(body_len);
     let fec = FecCodec::new(config.fec).expect("FEC profile");
@@ -935,9 +935,9 @@ fn print_cpu_table() {
             *b += g;
         }
         let sections = config
-            .rx_band_hz
+            .rx_band_hz()
             .map(|(lo, hi)| {
-                BandPass::with_order(lo, hi, config.rx_band_order as usize, RATE).sections()
+                BandPass::with_order(lo, hi, config.rx_band_order() as usize, RATE).sections()
             })
             .unwrap_or(0);
         println!(
@@ -1068,8 +1068,8 @@ fn hf_profiles_round_trip_all_message_types() {
     let fast = PhyConfig::hf_fast();
     assert_eq!(fast.bits_per_symbol(), 3);
     assert_eq!(fast.body_symbols(), 30);
-    assert_eq!(fast.n_tones, 8);
-    assert!(fast.preamble.iter().all(|&p| p < 8));
+    assert_eq!(fast.n_tones(), 8);
+    assert!(fast.preamble().iter().all(|&p| p < 8));
     assert!((fast.estimated_first_copy_ms() - 102.0).abs() < 1e-3);
     assert_eq!(repetition_samples(&fast), 35 * 144);
     assert!((fast.tone_hz(7) - 21_333.3).abs() < 0.1);
@@ -1171,10 +1171,11 @@ fn imd_and_leakage_budget() {
     tones.truncate(n);
     let total: f64 = tones.iter().map(|&v| v as f64 * v as f64).sum();
     let leak = support::audible_energy_db(&tones, RATE) - 10.0 * total.log10() as f32;
-    let mut linear = PhyConfig::hf_robust();
-    linear.raised_cosine_ramps = false;
-    linear.attack_ms = 0.3;
-    linear.release_ms = 0.3;
+    let linear = PhyConfig::hf_robust().map_mfsk(|p| {
+        p.raised_cosine_ramps = false;
+        p.attack_ms = 0.3;
+        p.release_ms = 0.3;
+    });
     let lin = clean_traffic(&linear, n);
     let lin_total: f64 = lin.iter().map(|&v| v as f64 * v as f64).sum();
     let lin_leak = support::audible_energy_db(&lin, RATE) - 10.0 * lin_total.log10() as f32;
@@ -1227,12 +1228,13 @@ fn hf_report() {
     let profiles: Vec<(&str, PhyConfig)> = vec![
         ("instrument (hf_robust)", PhyConfig::hf_robust()),
         ("instrument-fast (hf_fast)", PhyConfig::hf_fast()),
-        ("hf_robust, 2nd-order band", {
-            let mut c = PhyConfig::hf_robust();
-            c.rx_band_order = 2;
-            c.rx_band_hz = Some((0.7 * HF_BASE_HZ, 1.3 * 21_500.0));
-            c
-        }),
+        (
+            "hf_robust, 2nd-order band",
+            PhyConfig::hf_robust().map_mfsk(|p| {
+                p.rx_band_order = 2;
+                p.rx_band_hz = Some((0.7 * HF_BASE_HZ, 1.3 * 21_500.0));
+            }),
+        ),
     ];
     println!("\n## HF profile report ({trials} trials per cell)\n");
     if on("plans") {
@@ -1266,7 +1268,7 @@ fn hf_report() {
     println!(
         "\nAirtime per message: {:.1} ms ({} symbols of {:.1} ms + one period of silence).",
         repetition_samples(&hf) as f32 * 1000.0 / RATE as f32,
-        hf.preamble.len() + hf.fec.body_nibbles(),
-        hf.symbol_duration_ms + hf.guard_gap_ms
+        hf.preamble().len() + hf.fec.body_nibbles(),
+        hf.symbol_duration_ms() + hf.guard_gap_ms()
     );
 }

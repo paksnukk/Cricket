@@ -1,8 +1,10 @@
-use super::config::{Acquisition, PhyConfig};
+use super::config::PhyConfig;
 use super::filter::BandPass;
 use super::goertzel::{
     best_tone, goertzel_power, goertzel_power_energy, rms_dbfs, tone_purity, ToneDetection,
 };
+use super::mfsk::{Acquisition, MfskParams};
+use super::traits::PhyRx;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -44,6 +46,7 @@ pub struct DemodResult {
     pub erased: bool,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum RxEvent {
     /// Demodulated body nibble after a successful preamble lock.
@@ -160,6 +163,8 @@ enum RxPhase {
 /// its events. While paused, `push_samples` only buffers.
 pub struct ModemRx {
     config: PhyConfig,
+    /// The tone plan, timing and detection gates of `config`.
+    params: MfskParams,
     tones: Vec<f32>,
     /// Tone-band input filter (spec §3.2): every pushed sample goes
     /// through it before it is buffered, so window energies, the silence
@@ -201,14 +206,22 @@ pub struct ModemRx {
 }
 
 impl ModemRx {
+    /// Panics if `config` does not select [`Modulation::Mfsk`](super::Modulation::Mfsk)
+    /// (the modem builds its phys through [`super::PhyFactory`], which
+    /// cannot get this wrong).
     pub fn new(config: PhyConfig) -> Self {
-        let tones = config.tone_table();
-        let band = config.rx_band_hz.map(|(lo, hi)| {
-            BandPass::with_order(lo, hi, config.rx_band_order as usize, config.sample_rate_hz)
+        let params = config
+            .mfsk()
+            .cloned()
+            .unwrap_or_else(|| panic!("ModemRx needs an MFSK PhyConfig"));
+        let tones = params.tone_table();
+        let band = params.rx_band_hz.map(|(lo, hi)| {
+            BandPass::with_order(lo, hi, params.rx_band_order as usize, config.sample_rate_hz)
         });
-        let bits = config.bits_per_symbol();
+        let bits = params.bits_per_symbol();
         Self {
             config,
+            params,
             tones,
             band,
             buffer: VecDeque::with_capacity(4096),
@@ -291,6 +304,11 @@ impl ModemRx {
         &self.config
     }
 
+    /// The tone plan, timing and detection gates.
+    pub fn params(&self) -> &MfskParams {
+        &self.params
+    }
+
     /// See [`LinkState`]: `Locked` while a body is read (or awaits its
     /// verdict) and for [`LOCK_HOLD_MS`] after a confirmed body.
     pub fn link_state(&self) -> LinkState {
@@ -330,7 +348,7 @@ impl ModemRx {
             self.failed_alignment = None;
             self.align_floor = self.read;
             self.last_confirmed_end = Some(self.read);
-            self.trim(self.config.hop_samples());
+            self.trim(self.params.hop_samples(self.config.sample_rate_hz));
         }
         self.process()
     }
@@ -341,7 +359,7 @@ impl ModemRx {
     /// processing) unless [`awaiting_verdict`](Self::awaiting_verdict).
     pub fn reject(&mut self) -> Vec<RxEvent> {
         if self.phase == RxPhase::Verdict {
-            let hop = self.config.hop_samples();
+            let hop = self.params.hop_samples(self.config.sample_rate_hz);
             self.phase = RxPhase::Search;
             self.rewind_failed(hop);
             self.trim(hop);
@@ -433,9 +451,9 @@ impl ModemRx {
     }
 
     fn preamble0_ok(&self, det: &DemodResult) -> bool {
-        det.nibble == self.config.preamble[0]
+        det.nibble == self.params.preamble[0]
             && self.level_ok(det)
-            && det.confidence_db >= self.config.min_confidence_db
+            && det.confidence_db >= self.params.min_confidence_db
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
@@ -452,9 +470,11 @@ impl ModemRx {
 
     fn process(&mut self) -> Vec<RxEvent> {
         let mut events = Vec::new();
-        let sym = self.config.symbol_samples();
-        let period = self.config.samples_per_symbol_period();
-        let hop = self.config.hop_samples();
+        let sym = self.params.symbol_samples(self.config.sample_rate_hz);
+        let period = self
+            .params
+            .samples_per_symbol_period(self.config.sample_rate_hz);
+        let hop = self.params.hop_samples(self.config.sample_rate_hz);
 
         loop {
             match self.phase {
@@ -470,7 +490,7 @@ impl ModemRx {
                             aligned,
                             confidence_db,
                         } => {
-                            let n = self.config.preamble.len() as u64;
+                            let n = self.params.preamble.len() as u64;
                             self.attempt = Some(Attempt { trigger, aligned });
                             self.read = aligned + n * period as u64;
                             self.start_body();
@@ -488,8 +508,8 @@ impl ModemRx {
                     // Cheap pre-check: the gate needs the preamble[0] tone's
                     // purity >= min_tone_purity, so skip the 16-tone bank when
                     // that single tone (bit-identical power and energy) fails.
-                    let hit = self.expected_purity(trigger, sym, self.config.preamble[0])
-                        >= self.config.min_tone_purity
+                    let hit = self.expected_purity(trigger, sym, self.params.preamble[0])
+                        >= self.params.min_tone_purity
                         && self
                             .detect_nibble(&self.window_at(trigger, sym))
                             .is_some_and(|det| self.preamble0_ok(&det));
@@ -530,12 +550,12 @@ impl ModemRx {
                         break;
                     }
                     let window = self.window_at(self.read, sym);
-                    let expect = self.config.preamble[matched];
+                    let expect = self.params.preamble[matched];
                     let det = self.detect_nibble(&window);
                     let good = det.as_ref().is_some_and(|det| {
                         det.nibble == expect
                             && self.level_ok(det)
-                            && det.confidence_db >= self.config.min_confidence_db * 0.5
+                            && det.confidence_db >= self.params.min_confidence_db * 0.5
                     });
                     // With FEC the coded body + CRC verify the lock, so a
                     // bad preamble symbol after the first may be tolerated.
@@ -548,7 +568,7 @@ impl ModemRx {
                         if good {
                             self.last_confidence_db = confidence_db;
                         }
-                        if next >= self.config.preamble.len() {
+                        if next >= self.params.preamble.len() {
                             self.start_body();
                             events.push(RxEvent::PreambleLocked { confidence_db });
                         } else {
@@ -568,7 +588,7 @@ impl ModemRx {
                     expected,
                     erased,
                 } => {
-                    let track = self.config.rx_track_timing;
+                    let track = self.params.rx_track_timing;
                     let lookahead = if track { hop / 2 } else { 0 };
                     if !self.available(self.read, period.max(sym + lookahead)) {
                         break;
@@ -577,7 +597,7 @@ impl ModemRx {
                     let det = self.detect_nibble(&window);
                     let gate_ok = det.as_ref().is_some_and(|det| {
                         self.level_ok(det)
-                            && det.confidence_db >= self.config.min_confidence_db * 0.5
+                            && det.confidence_db >= self.params.min_confidence_db * 0.5
                     });
                     // Symbol clock tracking (spec §3.2.3): a symbol that
                     // passed the gate re-centres the clock on its tone, so a
@@ -641,7 +661,7 @@ impl ModemRx {
     /// Tolerated preamble misses under joint acquisition (`None` =
     /// first-symbol acquisition).
     fn joint_misses(&self) -> Option<usize> {
-        match self.config.acquisition {
+        match self.params.acquisition {
             Acquisition::FirstSymbol => None,
             Acquisition::Joint { misses } => Some(misses as usize),
         }
@@ -654,7 +674,7 @@ impl ModemRx {
         let (power, energy) = goertzel_power_energy(
             self.buffer.range(start..start + sym).copied(),
             sym,
-            self.config.tone_hz(nibble),
+            self.params.tone_hz(nibble),
             self.config.sample_rate_hz,
         );
         if rms_dbfs(energy, sym) < self.config.min_rms_dbfs {
@@ -679,8 +699,8 @@ impl ModemRx {
     ///    dropout may take out two.
     fn joint_search_step(&self, sym: usize, period: usize, hop: usize) -> JointStep {
         let misses = self.joint_misses().unwrap_or(0);
-        let n = self.config.preamble.len();
-        let min_purity = self.config.min_tone_purity;
+        let n = self.params.preamble.len();
+        let min_purity = self.params.min_tone_purity;
         let trigger = self.read;
         let span = (n - 1) * period + sym;
         if !self.available(trigger, span) {
@@ -688,7 +708,7 @@ impl ModemRx {
         }
         let mut failed = 0;
         let mut sum = 0.0;
-        for (i, &nibble) in self.config.preamble.iter().enumerate() {
+        for (i, &nibble) in self.params.preamble.iter().enumerate() {
             let p = self.expected_purity(trigger + (i * period) as u64, sym, nibble);
             sum += p;
             if p < min_purity {
@@ -713,13 +733,13 @@ impl ModemRx {
         let mut bad = 0;
         let mut contradicting = 0;
         let mut confidence_db = 0.0;
-        for (i, &nibble) in self.config.preamble.iter().enumerate() {
+        for (i, &nibble) in self.params.preamble.iter().enumerate() {
             let det = self.detect_nibble(&self.window_at(aligned + (i * period) as u64, sym));
             match det {
                 Some(d)
                     if d.nibble == nibble
                         && self.level_ok(&d)
-                        && d.confidence_db >= self.config.min_confidence_db * 0.5 =>
+                        && d.confidence_db >= self.params.min_confidence_db * 0.5 =>
                 {
                     confidence_db = d.confidence_db;
                     continue;
@@ -749,7 +769,7 @@ impl ModemRx {
         if at < d || at - d < self.base() {
             return 0;
         }
-        let target = self.config.tone_hz(nibble);
+        let target = self.params.tone_hz(nibble);
         let power = |start: u64| {
             goertzel_power(
                 &self.window_at(start, sym),
@@ -790,7 +810,7 @@ impl ModemRx {
 
     /// Level-independent gate (silence floor is applied in `detect_nibble`).
     fn level_ok(&self, det: &DemodResult) -> bool {
-        det.purity >= self.config.min_tone_purity
+        det.purity >= self.params.min_tone_purity
     }
 
     /// Symbol-boundary fine alignment around a preamble[0] hit at `trigger`.
@@ -805,7 +825,7 @@ impl ModemRx {
     /// symbol, so the residual error is a sample or two on a clean signal.
     /// Needs samples up to `trigger + 2 * sym`.
     fn best_preamble0_position(&self, trigger: u64, sym: usize, hop: usize) -> u64 {
-        let target = self.config.tone_hz(self.config.preamble[0]);
+        let target = self.params.tone_hz(self.params.preamble[0]);
         let power =
             |at: u64| goertzel_power(&self.window_at(at, sym), target, self.config.sample_rate_hz);
         self.maximize_position(trigger, sym, hop, power)
@@ -818,7 +838,7 @@ impl ModemRx {
     /// symbol clock. Needs samples up to `trigger + 2 * sym + (N - 1) * period`.
     fn best_preamble_position(&self, trigger: u64, sym: usize, hop: usize, period: usize) -> u64 {
         let power = |at: u64| -> f32 {
-            self.config
+            self.params
                 .preamble
                 .iter()
                 .enumerate()
@@ -827,7 +847,7 @@ impl ModemRx {
                     goertzel_power_energy(
                         self.buffer.range(start..start + sym).copied(),
                         sym,
-                        self.config.tone_hz(nibble),
+                        self.params.tone_hz(nibble),
                         self.config.sample_rate_hz,
                     )
                     .0
@@ -881,5 +901,42 @@ impl ModemRx {
             step /= 2;
         }
         best
+    }
+}
+
+/// The MFSK receiver pauses after the last body nibble until the modem
+/// reports the decode result: `confirm` continues after the body, `reject`
+/// rewinds the search into it (see [`ModemRx`]).
+impl PhyRx for ModemRx {
+    fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
+        ModemRx::push_samples(self, samples)
+    }
+
+    fn link_state(&self) -> LinkState {
+        ModemRx::link_state(self)
+    }
+
+    fn last_confidence_db(&self) -> f32 {
+        ModemRx::last_confidence_db(self)
+    }
+
+    fn samples_pushed(&self) -> u64 {
+        ModemRx::samples_pushed(self)
+    }
+
+    fn set_expected_body_nibbles(&mut self, n: usize) {
+        ModemRx::set_expected_body_nibbles(self, n)
+    }
+
+    fn confirm(&mut self) -> Vec<RxEvent> {
+        ModemRx::confirm(self)
+    }
+
+    fn reject(&mut self) -> Vec<RxEvent> {
+        ModemRx::reject(self)
+    }
+
+    fn reset(&mut self) {
+        ModemRx::reset(self)
     }
 }

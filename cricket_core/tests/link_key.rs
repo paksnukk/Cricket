@@ -120,7 +120,7 @@ fn different_keys_stop_crosstalk_deliveries() {
         let unkeyed = run(&config, DEFAULT_LINK_KEY, DEFAULT_LINK_KEY, 1);
         assert_eq!(unkeyed.own, NOTES, "{name}: own delivery (unkeyed)");
         assert!(unkeyed.other.is_empty(), "{name}: {:?}", unkeyed.other);
-        if !matches!(config.modulation, cricket_core::phy::Modulation::Digital) {
+        if !matches!(config.modulation, cricket_core::phy::Modulation::Digital(_)) {
             assert!(
                 unkeyed.cross > 0,
                 "{name}: the crosstalk at {CROSSTALK_DB} dB was not even decoded unkeyed"

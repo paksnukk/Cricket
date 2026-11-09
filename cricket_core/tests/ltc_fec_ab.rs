@@ -30,14 +30,11 @@ fn profile(key: &str) -> PhyConfig {
         "" => 4800,
         r => r.parse().expect("bit rate"),
     };
-    let mut config = PhyConfig {
-        fec: if parity == 0 {
-            FecMode::None
-        } else {
-            FecMode::Rs16 { parity }
-        },
-        ..PhyConfig::ltc_with_bit_rate(rate)
-    };
+    let mut config = PhyConfig::ltc_with_bit_rate(rate).with_fec(if parity == 0 {
+        FecMode::None
+    } else {
+        FecMode::Rs16 { parity }
+    });
     // Receiver parameter overrides for tuning: LTC_AB_PARAMS="name=value,...".
     if let (Ok(spec), cricket_core::phy::Modulation::Bmc(p)) =
         (std::env::var("LTC_AB_PARAMS"), &mut config.modulation)

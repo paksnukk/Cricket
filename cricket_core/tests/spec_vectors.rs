@@ -7,7 +7,7 @@ use cricket_core::link::{
     Rs16, WHITENING,
 };
 use cricket_core::modem::{decode_samples, repetition_samples, CricketModemTx};
-use cricket_core::phy::{best_tone, PhyConfig, PhyRx, RxEvent};
+use cricket_core::phy::{best_tone, PhyConfig, RxEvent};
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
 
 /// Parse `"1 0 9 …"` (hex nibbles) or `"10 00 90 …"` (hex bytes).
@@ -137,7 +137,7 @@ fn mfsk_on_air_symbols() {
             let audio = CricketModemTx::new(config.clone()).encode_message_with_seq(&v.msg, v.seq);
             let rep = repetition_samples(&config) as usize;
             assert_eq!(audio.len(), copies * rep);
-            let mut symbols = config.preamble.clone();
+            let mut symbols = config.preamble().to_vec();
             symbols.extend(hex(body));
             let period = config.samples_per_symbol_period();
             let sym = config.symbol_samples();
@@ -169,7 +169,7 @@ fn hf_on_air_symbols() {
     assert_eq!(robust.tone_table()[0], 19_000.0);
     assert!((robust.tone_table()[15] - 21_500.0).abs() < 0.01);
     let fast = PhyConfig::hf_fast();
-    assert_eq!(fast.preamble, vec![5, 2, 6, 1]);
+    assert_eq!(fast.preamble(), [5, 2, 6, 1]);
     assert!((fast.tone_table()[7] - 21_333.3).abs() < 0.1);
     let fast_body: Vec<u8> = "4 6 0 3 4 5 5 6 4 2 0 1 2 2 5 0 5 6 0 1 3 2 4 3 7 3 0 1 7 4"
         .split_whitespace()
@@ -183,7 +183,7 @@ fn hf_on_air_symbols() {
         let audio = CricketModemTx::new(config.clone()).encode_message_with_seq(&v.msg, v.seq);
         let rep = repetition_samples(&config) as usize;
         assert_eq!(audio.len(), rep);
-        let mut symbols = config.preamble.clone();
+        let mut symbols = config.preamble().to_vec();
         symbols.extend(body);
         let period = config.samples_per_symbol_period();
         let sym = config.symbol_samples();
@@ -213,7 +213,7 @@ fn ltc_on_air_nibbles() {
             audio
                 .extend(CricketModemTx::new(config.clone()).encode_message_with_seq(&v.msg, v.seq));
             audio.extend(vec![0.0; 500]);
-            let mut rx = PhyRx::new(config.clone());
+            let mut rx = config.modulation.phy().rx(&config);
             let want = hex(body);
             rx.set_expected_body_nibbles(want.len());
             let got: Vec<u8> = rx

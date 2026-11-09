@@ -24,7 +24,7 @@
 use crate::devices::DeviceSelector;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cricket_core::phy::{Modulation, PhyConfig};
+use cricket_core::phy::PhyConfig;
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 use std::collections::VecDeque;
 use std::fmt;
@@ -398,11 +398,8 @@ pub fn setup_warnings(
     if let Some(w) = output_device.and_then(|n| builtin_device_warning(n, false)) {
         out.push(w);
     }
-    let needs_clean_digital_path = match &config.modulation {
-        Modulation::Digital => true,
-        Modulation::Bmc(p) => p.bit_rate >= 14_400,
-        Modulation::Mfsk => false,
-    };
+    let needs_clean_digital_path =
+        config.needs_bit_exact_path() || config.bmc().is_some_and(|p| p.bit_rate >= 14_400);
     if cfg!(target_os = "windows") && needs_clean_digital_path {
         out.push(
             "On Windows, Cricket uses WASAPI shared mode: the Windows mixer applies volume, \

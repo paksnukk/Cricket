@@ -46,11 +46,9 @@ fn all_types() -> Vec<TransportMessage> {
 }
 
 fn fec_parity(parity: u8, k: usize) -> PhyConfig {
-    PhyConfig {
-        repetition_k: k,
-        fec: FecMode::Rs16 { parity },
-        ..PhyConfig::robust()
-    }
+    PhyConfig::robust()
+        .with_repetition_k(k)
+        .with_fec(FecMode::Rs16 { parity })
 }
 
 #[test]
@@ -78,7 +76,7 @@ fn profile_parameters() {
         let c = PhyConfig::from_name(name).unwrap();
         assert_eq!(c.fec, fec.fec, "{name}");
         assert_eq!(c.repetition_k, 1, "{name}");
-        assert_eq!(c.acquisition, fec.acquisition, "{name}");
+        assert_eq!(acquisition(&c), acquisition(&fec), "{name}");
     }
     assert!(PhyConfig::from_name("nonsense").is_none());
     for name in ["robust_repeat", "robust-repeat", "analog-safe-repeat"] {
@@ -87,11 +85,16 @@ fn profile_parameters() {
         assert_eq!(c.repetition_k, 2, "{name}");
     }
     assert_eq!(
-        PhyConfig::robust_repeat().acquisition,
+        acquisition(&PhyConfig::robust_repeat()),
         Acquisition::Joint { misses: 1 }
     );
-    assert_eq!(PhyConfig::fast().acquisition, Acquisition::FirstSymbol);
-    assert_eq!(fec.acquisition, Acquisition::Joint { misses: 2 });
+    assert_eq!(acquisition(&PhyConfig::fast()), Acquisition::FirstSymbol);
+    assert_eq!(acquisition(&fec), Acquisition::Joint { misses: 2 });
+}
+
+/// The MFSK acquisition mode of `config`.
+fn acquisition(config: &PhyConfig) -> Acquisition {
+    config.mfsk().expect("MFSK profile").acquisition
 }
 
 /// Joint acquisition: any one or two muted preamble symbols (including the
@@ -147,10 +150,7 @@ fn joint_acquisition_tolerates_two_missing_preamble_symbols() {
 /// not (checked on a single copy, K = 1).
 #[test]
 fn robust_repeat_joint_acquisition_tolerates_one_missing_preamble_symbol() {
-    let config = PhyConfig {
-        repetition_k: 1,
-        ..PhyConfig::robust_repeat()
-    };
+    let config = PhyConfig::robust_repeat().with_repetition_k(1);
     let period = config.samples_per_symbol_period();
     let msg = TransportMessage::NoteOn {
         channel: 3,
@@ -231,7 +231,7 @@ fn corrects_wrong_symbols_and_reports_them() {
     let audio = tx.encode_message_with_seq(&msg, 1);
     // Overwrite body symbols 0..4 (2 per codeword) with a different tone.
     let period = config.samples_per_symbol_period();
-    let pre = config.preamble.len();
+    let pre = config.preamble().len();
     let phy = cricket_core::phy::ModemTx::new(config.clone());
     let mut audio = audio;
     for i in 0..4 {
@@ -270,7 +270,7 @@ fn noise_and_random_tones_produce_no_messages() {
     let mut nibbles = Vec::new();
     while nibbles.len() * config.samples_per_symbol_period() < 10 * rate {
         if rng.below(8) == 0 {
-            nibbles.extend_from_slice(&config.preamble);
+            nibbles.extend_from_slice(config.preamble());
         }
         nibbles.push(rng.below(16) as u8);
     }
@@ -577,7 +577,7 @@ fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Ce
             // without symbol corruption).
             let d = (ms * config.sample_rate_hz as f32 / 1000.0) as usize;
             let start = XorShift64::new(sim_seed).below(clean.len() - d);
-            if start < config.preamble.len() * period {
+            if start < config.preamble().len() * period {
                 lost_preamble_hit += 1;
             } else if (start as u64) < repetition_samples(config) {
                 lost_body_only += 1;
@@ -759,10 +759,7 @@ fn fec_ab_table() {
         ("robust_repeat K2".into(), PhyConfig::robust_repeat()),
         (
             "robust_repeat K1".into(),
-            PhyConfig {
-                repetition_k: 1,
-                ..PhyConfig::robust_repeat()
-            },
+            PhyConfig::robust_repeat().with_repetition_k(1),
         ),
         ("robust (p4 K1)".into(), PhyConfig::robust()),
         ("fec p2 K1".into(), fec_parity(2, 1)),
@@ -825,9 +822,9 @@ fn acq_profiles() -> Vec<(String, PhyConfig)> {
 /// (`0` disables body symbol clock tracking), `MFSK_STEP` / `MFSK_BASE`
 /// (tone plan of both ends, see below).
 fn apply_rx_overrides(config: &mut PhyConfig) {
-    if config.n_tones == 0 {
+    let Some(config) = config.mfsk_mut().filter(|p| p.n_tones > 0) else {
         return;
-    }
+    };
     if let Some(p) = std::env::var("MFSK_PURITY")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -895,13 +892,14 @@ fn parse_profiles(names: &str) -> Vec<(String, PhyConfig)> {
             };
             let mut config =
                 PhyConfig::from_name(base).unwrap_or_else(|| panic!("unknown profile {base}"));
+            let mfsk = config.mfsk_mut().expect("MFSK profile");
             if pre6 {
-                config.preamble = vec![0xA, 0x5, 0xC, 0x3, 0x8, 0xE];
+                mfsk.preamble = vec![0xA, 0x5, 0xC, 0x3, 0x8, 0xE];
             }
             if acq == "first" {
-                config.acquisition = Acquisition::FirstSymbol;
+                mfsk.acquisition = Acquisition::FirstSymbol;
             } else if let Some(m) = acq.strip_prefix("joint") {
-                config.acquisition = Acquisition::Joint {
+                mfsk.acquisition = Acquisition::Joint {
                     misses: m.parse().expect("joint<misses>"),
                 };
             }

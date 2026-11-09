@@ -199,7 +199,7 @@ fn profile_entries() -> Vec<ProfileEntry> {
                 use_when: p.use_when.into(),
                 airtime_ms: repetition_samples(&c) as f32 * c.repetition_k.max(1) as f32 * 1000.0
                     / c.sample_rate_hz as f32,
-                min_confidence_db: c.min_confidence_db,
+                min_confidence_db: c.min_confidence_db(),
                 tx_level_dbfs: c.tx_level_dbfs(),
             }
         })
@@ -258,6 +258,8 @@ fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
             latency_ms,
             dropped,
         }),
+        // An event this GUI predates.
+        _ => return None,
     })
 }
 
@@ -340,11 +342,11 @@ fn get_profile_info(profile: String) -> Result<serde_json::Value, String> {
         "est_latency_ms": cfg.estimated_first_copy_ms(),
         "airtime_ms": repetition_samples(&cfg) as f32 * cfg.repetition_k.max(1) as f32 * 1000.0
             / cfg.sample_rate_hz as f32,
-        "symbol_duration_ms": cfg.symbol_duration_ms,
-        "guard_gap_ms": cfg.guard_gap_ms,
+        "symbol_duration_ms": cfg.symbol_duration_ms(),
+        "guard_gap_ms": cfg.guard_gap_ms(),
         "repetition_k": cfg.repetition_k,
         "sample_rate_hz": cfg.sample_rate_hz,
-        "min_confidence_db": cfg.min_confidence_db,
+        "min_confidence_db": cfg.min_confidence_db(),
         "tx_level_dbfs": cfg.tx_level_dbfs(),
     }))
 }

@@ -1,5 +1,5 @@
-use super::{frame_intervals, BmcParams, Modulation};
-use crate::phy::PhyConfig;
+use super::{frame_intervals, BmcParams};
+use crate::phy::{PhyConfig, PhyTx};
 use alloc::vec::Vec;
 use core::f32::consts::PI;
 
@@ -10,12 +10,14 @@ pub struct BmcTx {
 }
 
 impl BmcTx {
-    /// Panics if `config` does not select [`Modulation::Bmc`].
+    /// Panics if `config` does not select [`Modulation::Bmc`](crate::phy::Modulation::Bmc)
+    /// (the modem builds its phys through [`crate::phy::PhyFactory`], which
+    /// cannot get this wrong).
     pub fn new(config: PhyConfig) -> Self {
-        let params = match &config.modulation {
-            Modulation::Bmc(p) => p.clone(),
-            _ => panic!("BmcTx needs a BMC PhyConfig"),
-        };
+        let params = config
+            .bmc()
+            .cloned()
+            .unwrap_or_else(|| panic!("BmcTx needs a BMC PhyConfig"));
         Self { config, params }
     }
 
@@ -72,5 +74,11 @@ impl BmcTx {
             out.push(v * amp);
         }
         out
+    }
+}
+
+impl PhyTx for BmcTx {
+    fn synthesize_framed(&self, body_nibbles: &[u8]) -> Vec<f32> {
+        BmcTx::synthesize_framed(self, body_nibbles)
     }
 }

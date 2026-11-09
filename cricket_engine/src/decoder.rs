@@ -41,7 +41,7 @@ use crate::{closed_receiver, Emitter, Worker};
 use anyhow::{anyhow, Result};
 use cricket_core::link::DEFAULT_LINK_KEY;
 use cricket_core::modem::{CricketModemRx, ModemOutput, ModemStats};
-use cricket_core::phy::{Modulation, PhyConfig};
+use cricket_core::phy::PhyConfig;
 use cricket_core::transport::MscTarget;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -275,7 +275,7 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
     };
 
     let mut audio = cfg.audio.clone();
-    audio.digital = matches!(config.modulation, Modulation::Digital);
+    audio.digital = config.needs_bit_exact_path();
     let mut source = match cfg.audio_in.open(
         preferred_sample_rate,
         preferred_sample_rate as usize * 2,
@@ -460,18 +460,18 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
                 ModemOutput::SyncLost => {
                     sync_lost = sync_lost.saturating_add(1);
                 }
-                ModemOutput::Stats(stats) => {
-                    if last_stats_emit.elapsed() >= STATS_INTERVAL {
-                        ev.send(EngineEvent::Stats(link_stats(
-                            &stats,
-                            sync_lost,
-                            est_latency,
-                            link_alive,
-                            source.dropped(),
-                        )));
-                        last_stats_emit = Instant::now();
-                    }
+                ModemOutput::Stats(stats) if last_stats_emit.elapsed() >= STATS_INTERVAL => {
+                    ev.send(EngineEvent::Stats(link_stats(
+                        &stats,
+                        sync_lost,
+                        est_latency,
+                        link_alive,
+                        source.dropped(),
+                    )));
+                    last_stats_emit = Instant::now();
                 }
+                // Stats between reports, and outputs this engine predates.
+                _ => {}
             }
         }
     }

@@ -147,8 +147,8 @@ fn overload(config: &PhyConfig, seconds: u64, with_note_offs: bool) -> Outcome {
             }
         }
     }
-    out.note_on_drops = s.note_ons_dropped > 0;
-    out.queue_dropped = s.queue_dropped;
+    out.note_on_drops = s.note_ons_dropped() > 0;
+    out.queue_dropped = s.queue_dropped();
     assert_eq!(out.last_cc7, Some(final_cc), "final CC 7 value");
     out
 }

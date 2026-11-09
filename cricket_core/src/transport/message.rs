@@ -4,6 +4,7 @@ use super::msc::MscMessage;
 use alloc::vec::Vec;
 
 /// The 4-bit message type in the packet header (spec §4.1, §5).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
@@ -58,6 +59,7 @@ impl MessageType {
 /// (0–127) except `PitchBend::value` and `SongPosition::beats` (14-bit,
 /// 0–16383; pitch bend center is 8192). Construct values in range: the
 /// encoders mask out-of-range bits.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportMessage {
     NoteOff {

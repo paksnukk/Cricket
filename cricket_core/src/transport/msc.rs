@@ -28,6 +28,7 @@ pub const MSC_MAX_CUE_TENTHS: u16 = 9999;
 pub const MSC_MAX_LIST: u8 = 15;
 
 /// Supported MSC commands (MSC 1.0 command bytes).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MscCommand {
@@ -487,6 +488,7 @@ fn ascii(text: &[u8]) -> String {
 }
 
 /// Why an MSC SysEx was not converted.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MscError {
     /// Not an MSC SysEx (other SysEx): ignore it.

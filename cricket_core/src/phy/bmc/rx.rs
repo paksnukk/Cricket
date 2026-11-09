@@ -1,5 +1,5 @@
-use super::{BmcParams, Modulation};
-use crate::phy::{DemodResult, LinkState, PhyConfig, RxEvent, LOCK_HOLD_MS};
+use super::BmcParams;
+use crate::phy::{DemodResult, LinkState, PhyConfig, PhyRx, RxEvent, LOCK_HOLD_MS};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::f32::consts::PI;
@@ -244,12 +244,14 @@ fn margin_db(m: f32) -> f32 {
 }
 
 impl BmcRx {
-    /// Panics if `config` does not select [`Modulation::Bmc`].
+    /// Panics if `config` does not select [`Modulation::Bmc`](crate::phy::Modulation::Bmc)
+    /// (the modem builds its phys through [`crate::phy::PhyFactory`], which
+    /// cannot get this wrong).
     pub fn new(config: PhyConfig) -> Self {
-        let params = match &config.modulation {
-            Modulation::Bmc(p) => p.clone(),
-            _ => panic!("BmcRx needs a BMC PhyConfig"),
-        };
+        let params = config
+            .bmc()
+            .cloned()
+            .unwrap_or_else(|| panic!("BmcRx needs a BMC PhyConfig"));
         let sr = config.sample_rate_hz;
         let bit_rate = params.bit_rate as f32;
         let half_nominal = params.half_cell_samples(sr);
@@ -842,5 +844,34 @@ impl BmcRx {
             },
             end_sample: self.samples_pushed,
         });
+    }
+}
+
+/// BMC does not pause after a body: its sync search never stops and a
+/// clearly stronger sync replaces a lock directly, so `confirm` and
+/// `reject` have nothing to do (the trait defaults).
+impl PhyRx for BmcRx {
+    fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
+        BmcRx::push_samples(self, samples)
+    }
+
+    fn link_state(&self) -> LinkState {
+        BmcRx::link_state(self)
+    }
+
+    fn last_confidence_db(&self) -> f32 {
+        BmcRx::last_confidence_db(self)
+    }
+
+    fn samples_pushed(&self) -> u64 {
+        BmcRx::samples_pushed(self)
+    }
+
+    fn set_expected_body_nibbles(&mut self, n: usize) {
+        BmcRx::set_expected_body_nibbles(self, n)
+    }
+
+    fn reset(&mut self) {
+        BmcRx::reset(self)
     }
 }

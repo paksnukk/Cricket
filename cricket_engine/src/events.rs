@@ -33,6 +33,7 @@ use cricket_core::transport::{TransportMessage, PITCH_BEND_CENTER};
 /// Something a decoder or encoder worker reports. Delivered in order on the
 /// handle's event channel; [`EngineEvent::Stopped`] is always the last one.
 /// See the [module documentation](self) for the full table.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     /// Human-readable status line.
@@ -104,6 +105,7 @@ impl LinkStats {
 }
 
 /// Alarm categories. See the [module documentation](self) for meanings.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlarmKind {
     /// No valid packet for `link_dead_ms`; Sustain off + All Notes Off was
@@ -294,6 +296,8 @@ pub fn format_message(msg: &TransportMessage) -> (String, String) {
         M::Msc(m) => ("MSC", m.to_string()),
         M::Heartbeat => ("Heartbeat", String::new()),
         M::Panic => ("Panic", String::new()),
+        // A message type this engine predates.
+        _ => ("Unknown", format!("{msg:?}")),
     };
     (kind.into(), payload)
 }

@@ -2,12 +2,25 @@
 //! the profile catalog with the user-facing names ([`PROFILES`]), and the
 //! transmit level ([`DEFAULT_TX_LEVEL_DBFS`]).
 //!
+//! A [`PhyConfig`] holds what every profile has — sample rate, level, body
+//! coding, repetition, fail-safe timers, link key — and a
+//! [`Modulation`] whose variant carries the parameters of the phy that
+//! carries the body ([`MfskParams`], [`BmcParams`], …). Build one from a
+//! profile constructor ([`PhyConfig::robust`] …) or [`PhyConfig::from_name`]
+//! and adjust it with the `with_*` methods or [`PhyConfig::builder`]; the
+//! struct is `#[non_exhaustive]`, so it cannot be built with a literal
+//! outside the crate (fields will be added).
+//!
 //! Profiles have two kinds of names. The Rust constructors and the spec use
 //! the wire-format names (`robust`, `ltc_fec`, …); operators see the tier
 //! names of the README table (`analog-safe`, `clean-line`, …), which say
 //! what line a profile is for. [`PhyConfig::from_name`] accepts both.
 
-use super::bmc::{BmcParams, Modulation};
+use super::bmc::BmcParams;
+use super::digital::DigitalParams;
+use super::mfsk::{mfsk_rx_band, orthogonal_step_hz, Acquisition, MfskParams, PURITY_MFSK};
+use super::modulation::Modulation;
+use super::traits::BodyCoding;
 use crate::link::{FecMode, DEFAULT_LINK_KEY};
 use alloc::format;
 use alloc::string::String;
@@ -70,99 +83,32 @@ pub fn dbfs_from_amplitude(amplitude: f32) -> f32 {
     20.0 * libm::log10f(amplitude.abs().max(1e-10))
 }
 
-// Tone-purity gate (see `goertzel::tone_purity`), measured on the tone-band
-// filtered input (`PhyConfig::rx_band_hz`): ~0.97 for an aligned synthesized
-// symbol, ≥ 0.4 at a full search hop of misalignment, ~0.6 for a symbol in
-// white noise at −6 dB full-band SNR. Tuned on the MFSK training table
-// (`tests/fec.rs`, `mfsk_ab_table`): 0.2 is the lowest value at which white
-// noise and music-like audio still produce no phy lock for any profile
-// (at 0.15: robust 2, fast 13 locks per minute on white noise); each step
-// of 0.05 above it costs about 1 dB of AWGN cliff.
-const PURITY_MFSK: f32 = 0.2;
-
-/// Orthogonal tone step of an MFSK symbol of `symbol_duration_ms`: 1 / T
-/// (spec §3.1), so that every other tone falls on a zero of a tone's
-/// rectangular-window spectrum and leaks nothing into its Goertzel bin.
-/// 6 ms → 166⅔ Hz, 3 ms → 333⅓ Hz.
-pub fn orthogonal_step_hz(symbol_duration_ms: f32) -> f32 {
-    1000.0 / symbol_duration_ms
-}
-
-/// Receiver band of an MFSK tone plan (`PhyConfig::rx_band_hz`): from
-/// `RX_BAND_LOW` × the lowest tone to `RX_BAND_HIGH` × the highest, so
-/// the second-order band edges cost the outer tones less than 1 dB while
-/// hum and rumble (≤ 300 Hz) are 40–60 dB down and hiss above the band is
-/// gone.
-fn mfsk_rx_band(base_hz: f32, step_hz: f32, n_tones: usize) -> (f32, f32) {
-    let top = base_hz + step_hz * (n_tones.max(1) - 1) as f32;
-    (RX_BAND_LOW * base_hz, RX_BAND_HIGH * top)
-}
-const RX_BAND_LOW: f32 = 0.7;
-const RX_BAND_HIGH: f32 = 1.3;
-
-/// How the MFSK receiver finds a preamble (receiver-side only; the wire
-/// format is the same either way). Spec §3.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Acquisition {
-    /// Spec §3.2.1: gate on `preamble[0]` alone, fine-align on its tone, then
-    /// confirm the remaining preamble symbols in order. Used by Fast (whose
-    /// 2-symbol preamble is too short for joint detection).
-    #[default]
-    FirstSymbol,
-    /// Spec §3.2.2: joint detection over the whole preamble
-    /// (docs/proposals/fec.md §10): a search window is a candidate when at
-    /// least `N - misses` preamble symbols show their expected tone, fine
-    /// alignment maximizes the summed expected-tone power of all `N` symbols,
-    /// and the lock is accepted when at most `misses` symbols (anywhere,
-    /// including the first) fail the detection gate and at most one of those
-    /// shows a clear *different* tone. Robust uses 2 misses (its coded body +
-    /// CRC-16 verify the lock), Robust repeat 1.
-    Joint { misses: u8 },
-}
-
+/// A profile: the parameters common to every phy, plus the
+/// [`Modulation`] with the phy's own.
+///
+/// Fields are public so a profile can be adjusted in place; the struct is
+/// `#[non_exhaustive]` (fields will be added), so start from a constructor
+/// or [`PhyConfig::builder`] rather than a literal. The phy-specific
+/// parameters live in `modulation` ([`mfsk`](Self::mfsk),
+/// [`bmc`](Self::bmc)); the accessors below ([`symbol_duration_ms`](Self::symbol_duration_ms),
+/// [`preamble`](Self::preamble), …) answer for any modulation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PhyConfig {
     pub sample_rate_hz: u32,
-    /// Line code: `Mfsk` (robust, robust_repeat, fast) or `Bmc` (the
-    /// provisional LTC profiles, spec §6.5).
+    /// The phy that carries the body, with its parameters: MFSK (robust,
+    /// robust_repeat, fast, the HF profiles), BMC (the provisional LTC
+    /// profiles, spec §6.5), digital, or a custom phy.
     pub modulation: Modulation,
-    pub symbol_duration_ms: f32,
-    pub guard_gap_ms: f32,
-    pub attack_ms: f32,
-    pub release_ms: f32,
-    /// Symbol envelope: raised-cosine attack and release (the HF profiles,
-    /// spec §6.6, whose leakage into the audible band must stay far under
-    /// the tones) instead of the linear ramps of spec §3.1 (the baseband
-    /// profiles). Wire format.
-    pub raised_cosine_ramps: bool,
+    /// Peak transmit amplitude (full scale = 1.0; see
+    /// [`with_tx_level_dbfs`](Self::with_tx_level_dbfs)).
     pub amplitude: f32,
-    pub tone_base_hz: f32,
-    pub tone_step_hz: f32,
-    pub n_tones: usize,
-    pub preamble: Vec<u8>,
-    pub min_confidence_db: f32,
-    /// Minimum level-independent tone purity (Goertzel power normalized by
-    /// window energy, see `goertzel::tone_purity`; 1.0 = pure steady tone).
-    pub min_tone_purity: f32,
     /// Silence floor: windows whose RMS is below this (dBFS, full-scale sine
     /// = -3 dBFS) are never detected as symbols.
     pub min_rms_dbfs: f32,
-    /// Receiver only (spec §3.2): the MFSK receiver band-passes its input to
-    /// `(low, high)` Hz (second-order Butterworth each side) before any
-    /// detection, so window energy, silence floor and tone purity are
-    /// measured in the tone band only. `None` disables the filter.
-    pub rx_band_hz: Option<(f32, f32)>,
-    /// Receiver only: Butterworth order of each side of the
-    /// [`rx_band_hz`](Self::rx_band_hz) filter (even, 2–8). 2 on the
-    /// baseband profiles (spec §3.2); 8 on the HF profiles (spec §6.6),
-    /// whose tones sit a few kHz above an instrument 30–60 dB stronger.
-    pub rx_band_order: u8,
-    /// Receiver only (spec §3.2.3): re-centre the symbol clock on every
-    /// body symbol that passes the detection gate (±3 / ±6 samples), so
-    /// the body survives a sample-rate mismatch of up to ~2 % between the
-    /// ends. Costs four single-tone Goertzels per body symbol.
-    pub rx_track_timing: bool,
+    /// Copies of each message sent back to back (spec §4.4).
     pub repetition_k: usize,
+    /// Block interleave depth of an uncoded body (spec §4.3).
     pub interleave_depth: usize,
     /// Fail-safe: no valid packet for this long after the last one declares
     /// the link dead (spec §5.3). Per profile (spec §6): 2000 ms on the MFSK
@@ -179,10 +125,9 @@ pub struct PhyConfig {
     pub heartbeat_interval_ms: u32,
     /// Body forward error correction (spec §4.6): `Rs16 { parity: 4 }` for
     /// robust and the `*_fec` LTC profiles, `None` (block-interleaved
-    /// uncoded body, §4.3) otherwise.
+    /// uncoded body, §4.3) otherwise. The phy declares how it applies
+    /// ([`body_coding`](Self::body_coding)).
     pub fec: FecMode,
-    /// Preamble acquisition (MFSK only, spec §3.2).
-    pub acquisition: Acquisition,
     /// Receiver only: also run the digital-frame detector next to this
     /// profile's own receiver (profile name suffix `+digital`, e.g.
     /// `ltc9600+digital`), so a transmitter can switch between this profile
@@ -212,12 +157,10 @@ impl PhyConfig {
     /// (`FecMode::Rs16 { parity: 4 }`) sent once (K = 1), and joint preamble
     /// acquisition tolerating two missed preamble symbols.
     pub fn robust() -> Self {
-        Self {
-            repetition_k: 1,
-            fec: FecMode::Rs16 { parity: 4 },
-            acquisition: Acquisition::Joint { misses: 2 },
-            ..Self::robust_repeat()
-        }
+        let mut c = Self::robust_repeat();
+        c.repetition_k = 1;
+        c.fec = FecMode::Rs16 { parity: 4 };
+        c.map_mfsk(|p| p.acquisition = Acquisition::Joint { misses: 2 })
     }
 
     /// **Robust repeat** (spec §6.2; user-facing name `analog-safe-repeat`):
@@ -230,29 +173,30 @@ impl PhyConfig {
     pub fn robust_repeat() -> Self {
         Self {
             sample_rate_hz: 48_000,
-            modulation: Modulation::Mfsk,
-            symbol_duration_ms: 6.0,
-            guard_gap_ms: 0.5,
-            attack_ms: 0.3,
-            release_ms: 0.3,
-            raised_cosine_ramps: false,
+            modulation: Modulation::Mfsk(MfskParams {
+                symbol_duration_ms: 6.0,
+                guard_gap_ms: 0.5,
+                attack_ms: 0.3,
+                release_ms: 0.3,
+                raised_cosine_ramps: false,
+                tone_base_hz: 2500.0,
+                tone_step_hz: orthogonal_step_hz(6.0),
+                n_tones: 16,
+                preamble: vec![0xA, 0x5, 0xC, 0x3],
+                min_confidence_db: 3.0,
+                min_tone_purity: PURITY_MFSK,
+                rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(6.0), 16)),
+                rx_band_order: 2,
+                rx_track_timing: true,
+                acquisition: Acquisition::Joint { misses: 1 },
+            }),
             amplitude: DEFAULT_AMPLITUDE,
-            tone_base_hz: 2500.0,
-            tone_step_hz: orthogonal_step_hz(6.0),
-            n_tones: 16,
-            preamble: vec![0xA, 0x5, 0xC, 0x3],
-            min_confidence_db: 3.0,
-            min_tone_purity: PURITY_MFSK,
             min_rms_dbfs: -60.0,
-            rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(6.0), 16)),
-            rx_band_order: 2,
-            rx_track_timing: true,
             repetition_k: 2,
             interleave_depth: 4,
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
-            acquisition: Acquisition::Joint { misses: 1 },
             digital_detect: false,
             link_key: DEFAULT_LINK_KEY,
         }
@@ -268,15 +212,14 @@ impl PhyConfig {
     /// variant (78 ms) measured 2 dB worse and lost 30 ms dropouts
     /// (83 % vs 96 %), so 4 ms it is. Needs a line that passes 6.25 kHz.
     pub fn robust_fast() -> Self {
-        Self {
-            symbol_duration_ms: 4.0,
-            guard_gap_ms: 0.0,
-            attack_ms: 0.2,
-            release_ms: 0.2,
-            tone_step_hz: orthogonal_step_hz(4.0),
-            rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(4.0), 16)),
-            ..Self::robust()
-        }
+        Self::robust().map_mfsk(|p| {
+            p.symbol_duration_ms = 4.0;
+            p.guard_gap_ms = 0.0;
+            p.attack_ms = 0.2;
+            p.release_ms = 0.2;
+            p.tone_step_hz = orthogonal_step_hz(4.0);
+            p.rx_band_hz = Some(mfsk_rx_band(2500.0, orthogonal_step_hz(4.0), 16));
+        })
     }
 
     /// **HF robust** (`hf_robust`, spec §6.6, provisional; user-facing name
@@ -295,16 +238,16 @@ impl PhyConfig {
     /// wireless link or a codec in the path removes the tones.
     /// Measurements: `docs/proposals/hf-instrument.md`.
     pub fn hf_robust() -> Self {
-        Self {
-            attack_ms: HF_RAMP_MS,
-            release_ms: HF_RAMP_MS,
-            raised_cosine_ramps: true,
-            tone_base_hz: HF_BASE_HZ,
-            amplitude: HF_AMPLITUDE,
-            rx_band_hz: Some(HF_RX_BAND_HZ),
-            rx_band_order: HF_RX_BAND_ORDER,
-            ..Self::robust()
-        }
+        let mut c = Self::robust();
+        c.amplitude = HF_AMPLITUDE;
+        c.map_mfsk(|p| {
+            p.attack_ms = HF_RAMP_MS;
+            p.release_ms = HF_RAMP_MS;
+            p.raised_cosine_ramps = true;
+            p.tone_base_hz = HF_BASE_HZ;
+            p.rx_band_hz = Some(HF_RX_BAND_HZ);
+            p.rx_band_order = HF_RX_BAND_ORDER;
+        })
     }
 
     /// **HF fast** (`hf_fast`, spec §6.6, provisional; user-facing name
@@ -319,16 +262,15 @@ impl PhyConfig {
     /// hiss margin) and one erased symbol can erase two nibbles. Same
     /// level, receiver band and line requirements as `hf_robust`.
     pub fn hf_fast() -> Self {
-        Self {
-            symbol_duration_ms: 3.0,
-            guard_gap_ms: 0.0,
-            attack_ms: HF_FAST_RAMP_MS,
-            release_ms: HF_FAST_RAMP_MS,
-            tone_step_hz: orthogonal_step_hz(3.0),
-            n_tones: 8,
-            preamble: vec![0x5, 0x2, 0x6, 0x1],
-            ..Self::hf_robust()
-        }
+        Self::hf_robust().map_mfsk(|p| {
+            p.symbol_duration_ms = 3.0;
+            p.guard_gap_ms = 0.0;
+            p.attack_ms = HF_FAST_RAMP_MS;
+            p.release_ms = HF_FAST_RAMP_MS;
+            p.tone_step_hz = orthogonal_step_hz(3.0);
+            p.n_tones = 8;
+            p.preamble = vec![0x5, 0x2, 0x6, 0x1];
+        })
     }
 
     /// **HF fast at 96 kHz** (`hf_fast_96k`, experimental, not in the spec):
@@ -342,23 +284,23 @@ impl PhyConfig {
     /// catalog profile.
     pub fn hf_fast_96k() -> Self {
         let step = orthogonal_step_hz(3.0);
-        Self {
-            sample_rate_hz: 96_000,
-            symbol_duration_ms: 3.0,
-            guard_gap_ms: 0.0,
-            attack_ms: HF_FAST_RAMP_MS,
-            release_ms: HF_FAST_RAMP_MS,
-            raised_cosine_ramps: true,
-            tone_base_hz: HF_BASE_96K_HZ,
-            tone_step_hz: step,
-            amplitude: HF_AMPLITUDE,
-            rx_band_hz: Some((
+        let mut c = Self::robust();
+        c.sample_rate_hz = 96_000;
+        c.amplitude = HF_AMPLITUDE;
+        c.map_mfsk(|p| {
+            p.symbol_duration_ms = 3.0;
+            p.guard_gap_ms = 0.0;
+            p.attack_ms = HF_FAST_RAMP_MS;
+            p.release_ms = HF_FAST_RAMP_MS;
+            p.raised_cosine_ramps = true;
+            p.tone_base_hz = HF_BASE_96K_HZ;
+            p.tone_step_hz = step;
+            p.rx_band_hz = Some((
                 HF_BASE_96K_HZ - 1_000.0,
                 HF_BASE_96K_HZ + 15.0 * step + 1_000.0,
-            )),
-            rx_band_order: HF_RX_BAND_ORDER,
-            ..Self::robust()
-        }
+            ));
+            p.rx_band_order = HF_RX_BAND_ORDER;
+        })
     }
 
     /// Fast profile for clean dedicated chains (user-facing name
@@ -368,29 +310,30 @@ impl PhyConfig {
     pub fn fast() -> Self {
         Self {
             sample_rate_hz: 48_000,
-            modulation: Modulation::Mfsk,
-            symbol_duration_ms: 3.0,
-            guard_gap_ms: 0.0,
-            attack_ms: 0.15,
-            release_ms: 0.15,
-            raised_cosine_ramps: false,
+            modulation: Modulation::Mfsk(MfskParams {
+                symbol_duration_ms: 3.0,
+                guard_gap_ms: 0.0,
+                attack_ms: 0.15,
+                release_ms: 0.15,
+                raised_cosine_ramps: false,
+                tone_base_hz: 2500.0,
+                tone_step_hz: orthogonal_step_hz(3.0),
+                n_tones: 16,
+                preamble: vec![0xA, 0x5],
+                min_confidence_db: 2.0,
+                min_tone_purity: PURITY_MFSK,
+                rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(3.0), 16)),
+                rx_band_order: 2,
+                rx_track_timing: true,
+                acquisition: Acquisition::FirstSymbol,
+            }),
             amplitude: DEFAULT_AMPLITUDE,
-            tone_base_hz: 2500.0,
-            tone_step_hz: orthogonal_step_hz(3.0),
-            n_tones: 16,
-            preamble: vec![0xA, 0x5],
-            min_confidence_db: 2.0,
-            min_tone_purity: PURITY_MFSK,
             min_rms_dbfs: -60.0,
-            rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(3.0), 16)),
-            rx_band_order: 2,
-            rx_track_timing: true,
             repetition_k: 1,
             interleave_depth: 4,
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
-            acquisition: Acquisition::FirstSymbol,
             digital_detect: false,
             link_key: DEFAULT_LINK_KEY,
         }
@@ -403,9 +346,7 @@ impl PhyConfig {
         Self::ltc_with_bit_rate(4800)
     }
 
-    /// BMC profile at `bit_rate` bit/s (spec §6.5: 2400, 4800 or 9600). The symbol fields describe
-    /// one nibble (4 bits) so generic helpers stay meaningful; the MFSK-only
-    /// fields (tones, preamble, purity) are unused.
+    /// BMC profile at `bit_rate` bit/s (spec §6.5: 2400, 4800 or 9600).
     pub fn ltc_with_bit_rate(bit_rate: u32) -> Self {
         // `BmcParams::new` clamps the bit rate (`bmc::BIT_RATE_RANGE`).
         let params = BmcParams::new(bit_rate);
@@ -422,28 +363,13 @@ impl PhyConfig {
         Self {
             sample_rate_hz: 48_000,
             modulation: Modulation::Bmc(params),
-            symbol_duration_ms: 4000.0 / bit_rate as f32,
-            guard_gap_ms: 0.0,
-            attack_ms: 0.0,
-            release_ms: 0.0,
-            raised_cosine_ramps: false,
             amplitude: DEFAULT_AMPLITUDE,
-            tone_base_hz: 0.0,
-            tone_step_hz: 0.0,
-            n_tones: 0,
-            preamble: Vec::new(),
-            min_confidence_db: 0.0,
-            min_tone_purity: 0.0,
             min_rms_dbfs: -60.0,
-            rx_band_hz: None,
-            rx_band_order: 2,
-            rx_track_timing: false,
             repetition_k: 1,
             interleave_depth: 4,
             link_dead_ms,
             heartbeat_interval_ms,
             fec: FecMode::None,
-            acquisition: Acquisition::FirstSymbol,
             digital_detect: false,
             link_key: DEFAULT_LINK_KEY,
         }
@@ -458,29 +384,21 @@ impl PhyConfig {
 
     /// BMC profile at `bit_rate` bit/s with the RS16 parity-4 body.
     pub fn ltc_fec_with_bit_rate(bit_rate: u32) -> Self {
-        Self {
-            fec: FecMode::Rs16 { parity: 4 },
-            ..Self::ltc_with_bit_rate(bit_rate)
-        }
+        Self::ltc_with_bit_rate(bit_rate).with_fec(FecMode::Rs16 { parity: 4 })
     }
 
     /// Fast LTC profile for clean digital lines (Dante, MADI, AES; not part
     /// of spec §6.5 yet): BMC at `bit_rate` with [`BmcParams::fast`],
     /// uncoded 16-nibble body. `ltc14400` is 14400 bit/s.
     pub fn ltc_fast_with_bit_rate(bit_rate: u32) -> Self {
-        Self {
-            modulation: Modulation::Bmc(BmcParams::fast(bit_rate)),
-            ..Self::ltc_with_bit_rate(bit_rate)
-        }
+        Self::ltc_with_bit_rate(bit_rate)
+            .with_modulation(Modulation::Bmc(BmcParams::fast(bit_rate)))
     }
 
     /// [`ltc_fast_with_bit_rate`](Self::ltc_fast_with_bit_rate) with the
     /// RS16 parity-4 body (`ltc14400_fec`; user-facing name `digital-line`).
     pub fn ltc_fast_fec_with_bit_rate(bit_rate: u32) -> Self {
-        Self {
-            fec: FecMode::Rs16 { parity: 4 },
-            ..Self::ltc_fast_with_bit_rate(bit_rate)
-        }
+        Self::ltc_fast_with_bit_rate(bit_rate).with_fec(FecMode::Rs16 { parity: 4 })
     }
 
     /// **Digital** (experimental, `docs/proposals/digital-transparent.md`;
@@ -488,35 +406,18 @@ impl PhyConfig {
     /// directly in PCM sample values for
     /// bit-transparent digital paths (Dante / AES67 / MADI / AES3 without
     /// processing, USB interfaces in bit-exact mode). A frame is 21 samples
-    /// at a peak of −57.4 dBFS, sent twice back to back (K = 2). The symbol
-    /// fields describe one sample so generic helpers stay meaningful; the
-    /// MFSK-only fields are unused.
+    /// at a peak of −57.4 dBFS, sent twice back to back (K = 2).
     pub fn digital() -> Self {
         Self {
             sample_rate_hz: 48_000,
-            modulation: Modulation::Digital,
-            symbol_duration_ms: 1000.0 / 48_000.0,
-            guard_gap_ms: 0.0,
-            attack_ms: 0.0,
-            release_ms: 0.0,
-            raised_cosine_ramps: false,
+            modulation: Modulation::Digital(DigitalParams::default()),
             amplitude: super::digital::PEAK,
-            tone_base_hz: 0.0,
-            tone_step_hz: 0.0,
-            n_tones: 0,
-            preamble: Vec::new(),
-            min_confidence_db: 0.0,
-            min_tone_purity: 0.0,
             min_rms_dbfs: -120.0,
-            rx_band_hz: None,
-            rx_band_order: 2,
-            rx_track_timing: false,
             repetition_k: 2,
             interleave_depth: 4,
             link_dead_ms: 500,
             heartbeat_interval_ms: 100,
             fec: FecMode::None,
-            acquisition: Acquisition::FirstSymbol,
             digital_detect: true,
             link_key: DEFAULT_LINK_KEY,
         }
@@ -560,11 +461,25 @@ impl PhyConfig {
         Some(format!("{}{}", info.name, suffix))
     }
 
-    /// Set the transmit level (peak, dBFS; 0 = full scale) of an MFSK or
-    /// BMC profile. The `digital` profile's level is part of its wire
-    /// format and is left unchanged.
+    /// A builder starting from the default profile ([`robust`](Self::robust)).
+    pub fn builder() -> PhyConfigBuilder {
+        PhyConfigBuilder {
+            config: Self::default(),
+        }
+    }
+
+    /// A builder starting from this profile.
+    pub fn into_builder(self) -> PhyConfigBuilder {
+        PhyConfigBuilder { config: self }
+    }
+
+    // --- Adjustments -------------------------------------------------------
+
+    /// Set the transmit level (peak, dBFS; 0 = full scale). Left unchanged
+    /// on a phy whose level is part of its wire format (the `digital`
+    /// profile; [`PhyFactory::fixed_tx_level`](super::PhyFactory::fixed_tx_level)).
     pub fn with_tx_level_dbfs(mut self, dbfs: f32) -> Self {
-        if !matches!(self.modulation, Modulation::Digital) {
+        if !self.modulation.phy().fixed_tx_level() {
             self.amplitude = amplitude_from_dbfs(dbfs);
         }
         self
@@ -592,47 +507,155 @@ impl PhyConfig {
         self.link_key != DEFAULT_LINK_KEY
     }
 
+    /// Replace the modulation (the phy and its parameters).
+    pub fn with_modulation(mut self, modulation: Modulation) -> Self {
+        self.modulation = modulation;
+        self
+    }
+
+    /// Set the body FEC mode (spec §4.6).
+    pub fn with_fec(mut self, fec: FecMode) -> Self {
+        self.fec = fec;
+        self
+    }
+
+    /// Set the repetition count K (spec §4.4; 0 is treated as 1).
+    pub fn with_repetition_k(mut self, repetition_k: usize) -> Self {
+        self.repetition_k = repetition_k;
+        self
+    }
+
+    /// Set the peak transmit amplitude directly (see
+    /// [`with_tx_level_dbfs`](Self::with_tx_level_dbfs)).
+    pub fn with_amplitude(mut self, amplitude: f32) -> Self {
+        self.amplitude = amplitude;
+        self
+    }
+
+    /// Set the link-dead timeout (spec §5.3).
+    pub fn with_link_dead_ms(mut self, link_dead_ms: u32) -> Self {
+        self.link_dead_ms = link_dead_ms;
+        self
+    }
+
+    /// Set the heartbeat interval (spec §5.5).
+    pub fn with_heartbeat_interval_ms(mut self, heartbeat_interval_ms: u32) -> Self {
+        self.heartbeat_interval_ms = heartbeat_interval_ms;
+        self
+    }
+
+    /// Set the block interleave depth of an uncoded body (spec §4.3).
+    pub fn with_interleave_depth(mut self, interleave_depth: usize) -> Self {
+        self.interleave_depth = interleave_depth;
+        self
+    }
+
+    /// Set the receiver's silence floor, dBFS.
+    pub fn with_min_rms_dbfs(mut self, min_rms_dbfs: f32) -> Self {
+        self.min_rms_dbfs = min_rms_dbfs;
+        self
+    }
+
+    /// Run the digital-frame detector next to this profile's receiver (the
+    /// `+digital` suffix of [`from_name`](Self::from_name)).
+    pub fn with_digital_detect(mut self, digital_detect: bool) -> Self {
+        self.digital_detect = digital_detect;
+        self
+    }
+
+    /// Adjust the MFSK parameters in place; a no-op for other modulations.
+    pub fn map_mfsk(mut self, f: impl FnOnce(&mut MfskParams)) -> Self {
+        if let Some(p) = self.modulation.mfsk_mut() {
+            f(p);
+        }
+        self
+    }
+
+    /// Adjust the BMC parameters in place; a no-op for other modulations.
+    pub fn map_bmc(mut self, f: impl FnOnce(&mut BmcParams)) -> Self {
+        if let Some(p) = self.modulation.bmc_mut() {
+            f(p);
+        }
+        self
+    }
+
+    // --- The phy's parameters ---------------------------------------------
+
+    /// The MFSK parameters, if this is an MFSK profile.
+    pub fn mfsk(&self) -> Option<&MfskParams> {
+        self.modulation.mfsk()
+    }
+
+    pub fn mfsk_mut(&mut self) -> Option<&mut MfskParams> {
+        self.modulation.mfsk_mut()
+    }
+
+    /// The BMC parameters, if this is an LTC profile.
+    pub fn bmc(&self) -> Option<&BmcParams> {
+        self.modulation.bmc()
+    }
+
+    pub fn bmc_mut(&mut self) -> Option<&mut BmcParams> {
+        self.modulation.bmc_mut()
+    }
+
+    /// How the packet bytes are laid out in the body
+    /// ([`PhyFactory::body_coding`](super::PhyFactory::body_coding)):
+    /// padded and interleaved, FEC-coded, or the phy's own frames.
+    pub fn body_coding(&self) -> BodyCoding {
+        self.modulation.phy().body_coding(self)
+    }
+
+    /// Nibbles of one body on the wire (16, or the coded length).
+    pub fn body_nibbles(&self) -> usize {
+        self.body_coding().body_nibbles()
+    }
+
+    /// The phy needs a bit-transparent audio path (the `digital` profile).
+    pub fn needs_bit_exact_path(&self) -> bool {
+        self.modulation.phy().needs_bit_exact_path()
+    }
+
     /// Estimated first-copy on-wire duration for a max-size body (16 nibbles,
     /// or the FEC-coded body length) + preamble.
     pub fn estimated_first_copy_ms(&self) -> f32 {
-        let body_nibbles = self.fec.body_nibbles();
-        match &self.modulation {
-            Modulation::Bmc(p) => return p.frame_ms(body_nibbles),
-            Modulation::Digital => {
-                return super::digital::MAX_FRAME_SAMPLES as f32 * 1000.0
-                    / self.sample_rate_hz as f32
-            }
-            Modulation::Mfsk => {}
-        }
-        let symbols = self.preamble.len() + self.body_symbols();
-        let period_ms = self.symbol_duration_ms + self.guard_gap_ms;
-        symbols as f32 * period_ms
+        self.modulation
+            .phy()
+            .first_copy_ms(self, self.body_nibbles())
     }
 
-    /// Bits one MFSK symbol carries: 4 with 16 tones, 3 with 8
+    /// Bits one wire symbol carries: 4 with 16 tones, 3 with 8
     /// ([`super::pack`]). 4 for the non-MFSK profiles (one nibble).
     pub fn bits_per_symbol(&self) -> u32 {
-        match self.modulation {
-            Modulation::Mfsk => super::pack::bits_per_symbol(self.n_tones),
-            _ => 4,
-        }
+        self.modulation.phy().bits_per_symbol(self)
     }
 
     /// Symbols of one body on the wire: the body nibbles
-    /// ([`FecMode::body_nibbles`]) repacked into
+    /// ([`body_nibbles`](Self::body_nibbles)) repacked into
     /// [`bits_per_symbol`](Self::bits_per_symbol)-bit symbols (22 → 30 on
     /// an 8-tone plan; equal to the nibble count on 16 tones and on the
     /// non-MFSK profiles).
     pub fn body_symbols(&self) -> usize {
-        super::pack::symbols_for_nibbles(self.fec.body_nibbles(), self.bits_per_symbol())
+        super::pack::symbols_for_nibbles(self.body_nibbles(), self.bits_per_symbol())
+    }
+
+    /// Duration of one body symbol on the wire, ms: a tone on MFSK, one
+    /// nibble (four bit cells) on BMC, one sample on `digital`.
+    pub fn symbol_duration_ms(&self) -> f32 {
+        self.modulation.phy().symbol_duration_ms(self)
+    }
+
+    /// Silence between symbols, ms (MFSK only; 0 elsewhere).
+    pub fn guard_gap_ms(&self) -> f32 {
+        self.modulation.phy().guard_gap_ms(self)
     }
 
     pub fn symbol_samples(&self) -> usize {
-        libm::roundf((self.symbol_duration_ms / 1000.0) * self.sample_rate_hz as f32) as usize
+        libm::roundf((self.symbol_duration_ms() / 1000.0) * self.sample_rate_hz as f32) as usize
     }
 
     pub fn gap_samples(&self) -> usize {
-        libm::roundf((self.guard_gap_ms / 1000.0) * self.sample_rate_hz as f32) as usize
+        libm::roundf((self.guard_gap_ms() / 1000.0) * self.sample_rate_hz as f32) as usize
     }
 
     pub fn samples_per_symbol_period(&self) -> usize {
@@ -643,18 +666,145 @@ impl PhyConfig {
         (self.symbol_samples() / 4).max(1)
     }
 
-    /// The receiver band ([`rx_band_hz`](Self::rx_band_hz)) that fits
+    /// The MFSK preamble, as tone indices (empty for other phys).
+    pub fn preamble(&self) -> &[u8] {
+        self.mfsk().map_or(&[], |p| p.preamble.as_slice())
+    }
+
+    /// Tones in the MFSK alphabet (0 for other phys).
+    pub fn n_tones(&self) -> usize {
+        self.mfsk().map_or(0, |p| p.n_tones)
+    }
+
+    /// The MFSK receiver band ([`MfskParams::rx_band_hz`]; `None` for other
+    /// phys).
+    pub fn rx_band_hz(&self) -> Option<(f32, f32)> {
+        self.mfsk().and_then(|p| p.rx_band_hz)
+    }
+
+    /// Order of each side of the MFSK receiver band filter (2 for other
+    /// phys).
+    pub fn rx_band_order(&self) -> u8 {
+        self.mfsk().map_or(2, |p| p.rx_band_order)
+    }
+
+    /// The MFSK detection gate, dB (0 for other phys).
+    pub fn min_confidence_db(&self) -> f32 {
+        self.mfsk().map_or(0.0, |p| p.min_confidence_db)
+    }
+
+    /// The receiver band ([`MfskParams::rx_band_hz`]) that fits
     /// this profile's tone plan, or `None` for a profile without tones.
     pub fn default_rx_band_hz(&self) -> Option<(f32, f32)> {
-        (self.n_tones > 0).then(|| mfsk_rx_band(self.tone_base_hz, self.tone_step_hz, self.n_tones))
+        self.mfsk().and_then(|p| p.default_rx_band_hz())
     }
 
+    /// Frequency of MFSK tone `index` (0 for other phys).
     pub fn tone_hz(&self, index: u8) -> f32 {
-        self.tone_base_hz + (index as f32) * self.tone_step_hz
+        self.mfsk().map_or(0.0, |p| p.tone_hz(index))
     }
 
+    /// The MFSK tone plan (empty for other phys).
     pub fn tone_table(&self) -> Vec<f32> {
-        (0..self.n_tones as u8).map(|i| self.tone_hz(i)).collect()
+        self.mfsk().map_or_else(Vec::new, |p| p.tone_table())
+    }
+}
+
+/// Builds a [`PhyConfig`] step by step from a profile
+/// ([`PhyConfig::builder`], [`PhyConfig::into_builder`]).
+///
+/// ```
+/// use cricket_core::link::FecMode;
+/// use cricket_core::phy::PhyConfig;
+/// let config = PhyConfig::builder()
+///     .fec(FecMode::Rs16 { parity: 2 })
+///     .repetition_k(2)
+///     .tx_level_dbfs(-20.0)
+///     .mfsk(|p| p.rx_track_timing = false)
+///     .build();
+/// assert_eq!(config.fec.body_nibbles(), 18);
+/// ```
+#[derive(Debug, Clone)]
+pub struct PhyConfigBuilder {
+    config: PhyConfig,
+}
+
+impl PhyConfigBuilder {
+    pub fn modulation(mut self, modulation: Modulation) -> Self {
+        self.config.modulation = modulation;
+        self
+    }
+
+    pub fn sample_rate_hz(mut self, sample_rate_hz: u32) -> Self {
+        self.config.sample_rate_hz = sample_rate_hz;
+        self
+    }
+
+    pub fn amplitude(mut self, amplitude: f32) -> Self {
+        self.config.amplitude = amplitude;
+        self
+    }
+
+    /// See [`PhyConfig::with_tx_level_dbfs`].
+    pub fn tx_level_dbfs(mut self, dbfs: f32) -> Self {
+        self.config = self.config.with_tx_level_dbfs(dbfs);
+        self
+    }
+
+    pub fn min_rms_dbfs(mut self, min_rms_dbfs: f32) -> Self {
+        self.config.min_rms_dbfs = min_rms_dbfs;
+        self
+    }
+
+    pub fn repetition_k(mut self, repetition_k: usize) -> Self {
+        self.config.repetition_k = repetition_k;
+        self
+    }
+
+    pub fn interleave_depth(mut self, interleave_depth: usize) -> Self {
+        self.config.interleave_depth = interleave_depth;
+        self
+    }
+
+    pub fn link_dead_ms(mut self, link_dead_ms: u32) -> Self {
+        self.config.link_dead_ms = link_dead_ms;
+        self
+    }
+
+    pub fn heartbeat_interval_ms(mut self, heartbeat_interval_ms: u32) -> Self {
+        self.config.heartbeat_interval_ms = heartbeat_interval_ms;
+        self
+    }
+
+    pub fn fec(mut self, fec: FecMode) -> Self {
+        self.config.fec = fec;
+        self
+    }
+
+    pub fn digital_detect(mut self, digital_detect: bool) -> Self {
+        self.config.digital_detect = digital_detect;
+        self
+    }
+
+    pub fn link_key(mut self, link_key: u16) -> Self {
+        self.config.link_key = link_key;
+        self
+    }
+
+    /// Adjust the MFSK parameters (no-op for other modulations).
+    pub fn mfsk(mut self, f: impl FnOnce(&mut MfskParams)) -> Self {
+        self.config = self.config.map_mfsk(f);
+        self
+    }
+
+    /// Adjust the BMC parameters (no-op for other modulations).
+    pub fn bmc(mut self, f: impl FnOnce(&mut BmcParams)) -> Self {
+        self.config = self.config.map_bmc(f);
+        self
+    }
+
+    pub fn build(self) -> PhyConfig {
+        self.config
     }
 }
 
@@ -942,7 +1092,7 @@ mod tests {
             let y = PhyConfig::from_name(b).unwrap_or_else(|| panic!("{b}"));
             assert_eq!(x.fec, y.fec, "{a} {b}");
             assert_eq!(x.repetition_k, y.repetition_k, "{a} {b}");
-            assert_eq!(x.symbol_duration_ms, y.symbol_duration_ms, "{a} {b}");
+            assert_eq!(x.symbol_duration_ms(), y.symbol_duration_ms(), "{a} {b}");
             assert_eq!(x.amplitude, y.amplitude, "{a} {b}");
         }
         assert_eq!(
@@ -1040,20 +1190,26 @@ mod tests {
     fn hf_profiles_are_robust_moved_up() {
         let hf = PhyConfig::hf_robust();
         let r = PhyConfig::robust();
-        assert_eq!(hf.symbol_duration_ms, r.symbol_duration_ms);
-        assert_eq!(hf.guard_gap_ms, r.guard_gap_ms);
-        assert_eq!(hf.preamble, r.preamble);
+        assert_eq!(hf.symbol_duration_ms(), r.symbol_duration_ms());
+        assert_eq!(hf.guard_gap_ms(), r.guard_gap_ms());
+        assert_eq!(hf.preamble(), r.preamble());
         assert_eq!(hf.fec, r.fec);
-        assert_eq!(hf.acquisition, r.acquisition);
+        assert_eq!(
+            hf.mfsk().unwrap().acquisition,
+            r.mfsk().unwrap().acquisition
+        );
         assert_eq!(hf.repetition_k, 1);
         assert_eq!((hf.heartbeat_interval_ms, hf.link_dead_ms), (500, 2000));
-        assert_eq!(hf.tone_step_hz, r.tone_step_hz);
+        assert_eq!(
+            hf.mfsk().unwrap().tone_step_hz,
+            r.mfsk().unwrap().tone_step_hz
+        );
         assert_eq!(hf.tone_hz(0), 19_000.0);
         assert!((hf.tone_hz(15) - 21_500.0).abs() < 0.01);
         assert!((hf.tone_hz(6) - 20_000.0).abs() < 0.01);
         assert!((hf.tx_level_dbfs() - HF_TX_LEVEL_DBFS).abs() < 0.05);
-        assert_eq!(hf.rx_band_hz, Some(HF_RX_BAND_HZ));
-        assert_eq!(hf.rx_band_order, 8);
+        assert_eq!(hf.rx_band_hz(), Some(HF_RX_BAND_HZ));
+        assert_eq!(hf.rx_band_order(), 8);
         assert_eq!(hf.estimated_first_copy_ms(), r.estimated_first_copy_ms());
         // Every tone is a whole Goertzel bin of the 288-sample window.
         for k in 0..16u8 {
@@ -1069,7 +1225,7 @@ mod tests {
         assert!((hf96.tone_hz(15) - 29_000.0).abs() < 0.01);
         assert_eq!(hf96.fec, r.fec);
         assert!((hf96.estimated_first_copy_ms() - 78.0).abs() < 1e-3);
-        assert!(hf96.rx_band_hz.unwrap().0 > 22_050.0);
+        assert!(hf96.rx_band_hz().unwrap().0 > 22_050.0);
         // Catalog: the `instrument` tier, aliases, default level.
         let info = profile_info("hf-robust").unwrap();
         assert_eq!(info.name, "instrument");

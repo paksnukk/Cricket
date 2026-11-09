@@ -20,7 +20,7 @@ use cricket_core::modem::{
     refresh_quiet_samples, refresh_schedule, refresh_spacing_samples, repetition_samples,
     CricketModemTx,
 };
-use cricket_core::phy::{Modulation, PhyConfig};
+use cricket_core::phy::PhyConfig;
 use cricket_core::transport::{
     midi_input_filtered, MidiInput, MscFilter, TransportMessage, TxScheduler,
 };
@@ -190,7 +190,7 @@ const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     let name = PhyConfig::canonical_name(&cfg.profile).unwrap_or_else(|| cfg.profile.clone());
     let mut config = phy.with_link_key(cfg.link_key);
-    let digital = matches!(config.modulation, Modulation::Digital);
+    let digital = config.needs_bit_exact_path();
     if let Some(db) = cfg.tx_level_dbfs {
         if digital {
             ev.log("TX level ignored: the digital-bit-exact profile's level is fixed by its wire format.");
@@ -375,8 +375,7 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
             }
         }
 
-        let note_ons = core::mem::take(&mut scheduler.note_ons_dropped);
-        let others = core::mem::take(&mut scheduler.queue_dropped);
+        let (note_ons, others) = scheduler.take_dropped();
         if note_ons > 0 || others > 0 {
             dropped_total += u64::from(note_ons) + u64::from(others);
             let message = drop_message(note_ons, others, scheduler.max_note_ons(), &name);

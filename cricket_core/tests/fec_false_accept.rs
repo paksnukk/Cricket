@@ -25,7 +25,7 @@ use cricket_core::link::{
     crc16_ccitt, nibbles_to_bytes, BodySymbol, FecCodec, PROTOCOL_VERSION, SEQ_MODULUS,
 };
 use cricket_core::modem::{encode_to_samples, CricketModemTx};
-use cricket_core::phy::{PhyConfig, PhyRx, RxEvent};
+use cricket_core::phy::{PhyConfig, RxEvent};
 use cricket_core::transport::{MessageType, TransportMessage};
 use support::{ChannelSim, XorShift64};
 
@@ -226,10 +226,7 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
         ];
         v.insert(0, ("MFSK traffic", mfsk_traffic(seconds, 8, &mfsk)));
         // Misconfiguration: an uncoded LTC transmitter at the same bit rate.
-        let uncoded = PhyConfig {
-            fec: cricket_core::link::FecMode::None,
-            ..config.clone()
-        };
+        let uncoded = config.clone().with_fec(cricket_core::link::FecMode::None);
         v.push(("uncoded LTC traffic", bmc_traffic(&uncoded, seconds, 10)));
     } else {
         v.insert(
@@ -324,7 +321,7 @@ const OTHER_KEY: &str = "other-key traffic";
 /// counted. A decoded body is a false message (the audio holds no packet
 /// for this profile).
 fn run_false(config: &PhyConfig, audio: &[f32]) -> FalseStats {
-    let mut phy = PhyRx::new(config.clone());
+    let mut phy = config.modulation.phy().rx(config);
     let body_len = config.fec.body_nibbles();
     phy.set_expected_body_nibbles(body_len);
     let fec = FecCodec::new(config.fec).expect("FEC profile");
@@ -491,10 +488,7 @@ fn random_bodies_rarely_reach_the_crc() {
 #[test]
 fn worst_case_audio_rarely_reaches_the_crc() {
     let ltc_fec = PhyConfig::ltc_fec();
-    let uncoded = PhyConfig {
-        fec: cricket_core::link::FecMode::None,
-        ..ltc_fec.clone()
-    };
+    let uncoded = ltc_fec.clone().with_fec(cricket_core::link::FecMode::None);
     let mfsk = [
         PhyConfig::robust_repeat(),
         PhyConfig::fast(),

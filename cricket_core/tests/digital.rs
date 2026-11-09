@@ -112,7 +112,7 @@ fn score(sent: &[TransportMessage], got: &[TransportMessage]) -> (usize, usize) 
 #[test]
 fn profile_selection_and_airtime() {
     let c = PhyConfig::from_name("digital").unwrap();
-    assert!(matches!(c.modulation, Modulation::Digital));
+    assert!(matches!(c.modulation, Modulation::Digital(_)));
     assert_eq!(c.repetition_k, 2);
     assert!((c.estimated_first_copy_ms() - 21.0 / 48.0).abs() < 1e-4);
     assert_eq!(cricket_core::modem::repetition_samples(&c), 21);

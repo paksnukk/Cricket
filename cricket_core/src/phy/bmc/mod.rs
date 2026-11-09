@@ -79,24 +79,18 @@
 mod rx;
 mod tx;
 
+use super::config::PhyConfig;
+use super::traits::{BodyCoding, PhyFactory, PhyRx, PhyTx, RefreshPolicy};
+use alloc::boxed::Box;
 pub use rx::BmcRx;
 pub use tx::BmcTx;
 
-/// Physical-layer modulation selected by [`PhyConfig`](super::PhyConfig).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Modulation {
-    /// AML v1 MFSK-16 (Goertzel bank). Used by robust, robust_repeat and fast.
-    Mfsk,
-    /// Biphase-mark code (LTC-style, provisional), see the module docs.
-    Bmc(BmcParams),
-    /// Packet nibbles as PCM sample values (bit-transparent paths only,
-    /// experimental), see [`crate::phy::digital`].
-    Digital,
-}
-
 /// Parameters of the BMC phy. The wire parameters (spec §6.5) are
 /// `bit_rate`, `preamble_bits`, `postamble_bits`, `gap_bits` and
-/// `edge_frac`; the rest tune the reference receiver.
+/// `edge_frac`; the rest tune the reference receiver. Build one with
+/// [`BmcParams::new`] or [`BmcParams::fast`] and change fields; the struct
+/// may grow, so it cannot be built with a literal outside the crate.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct BmcParams {
     /// Bits per second (one bit = one BMC cell).
@@ -279,6 +273,54 @@ impl BmcParams {
     /// Burst duration in milliseconds (without the gap).
     pub fn frame_ms(&self, body_nibbles: usize) -> f32 {
         self.frame_half_cells(body_nibbles) as f32 * 500.0 / self.bit_rate as f32
+    }
+}
+
+impl PhyFactory for BmcParams {
+    fn name(&self) -> &str {
+        "bmc"
+    }
+
+    fn clone_box(&self) -> Box<dyn PhyFactory> {
+        Box::new(self.clone())
+    }
+
+    fn tx(&self, config: &PhyConfig) -> Box<dyn PhyTx> {
+        Box::new(BmcTx::new(config.clone()))
+    }
+
+    fn rx(&self, config: &PhyConfig) -> Box<dyn PhyRx> {
+        Box::new(BmcRx::new(config.clone()))
+    }
+
+    fn body_coding(&self, config: &PhyConfig) -> BodyCoding {
+        BodyCoding::from_fec(config.fec)
+    }
+
+    fn frame_samples(&self, config: &PhyConfig, body_nibbles: usize) -> usize {
+        BmcParams::frame_samples(self, config.sample_rate_hz, body_nibbles)
+    }
+
+    /// `gap_bits` cells of silence after each burst.
+    fn gap_samples(&self, config: &PhyConfig) -> usize {
+        BmcParams::gap_samples(self, config.sample_rate_hz)
+    }
+
+    /// One nibble: four bit cells.
+    fn symbol_duration_ms(&self, _config: &PhyConfig) -> f32 {
+        4000.0 / self.bit_rate as f32
+    }
+
+    fn first_copy_ms(&self, _config: &PhyConfig, body_nibbles: usize) -> f32 {
+        self.frame_ms(body_nibbles)
+    }
+
+    /// The first six free slots: a message is a few ms, so the repeats are
+    /// over before the next note is likely and a short dropout covers at
+    /// most one (measured on `ltc_fec`, the spread put a repeat where the
+    /// next note lands and moved the loopback p95 from 21 to 38 ms).
+    fn refresh_policy(&self, _config: &PhyConfig) -> RefreshPolicy {
+        RefreshPolicy::CONSECUTIVE
     }
 }
 

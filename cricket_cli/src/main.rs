@@ -702,7 +702,7 @@ fn run_hf_mix(
         written,
         PhyConfig::canonical_name(profile).unwrap_or_else(|| profile.to_string()),
         config.tone_hz(0) / 1000.0,
-        config.tone_hz(config.n_tones as u8 - 1) / 1000.0,
+        config.tone_hz(config.n_tones() as u8 - 1) / 1000.0,
         config.tx_level_dbfs(),
         samples.len() / rate as usize,
         wav_in,
@@ -729,12 +729,12 @@ fn run_hf_scan(wav_in: &str, profile: &str, link_key: u16) -> Result<()> {
         rate,
         PhyConfig::canonical_name(profile).unwrap_or_else(|| profile.to_string()),
         config.tone_hz(0) / 1000.0,
-        config.tone_hz(config.n_tones as u8 - 1) / 1000.0
+        config.tone_hz(config.n_tones() as u8 - 1) / 1000.0
     );
     // Level in the receiver's band and overall, for judging the rig.
     let (band_rms, full_rms, peak) = {
-        let mut band = config.rx_band_hz.map(|(lo, hi)| {
-            cricket_core::phy::BandPass::with_order(lo, hi, config.rx_band_order as usize, rate)
+        let mut band = config.rx_band_hz().map(|(lo, hi)| {
+            cricket_core::phy::BandPass::with_order(lo, hi, config.rx_band_order() as usize, rate)
         });
         let mut e_band = 0f64;
         let mut e_full = 0f64;
@@ -787,8 +787,8 @@ fn run_hf_scan(wav_in: &str, profile: &str, link_key: u16) -> Result<()> {
          (tones at −30 dBFS peak measure about −33 dBFS when the line is on).",
         rms_to_dbfs(full_rms),
         rms_to_dbfs(peak / 2f32.sqrt()) + 3.0,
-        config.rx_band_hz.map_or(0.0, |b| b.0 / 1000.0),
-        config.rx_band_hz.map_or(0.0, |b| b.1 / 1000.0),
+        config.rx_band_hz().map_or(0.0, |b| b.0 / 1000.0),
+        config.rx_band_hz().map_or(0.0, |b| b.1 / 1000.0),
         rms_to_dbfs(band_rms)
     );
     if count == 0 {
@@ -1534,6 +1534,8 @@ impl Monitor {
                 json!({ "event": "tx_status", "queued": queued, "latency_ms": latency_ms, "dropped": dropped })
             }
             EngineEvent::Stopped => json!({ "event": "stopped" }),
+            // An event this CLI predates.
+            _ => return,
         };
         self.emit_json(value);
     }
@@ -1555,6 +1557,8 @@ impl Monitor {
             }
             EngineEvent::Stopped => self.print("[STOPPED]"),
             EngineEvent::Level(_) | EngineEvent::Stats(_) | EngineEvent::TxStatus { .. } => {}
+            // An event this CLI predates.
+            _ => {}
         }
     }
 

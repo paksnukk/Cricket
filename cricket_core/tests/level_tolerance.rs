@@ -150,7 +150,7 @@ fn tone_soup(seconds: usize, sample_rate: u32, grid: Option<&PhyConfig>, seed: u
     let mut phase = 0.0f32;
     while out.len() < total {
         let freq = match grid {
-            Some(cfg) => cfg.tone_hz(rng.below(cfg.n_tones) as u8),
+            Some(cfg) => cfg.tone_hz(rng.below(cfg.n_tones()) as u8),
             None => 2000.0 + 4000.0 * rng.next_f64() as f32,
         };
         let amp = 0.05 + 0.75 * rng.next_f64() as f32;

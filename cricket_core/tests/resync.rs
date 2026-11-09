@@ -40,7 +40,7 @@ fn first_body_error(config: &PhyConfig, offset: usize, chunk: usize) -> Option<i
     let mut rx = ModemRx::new(config.clone());
     rx.set_expected_body_nibbles(MAX_BODY_NIBBLES);
     let period = config.samples_per_symbol_period();
-    let truth = (offset + (config.preamble.len() + 1) * period) as i64;
+    let truth = (offset + (config.preamble().len() + 1) * period) as i64;
     for c in audio.chunks(chunk) {
         for ev in rx.push_samples(c) {
             if let RxEvent::BodyNibble { end_sample, .. } = ev {
@@ -119,7 +119,7 @@ fn false_preamble_lock_before_packet_recovers() {
                 for (offset, chunk) in [(0usize, 4096usize), (37, 64), (period / 2, 240)] {
                     total += 1;
                     let mut audio = vec![0.0; offset + 500];
-                    audio.extend(tone(&config, config.preamble[0], burst_len, phase));
+                    audio.extend(tone(&config, config.preamble()[0], burst_len, phase));
                     audio.extend_from_slice(&packet);
                     let got = decode_chunked(config.clone(), &audio, chunk);
                     if got != [msg.clone()] {
@@ -179,7 +179,7 @@ fn failed_body_decode_rewinds_to_packet_inside_it() {
             for (lead, chunk) in [(0usize, 4096usize), (37, 64), (period / 2, 240)] {
                 total += 1;
                 // Spurious preamble + `kept` body symbols, then the real packet.
-                let cut = (config.preamble.len() + kept) * period;
+                let cut = (config.preamble().len() + kept) * period;
                 let mut audio = vec![0.0; lead + 500];
                 audio.extend_from_slice(&spurious[..cut]);
                 audio.extend_from_slice(&packet);

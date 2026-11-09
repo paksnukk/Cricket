@@ -60,6 +60,7 @@ const _: () = assert!(WHITENING.len() >= CODEWORDS * RS16_MAX_N);
 pub const MAX_PARITY: u8 = (RS16_MAX_N - K) as u8;
 
 /// Forward-error-correction scheme applied to the packet body.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FecMode {
     /// Uncoded body: 16 nibbles, block-interleaved (spec §4.3).

@@ -8,7 +8,7 @@ use cricket_core::modem::{
     decode_samples, encode_to_samples, CricketModemRx, CricketModemTx, ModemOutput,
     MAX_BODY_NIBBLES,
 };
-use cricket_core::phy::{LinkState, PhyConfig, PhyTx, LOCK_HOLD_MS};
+use cricket_core::phy::{LinkState, PhyConfig, LOCK_HOLD_MS};
 use cricket_core::transport::TransportMessage;
 
 fn all_profiles() -> Vec<(&'static str, PhyConfig)> {
@@ -99,7 +99,7 @@ fn reserved_type_nibble_counts_as_crc_fail() {
         nibbles.resize(MAX_BODY_NIBBLES, 0);
         let body = interleave(&nibbles, config.interleave_depth);
         let mut audio = vec![0.0f32; 500];
-        audio.extend(PhyTx::new(config.clone()).synthesize_framed(&body));
+        audio.extend(config.modulation.phy().tx(&config).synthesize_framed(&body));
         audio.extend(vec![0.0; config.sample_rate_hz as usize / 4]);
         let mut rx = CricketModemRx::new(config.clone());
         let got = push_chunked(&mut rx, &audio);

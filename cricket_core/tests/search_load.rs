@@ -29,7 +29,7 @@ fn preamble_tones(config: &PhyConfig, seconds: usize) -> Vec<f32> {
     let period = config.samples_per_symbol_period();
     let n = config.sample_rate_hz as usize * seconds / period + 1;
     let symbols: Vec<u8> = (0..n)
-        .map(|i| config.preamble[i % config.preamble.len()])
+        .map(|i| config.preamble()[i % config.preamble().len()])
         .collect();
     tx.synthesize_nibbles(&symbols)
 }
@@ -65,8 +65,8 @@ fn preamble_tones_fail_each_body_at_most_twice() {
     for (name, config) in profiles() {
         let audio = preamble_tones(&config, seconds);
         let period = config.samples_per_symbol_period();
-        let occurrences = audio.len() / (period * config.preamble.len()) + 1;
-        let per_occurrence = match config.acquisition {
+        let occurrences = audio.len() / (period * config.preamble().len()) + 1;
+        let per_occurrence = match config.mfsk().expect("MFSK profile").acquisition {
             Acquisition::FirstSymbol => 1,
             Acquisition::Joint { .. } => 2,
         };

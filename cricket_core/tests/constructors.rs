@@ -48,9 +48,9 @@ fn bmc_bit_rate_is_clamped_without_panic() {
             // The symbol fields follow the clamped rate (4 bits per nibble).
             let want_ms = 4000.0 / rate as f32;
             assert!(
-                (config.symbol_duration_ms - want_ms).abs() < 1e-3,
+                (config.symbol_duration_ms() - want_ms).abs() < 1e-3,
                 "{raw}: symbol {} ms, want {want_ms}",
-                config.symbol_duration_ms
+                config.symbol_duration_ms()
             );
             assert!(config.estimated_first_copy_ms().is_finite());
             // TX and RX are constructed and run without panicking.
@@ -102,7 +102,7 @@ fn fec_parity_is_clamped_without_panic() {
         assert_eq!(mode.body_nibbles(), 2 * (7 + want), "parity {parity}");
         assert_eq!(mode.max_body_erasures(), 2 * want, "parity {parity}");
         for base in [PhyConfig::robust(), PhyConfig::ltc()] {
-            let config = PhyConfig { fec: mode, ..base };
+            let config = base.with_fec(mode);
             // Both constructors used to reach `Rs16::new`'s assertion.
             let mut tx = CricketModemTx::new(config.clone());
             let audio = tx.encode_message(&note());

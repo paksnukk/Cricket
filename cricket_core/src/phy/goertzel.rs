@@ -162,7 +162,7 @@ mod tests {
         let interleaved = interleave(&nibbles, config.interleave_depth);
 
         let mut all_syms = Vec::new();
-        all_syms.extend_from_slice(&config.preamble);
+        all_syms.extend_from_slice(config.preamble());
         all_syms.extend_from_slice(&interleaved);
 
         let tx = ModemTx::new(config.clone());

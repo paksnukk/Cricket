@@ -57,14 +57,11 @@ fn profile(key: &str) -> PhyConfig {
             "" => 4800,
             r => r.parse().expect("bit rate"),
         };
-        PhyConfig {
-            fec: if parity == 0 {
-                FecMode::None
-            } else {
-                FecMode::Rs16 { parity }
-            },
-            ..PhyConfig::ltc_with_bit_rate(rate)
-        }
+        PhyConfig::ltc_with_bit_rate(rate).with_fec(if parity == 0 {
+            FecMode::None
+        } else {
+            FecMode::Rs16 { parity }
+        })
     };
     if let Some(sr) = sr {
         config = config.with_sample_rate(sr);
@@ -879,11 +876,11 @@ struct PhyCell {
 }
 
 fn run_phy_cell(config: &PhyConfig, imp: Imp, trials: usize, seed: u64) -> PhyCell {
-    use cricket_core::phy::{PhyRx, PhyTx, RxEvent};
+    use cricket_core::phy::RxEvent;
     let mut rng = XorShift64::new(seed);
     let sr = config.sample_rate_hz as f64;
     let n_body = config.fec.body_nibbles();
-    let tx = PhyTx::new(config.clone());
+    let tx = config.modulation.phy().tx(config);
     let mut cell = PhyCell {
         trials,
         ..PhyCell::default()
@@ -898,7 +895,7 @@ fn run_phy_cell(config: &PhyConfig, imp: Imp, trials: usize, seed: u64) -> PhyCe
         ));
         clean = imp.path(&clean, sr, rng.next_f64());
         let audio = imp.sim(config, rng.next_u64(), offset).apply(&clean);
-        let mut rx = PhyRx::new(config.clone());
+        let mut rx = config.modulation.phy().rx(config);
         rx.set_expected_body_nibbles(n_body);
         let mut got: Vec<(u8, f32)> = Vec::new();
         let mut best: Option<Vec<(u8, f32)>> = None;
