@@ -10,8 +10,10 @@ promises; the order is. Versioning: the whole workspace carries one version, the
   original icon, Keep-a-Changelog, spec status header and versioning policy, docs index and history,
   scaffolding (CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, NOTICE, templates, CODEOWNERS, Dependabot),
   CI matrix, release workflow, supply-chain checks.
-- Bugs confirmed by the review (A1–A6) and the stage-dangerous defaults (B1–B4, B8–B10): landed in
-  parallel by the core and engine/CLI/GUI work; see the Unreleased changelog.
+- Stage-safe defaults and user-facing profile names (review B1–B4, B8–B10, C7): unknown profile is an
+  error, test scale opt-in, fail-safe on Stop, −12 dBFS default TX level, channel selection, alarm
+  list, dBFS meter and link traffic light, CLI status line / `--json` / `cricket profiles`.
+- Bugs confirmed by the review (A1–A6), landed by the core work; see the Unreleased changelog.
 
 ## Sprint 2 — protocol improvements → tag v0.2.0
 
@@ -22,8 +24,8 @@ release a revision bump is enough" (spec header). Each step is measured in the s
 - NoteOff refreshes spread exponentially, NoteOn precedence (C2).
 - Link key as CRC seed + optional level squelch, so two Cricket links on one stage cannot accept each
   other's packets (C3; wire change).
-- Chord / overload policy per profile (C4), fail-safe timing per profile (C6), TX default level
-  −12 dBFS (C7), best-guess decoding of uncoded packets (C8), MSC ahead of NoteOff (C9).
+- Chord / overload policy per profile (C4), fail-safe timing per profile (C6), best-guess decoding of
+  uncoded packets (C8), MSC ahead of NoteOff (C9).
 - Receiver rate limit against preamble-like input (A7). Simulator realism: programme material, dynamics
   processors, bursty loss, held-out test set (C10).
 - Possibly orthogonal tone spacing 1/T (C5) — only with a measured gain, and before the tag.
@@ -56,8 +58,9 @@ As soon as hardware is available. Logging per symbol and per packet to CSV first
 - Engine pass-through node (audio in → process → audio out).
 - Fuzz targets for packet parsing, Reed–Solomon, MSC and the receiver streams.
 - Spec move to `docs/spec/aml-v1.md` once all links can be updated in one change.
-- GUI: user-facing profile names with aliases, status traffic light, honest latency figures in the
-  menu, alarm list with acknowledgement, MIDI monitor, a non-null CSP once verified in `tauri dev`.
+- GUI: a MIDI monitor, counters for dropped / rejected messages, a non-null CSP once verified in
+  `tauri dev` (profile names, traffic light, honest latency figures and the alarm list landed in
+  Sprint 1).
 
 ### Chores
 
