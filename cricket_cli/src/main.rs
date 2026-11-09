@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use cricket_core::modem::repetition_samples;
 use cricket_core::modem::{CricketModemRx, CricketModemTx, ModemOutput};
-use cricket_core::pathcheck::{self, PathImpairment, PathReport, Verdict};
+use cricket_core::pathcheck::{self, PathReport, Verdict};
 use cricket_core::phy::{
     PhyConfig, ProfileInfo, ProfileTier, DEFAULT_PROFILE, DEFAULT_TX_LEVEL_DBFS, HF_TX_LEVEL_DBFS,
     PROFILES,
@@ -18,6 +18,7 @@ use cricket_engine::{
     LinkLight, LinkStats, MidiIn, MidiOut, MscFilter, NotePattern, Pacing, SampleFormatPref,
     MIN_TX_LEVEL_DBFS,
 };
+use cricket_sim::PathImpairment;
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1260,7 +1261,7 @@ fn run_pathcheck_sim(name: &str) -> Result<()> {
             ));
         };
         println!("Cricket path check, simulated path `{}` ({:?}):", n, path);
-        let report = pathcheck::analyze(&pathcheck::simulate(path, &pattern), 48_000);
+        let report = pathcheck::analyze(&cricket_sim::simulate(path, &pattern), 48_000);
         print_report(&report);
         return Ok(());
     }
@@ -1270,7 +1271,7 @@ fn run_pathcheck_sim(name: &str) -> Result<()> {
         "path", "verdict", "bit-exact", "symbols ok", "probes"
     );
     for (n, path) in &presets {
-        let r = pathcheck::analyze(&pathcheck::simulate(path, &pattern), 48_000);
+        let r = pathcheck::analyze(&cricket_sim::simulate(path, &pattern), 48_000);
         println!(
             "{:<24} {:<10} {:>9.2}% {:>11.4}% {:>4}/{:<3}",
             n,

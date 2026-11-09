@@ -14,10 +14,11 @@
 use cricket_core::modem::{
     refresh_spacing_samples, repetition_samples, CricketModemRx, CricketModemTx, ModemOutput,
 };
-use cricket_core::pathcheck::{self, PathImpairment, Rng, Verdict};
+use cricket_core::pathcheck::{self, Rng, Verdict};
 use cricket_core::phy::digital::{self, DigitalRx, CODE_SCALE, STEP, SYNC, TOLERANCE};
 use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage, TxScheduler};
+use cricket_sim::{simulate, PathImpairment};
 use std::time::Instant;
 
 const RATE: usize = 48_000;
@@ -280,12 +281,9 @@ fn expectation(name: &str) -> (Expect, &'static [Verdict]) {
 fn fail_safe_row(name: &str, path: &[PathImpairment], n: usize) -> (usize, usize, usize, Verdict) {
     let config = PhyConfig::digital();
     let (sent, audio) = traffic(&config, n, 11);
-    let got = decode(&config, &pathcheck::simulate(path, &audio), 256);
+    let got = decode(&config, &simulate(path, &audio), 256);
     let (ok, bad) = score(&sent, &got);
-    let report = pathcheck::analyze(
-        &pathcheck::simulate(path, &pathcheck::pattern_samples(30)),
-        48_000,
-    );
+    let report = pathcheck::analyze(&simulate(path, &pathcheck::pattern_samples(30)), 48_000);
     let _ = name;
     (sent.len(), ok, bad, report.verdict)
 }
@@ -311,8 +309,7 @@ fn fail_safe_table() {
 #[test]
 fn pathcheck_findings() {
     let pattern = pathcheck::pattern_samples(30);
-    let run =
-        |path: &[PathImpairment]| pathcheck::analyze(&pathcheck::simulate(path, &pattern), 48_000);
+    let run = |path: &[PathImpairment]| pathcheck::analyze(&simulate(path, &pattern), 48_000);
     let r = run(&[PathImpairment::Polarity]);
     assert!(r.inverted && r.verdict == Verdict::BitExact);
     let r = run(&[PathImpairment::Gain(-0.1)]);

@@ -638,6 +638,7 @@ dependencies = [
  "clap",
  "cricket_core",
  "cricket_engine",
+ "cricket_sim",
  "ctrlc",
  "serde_json",
 ]
@@ -646,6 +647,7 @@ dependencies = [
 name = "cricket_core"
 version = "0.2.0"
 dependencies = [
+ "cricket_sim",
  "hound",
  "libm",
  "serde",
@@ -675,6 +677,14 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "cricket_sim"
+version = "0.2.0"
+dependencies = [
+ "cricket_core",
+ "libm",
 ]
 
 [[package]]

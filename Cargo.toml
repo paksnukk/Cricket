@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "cricket_core",
+    "cricket_sim",
     "cricket_engine",
     "cricket_cli",
     "cricket_gui/src-tauri"

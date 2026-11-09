@@ -1,0 +1,17 @@
+[package]
+name = "cricket_sim"
+description = "Channel simulator for the Cricket (AML v1) MIDI-over-audio modem: line impairments, instrument and program sources, converter and link models, bit-transparency path models, chunked decoding — for tests and measurement harnesses"
+readme = "../README.md"
+keywords = ["midi", "audio", "modem", "simulator", "testing"]
+categories = ["multimedia::audio", "development-tools::testing", "simulation"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cricket_core = { path = "../cricket_core", version = "0.2.0", features = ["pathcheck"] }
+libm = "0.2"
