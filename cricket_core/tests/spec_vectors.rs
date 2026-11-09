@@ -84,7 +84,7 @@ fn vectors() -> Vec<Vector> {
 fn field_generator_and_whitening() {
     // g(x) = (x + α)(x + α²)(x + α³)(x + α⁴) over GF(16) / x⁴ + x + 1:
     // the codeword of data x⁰…0 1 is g itself, = x⁴ + Dx³ + Cx² + 8x + 7.
-    let rs = Rs16::new(7, 4);
+    let rs = Rs16::new(7, 4).unwrap();
     assert_eq!(
         rs.encode(&hex("0 0 0 0 0 0 1")),
         hex("0 0 0 0 0 0 1 D C 8 7")
@@ -97,7 +97,7 @@ fn field_generator_and_whitening() {
 
 #[test]
 fn link_layer_vectors() {
-    let rs = Rs16::new(7, 4);
+    let rs = Rs16::new(7, 4).unwrap();
     let codec = FecCodec::new(FecMode::Rs16 { parity: 4 }).unwrap();
     for v in vectors() {
         let packet = Packet {

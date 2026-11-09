@@ -198,9 +198,12 @@ impl PhyConfig {
     /// one nibble (4 bits) so generic helpers stay meaningful; the MFSK-only
     /// fields (tones, preamble, purity) are unused.
     pub fn ltc_with_bit_rate(bit_rate: u32) -> Self {
+        // `BmcParams::new` clamps the bit rate (`bmc::BIT_RATE_RANGE`).
+        let params = BmcParams::new(bit_rate);
+        let bit_rate = params.bit_rate;
         Self {
             sample_rate_hz: 48_000,
-            modulation: Modulation::Bmc(BmcParams::new(bit_rate)),
+            modulation: Modulation::Bmc(params),
             symbol_duration_ms: 4000.0 / bit_rate as f32,
             guard_gap_ms: 0.0,
             attack_ms: 0.0,

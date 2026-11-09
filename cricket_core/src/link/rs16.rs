@@ -118,15 +118,17 @@ pub struct Rs16 {
 }
 
 impl Rs16 {
-    /// RS(`k + nsym`, `k`). Panics on invalid parameters (`k + nsym > 15`,
-    /// `k == 0`, `nsym == 0`).
-    pub fn new(k: usize, nsym: usize) -> Self {
-        assert!(k > 0 && nsym > 0 && k + nsym <= RS16_MAX_N, "invalid RS16");
-        Self {
+    /// RS(`k + nsym`, `k`). `Err(BadParams)` for `k == 0`, `nsym == 0` or
+    /// `k + nsym > 15`.
+    pub fn new(k: usize, nsym: usize) -> Result<Self, Rs16Error> {
+        if k == 0 || nsym == 0 || k + nsym > RS16_MAX_N {
+            return Err(Rs16Error::BadParams);
+        }
+        Ok(Self {
             n: k + nsym,
             nsym,
             gen: generator(nsym),
-        }
+        })
     }
 
     pub fn n(&self) -> usize {
@@ -315,7 +317,7 @@ mod tests {
 
     #[test]
     fn codewords_have_zero_syndromes() {
-        let rs = Rs16::new(7, 4);
+        let rs = Rs16::new(7, 4).unwrap();
         let cw = rs.encode(&[1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(cw.len(), 11);
         assert_eq!(&cw[..7], &[1, 2, 3, 4, 5, 6, 7]);
@@ -328,7 +330,7 @@ mod tests {
     fn corrects_errors_and_erasures_within_capacity() {
         let mut rng = Lcg(12345);
         for &(k, nsym) in &[(7usize, 2usize), (7, 4), (7, 6), (11, 4), (5, 3), (13, 2)] {
-            let rs = Rs16::new(k, nsym);
+            let rs = Rs16::new(k, nsym).unwrap();
             let n = k + nsym;
             for _ in 0..400 {
                 let data: Vec<u8> = (0..k).map(|_| rng.below(16) as u8).collect();
@@ -359,7 +361,7 @@ mod tests {
     fn too_many_errors_rarely_miscorrect() {
         // Beyond capacity the decoder must mostly report failure; any "success"
         // must at least be a valid codeword (syndromes re-checked).
-        let rs = Rs16::new(7, 4);
+        let rs = Rs16::new(7, 4).unwrap();
         let mut rng = Lcg(999);
         let mut miscorrected = 0;
         for _ in 0..2000 {

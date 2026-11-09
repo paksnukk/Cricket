@@ -182,9 +182,19 @@ pub struct BmcParams {
     pub erase_margin: f32,
 }
 
+/// Bit rates [`BmcParams::new`] accepts; a value outside is clamped. Below
+/// 300 bit/s a half cell is longer than 80 samples at 48 kHz (the receiver's
+/// history alone would take hundreds of KB); above 100 000 bit/s a half
+/// cell is shorter than one sample at every sample rate in use. A bit rate
+/// of 0 would make every cell length infinite.
+pub const BIT_RATE_RANGE: core::ops::RangeInclusive<u32> = 300..=100_000;
+
 impl BmcParams {
     /// Defaults for `bit_rate` (all other parameters are bit-rate relative).
+    /// `bit_rate` is clamped to [`BIT_RATE_RANGE`]; read it back from the
+    /// result when it matters.
     pub fn new(bit_rate: u32) -> Self {
+        let bit_rate = bit_rate.clamp(*BIT_RATE_RANGE.start(), *BIT_RATE_RANGE.end());
         Self {
             bit_rate,
             preamble_bits: 8,

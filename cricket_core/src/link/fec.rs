@@ -55,6 +55,10 @@ pub const WHITENING: [u8; 30] = [
 ];
 const _: () = assert!(WHITENING.len() >= CODEWORDS * RS16_MAX_N);
 
+/// Largest `parity` of [`FecMode::Rs16`]: a codeword over GF(16) holds at
+/// most [`RS16_MAX_N`] = 15 nibbles, 7 of them data.
+pub const MAX_PARITY: u8 = (RS16_MAX_N - K) as u8;
+
 /// Forward-error-correction scheme applied to the packet body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FecMode {
@@ -62,7 +66,9 @@ pub enum FecMode {
     #[default]
     None,
     /// Two interleaved RS(7 + parity, 7) codewords over GF(16).
-    /// `parity` must be in 1..=8. Body = `2 * (7 + parity)` nibbles.
+    /// `parity` is 1..=[`MAX_PARITY`] (8); a value outside that range is
+    /// treated as the nearest valid one (see [`FecMode::parity`]), so no
+    /// constructor panics on it. Body = `2 * (7 + parity)` nibbles.
     Rs16 { parity: u8 },
 }
 
@@ -71,11 +77,22 @@ impl FecMode {
         !matches!(self, FecMode::None)
     }
 
+    /// Parity nibbles per codeword: `Rs16`'s `parity` clamped to
+    /// 1..=[`MAX_PARITY`], 0 for `None`. Every size and codec derived from
+    /// the mode uses this value, so an out-of-range `parity` is consistent
+    /// between transmitter and receiver (but not a wire format of its own).
+    pub fn parity(&self) -> usize {
+        match *self {
+            FecMode::None => 0,
+            FecMode::Rs16 { parity } => usize::from(parity.clamp(1, MAX_PARITY)),
+        }
+    }
+
     /// Body symbols per repetition (excluding the preamble).
     pub fn body_nibbles(&self) -> usize {
         match *self {
             FecMode::None => UNCODED_BODY_NIBBLES,
-            FecMode::Rs16 { parity } => CODEWORDS * (K + parity as usize),
+            FecMode::Rs16 { .. } => CODEWORDS * (K + self.parity()),
         }
     }
 
@@ -94,7 +111,7 @@ impl FecMode {
     pub fn max_body_erasures(&self) -> usize {
         match *self {
             FecMode::None => 0,
-            FecMode::Rs16 { parity } => CODEWORDS * parity as usize,
+            FecMode::Rs16 { .. } => CODEWORDS * self.parity(),
         }
     }
 }
@@ -141,13 +158,12 @@ pub struct FecCodec {
 }
 
 impl FecCodec {
-    /// `None` for [`FecMode::None`].
+    /// `None` for [`FecMode::None`]; always `Some` for `Rs16` (its parity
+    /// is clamped to a valid range, see [`FecMode::parity`]).
     pub fn new(mode: FecMode) -> Option<Self> {
         match mode {
             FecMode::None => None,
-            FecMode::Rs16 { parity } => Some(Self {
-                rs: Rs16::new(K, parity as usize),
-            }),
+            FecMode::Rs16 { .. } => Rs16::new(K, mode.parity()).ok().map(|rs| Self { rs }),
         }
     }
 
@@ -427,7 +443,7 @@ mod tests {
         assert_eq!(WHITENING[0], 0x8);
         assert!(WHITENING.iter().all(|&w| w != 0 && w < 16));
         let plain: Vec<u8> = body.iter().zip(WHITENING).map(|(b, w)| b ^ w).collect();
-        let rs = Rs16::new(K, 4);
+        let rs = Rs16::new(K, 4).unwrap();
         let a = rs.encode(&data[..K]);
         let b = rs.encode(&data[K..]);
         let interleaved: Vec<u8> = a.iter().zip(&b).flat_map(|(x, y)| [*x, *y]).collect();

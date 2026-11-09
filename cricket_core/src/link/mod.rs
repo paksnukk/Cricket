@@ -7,7 +7,7 @@ mod packet;
 mod rs16;
 
 pub use crc::{crc16_ccitt, verify_crc16};
-pub use fec::{BodySymbol, FecCodec, FecDecoded, FecMode, FEC_DATA_NIBBLES, WHITENING};
+pub use fec::{BodySymbol, FecCodec, FecDecoded, FecMode, FEC_DATA_NIBBLES, MAX_PARITY, WHITENING};
 pub use interleave::{deinterleave, interleave};
 pub use packet::{
     body_nibble_count, bytes_to_nibbles, decode_packet_bytes, encode_packet_bytes,
