@@ -1,0 +1,224 @@
+name: Release
+
+# A tag `vX.Y.Z` builds the `cricket` CLI for Linux (x64, arm64), macOS (universal)
+# and Windows, and the desktop bundles, and attaches everything to a draft GitHub
+# Release whose notes come from CHANGELOG.md. See docs/release-process.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Version from the tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Tag matches the manifests
+        run: |
+          .github/scripts/check-versions.sh
+          ws=$(awk '/^\[workspace.package\]/{f=1} f && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
+          if [ "$ws" != "${{ steps.version.outputs.version }}" ]; then
+            echo "error: tag ${GITHUB_REF_NAME} but Cargo.toml says $ws" >&2; exit 1
+          fi
+
+      - name: Release notes from CHANGELOG.md
+        run: .github/scripts/release-notes.sh "${{ steps.version.outputs.version }}" | tee release-notes.md
+
+      - name: Create the draft release
+        id: release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Cricket ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: true
+          prerelease: ${{ startsWith(steps.version.outputs.version, '0.') }}
+
+  cli:
+    name: CLI (${{ matrix.name }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04 # oldest glibc of the hosted runners
+            target: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            os: ubuntu-22.04-arm # native arm64 runner (public repositories)
+            target: aarch64-unknown-linux-gnu
+          - name: macos-universal
+            os: macos-14
+            target: universal
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target == 'universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: cli-${{ matrix.name }}
+
+      - name: Build (single target)
+        if: matrix.target != 'universal'
+        shell: bash
+        run: |
+          cargo build --release --locked -p cricket_cli --target ${{ matrix.target }}
+          mkdir -p out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/cricket.exe out/
+          else
+            cp target/${{ matrix.target }}/release/cricket out/
+            strip out/cricket
+          fi
+
+      - name: Build (macOS universal)
+        if: matrix.target == 'universal'
+        run: |
+          cargo build --release --locked -p cricket_cli --target aarch64-apple-darwin
+          cargo build --release --locked -p cricket_cli --target x86_64-apple-darwin
+          mkdir -p out
+          lipo -create -output out/cricket \
+            target/aarch64-apple-darwin/release/cricket \
+            target/x86_64-apple-darwin/release/cricket
+          strip -x out/cricket
+          lipo -info out/cricket
+
+      - name: Package
+        shell: bash
+        run: |
+          v="${{ needs.create-release.outputs.version }}"
+          base="cricket-${v}-${{ matrix.name }}"
+          mkdir -p "dist/$base"
+          cp out/* README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE NOTICE "dist/$base/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "$base.zip" "$base" > /dev/null
+            sha256sum "$base.zip" > "$base.zip.sha256"
+          else
+            tar czf "$base.tar.gz" "$base"
+            if command -v sha256sum > /dev/null; then sha256sum "$base.tar.gz" > "$base.tar.gz.sha256"
+            else shasum -a 256 "$base.tar.gz" > "$base.tar.gz.sha256"; fi
+          fi
+          rm -r "$base"
+          ls -l
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-14
+            args: --target universal-apple-darwin
+          - name: linux-x64
+            os: ubuntu-22.04 # AppImage/deb built on the oldest glibc of the hosted runners
+            args: ""
+          - name: windows-x64
+            os: windows-latest
+            args: ""
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf file
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: cricket_gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: stable
+          targets: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: desktop-${{ matrix.name }}
+
+      - name: Install frontend dependencies
+        working-directory: cricket_gui
+        run: npm ci
+
+      # Signing and notarisation are optional: a secret that is absent is simply not
+      # exported, and the bundler produces an unsigned build (docs/release-process.md).
+      - name: Configure signing (only the secrets that exist)
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID \
+                   APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [ -n "${!v}" ]; then
+              { echo "$v<<__CRICKET_EOF__"; printf '%s\n' "${!v}"; echo "__CRICKET_EOF__"; } >> "$GITHUB_ENV"
+              echo "$v: set"
+            else
+              echo "$v: not set (unsigned build)"
+            fi
+          done
+
+      - name: Build and attach the bundles
+        uses: tauri-apps/tauri-action@6caf3c52bef9f7b97e6f3693cc48ba16331cdeba # v0.5.25
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: cricket_gui
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }}
+          uploadUpdaterJson: false

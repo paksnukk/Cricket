@@ -2,80 +2,243 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags-ignore: ["v*"] # tags are built by release.yml
   pull_request:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC: the long measurement harnesses
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  rust:
-    name: Rust (test, clippy, fmt)
+  lint:
+    name: Lint (fmt, clippy, rustdoc, versions)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      # ALSA for cpal/midir; GTK/WebKitGTK/libsoup for Tauri 2 (cricket_gui).
+      # ALSA for cpal/midir; GTK/WebKitGTK/libsoup for Tauri 2 (cricket_gui is in --workspace).
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libasound2-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev
+            pkg-config libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
         with:
+          toolchain: stable
           components: clippy, rustfmt
+          targets: thumbv8m.main-none-eabihf
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
 
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Clippy
+      - name: Clippy (workspace, all targets)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test
+      - name: Clippy (cricket_core, no_std)
+        run: cargo clippy -p cricket_core --no-default-features --target thumbv8m.main-none-eabihf -- -D warnings
+
+      - name: Rustdoc (warnings are errors)
+        run: cargo doc --no-deps --workspace --exclude cricket_gui
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Versions agree (Cargo.toml, tauri.conf.json, package.json)
+        run: .github/scripts/check-versions.sh
+
+  test:
+    name: Test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      # Linux also builds and tests the GUI crate (the Tauri deps are installed above).
+      - name: Test (workspace, including cricket_gui)
+        if: runner.os == 'Linux'
         run: cargo test --workspace
 
+      - name: Test (workspace without cricket_gui)
+        if: runner.os != 'Linux'
+        run: cargo test --workspace --exclude cricket_gui
+
   no_std:
-    name: cricket_core (no_std)
+    name: cricket_core no_std (${{ matrix.target }})
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - thumbv8m.main-none-eabihf # Cortex-M33 (RP2350, STM32H5/U5)
+          - thumbv6m-none-eabi # Cortex-M0+ (RP2040), no hardware float
+          - riscv32imac-unknown-none-elf # ESP32-C series, RP2350 RISC-V cores
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
         with:
-          targets: thumbv8m.main-none-eabihf
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
 
       - name: Build for a bare-metal target
-        run: cargo build -p cricket_core --no-default-features --target thumbv8m.main-none-eabihf
+        run: cargo build -p cricket_core --no-default-features --target ${{ matrix.target }} --release
 
-  frontend:
-    name: Frontend (typecheck)
+  msrv:
+    name: MSRV (Rust 1.87)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: "1.87.0" # keep equal to rust-version in Cargo.toml
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Check with the minimum supported Rust version
+        run: cargo check -p cricket_core -p cricket_engine -p cricket_cli
+
+  gui:
+    name: GUI (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
     defaults:
       run:
         working-directory: cricket_gui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - uses: actions/setup-node@v4
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: lts/*
           cache: npm
           cache-dependency-path: cricket_gui/package-lock.json
 
-      - name: Install
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Install frontend dependencies
         run: npm ci
 
-      - name: Typecheck
-        run: npx tsc --noEmit
+      - name: Typecheck and build frontend
+        run: npm run build
+
+      - name: Check the Tauri crate
+        run: cargo check -p cricket_gui
+
+  supply-chain:
+    name: Supply chain (cargo deny, cargo audit)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: cargo deny (licenses, advisories, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@44db170f6a7d12a6e90340e9e0fca1f650d34b14 # v2.0.15
+        with:
+          command: check
+          arguments: --all-features
+
+      - name: cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Same accepted advisories as deny.toml, with the reasons there.
+          ignore: RUSTSEC-2026-0293,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+
+  # The 14 `#[ignore]`d measurement harnesses: A/B tables, false-accept and chord
+  # reports. Too slow for every push; weekly (or on demand) in release mode, one
+  # job per test binary so a slow table does not hide the others.
+  harnesses:
+    name: Measurement harnesses (${{ matrix.test }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - fec # fec_ab_table, acquisition_ab_table, false_trigger_report
+          - fec_false_accept # false_accept_report
+          - phy_ab_measurements # ab_report, bmc_param_sweep
+          - ltc_fast_ab # ltc_fast_ab_table, ltc_fast_phy_diag, ltc_fast_chord_table, ltc_fast_cpu
+          - ltc_fec_ab # ltc_fec_ab_table, ltc_false_message_report
+          - stuck_notes # ltc_back_to_back_report
+          - digital # digital_report
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: harnesses
+
+      - name: Run the ignored tests of one harness (release)
+        run: |
+          mkdir -p harness-out
+          cargo test --release -p cricket_core --test ${{ matrix.test }} -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee "harness-out/${{ matrix.test }}.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-${{ matrix.test }}
+          path: harness-out/
+          retention-days: 90
