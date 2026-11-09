@@ -1,16 +1,23 @@
 [package]
 name = "cricket_engine"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
 description = "Cricket real-time engine: audio/MIDI I/O and encoder/decoder workers shared by the GUI and CLI"
+readme = "../README.md"
+keywords = ["midi", "audio", "modem", "msc", "cpal"]
+categories = ["multimedia::audio"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 
 [features]
 # In-memory audio/MIDI endpoints for hardware-free tests (always on under `cfg(test)`).
 testing = []
 
 [dependencies]
-cricket_core = { path = "../cricket_core" }
+cricket_core = { path = "../cricket_core", version = "0.2.0" }
 cpal = "0.15"
 midir = "0.9"
 ringbuf = "0.3"

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use cricket_core::pathcheck::{self, PathImpairment, PathReport, Verdict};
@@ -14,7 +16,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = None)]
+#[command(name = "cricket", author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = None)]
 struct Cli {
     /// PHY profile (both ends must use the same one): robust (default;
     /// Reed–Solomon coded body, sent once), robust_repeat (uncoded body sent

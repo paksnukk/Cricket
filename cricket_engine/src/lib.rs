@@ -27,8 +27,9 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
-//! In-memory endpoints live in [`memory`]; test-only ones in [`testing`]
+//! In-memory endpoints live in [`memory`]; test-only ones in `testing`
 //! (feature `testing`).
+#![forbid(unsafe_code)]
 
 pub mod audio;
 pub mod decoder;
