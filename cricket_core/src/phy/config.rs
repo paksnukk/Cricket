@@ -35,13 +35,23 @@ pub fn dbfs_from_amplitude(amplitude: f32) -> f32 {
     20.0 * libm::log10f(amplitude.abs().max(1e-10))
 }
 
-// Tone-purity thresholds (see `goertzel::tone_purity`). Measured on
-// synthesized symbols: ~0.97 aligned, ~0.91 aligned at SNR 12 dB, >= 0.43 at a
-// full search hop of misalignment (>= 0.39 at SNR 12 dB). White-noise windows
-// peak at ~0.09 (robust, N = 288) and ~0.18 (fast, N = 144), so fast needs the
-// higher threshold to keep margin above noise.
-const PURITY_ROBUST: f32 = 0.25;
-const PURITY_FAST: f32 = 0.3;
+// Tone-purity gate (see `goertzel::tone_purity`), measured on the tone-band
+// filtered input (`PhyConfig::rx_band_hz`): ~0.97 for an aligned synthesized
+// symbol, ≥ 0.4 at a full search hop of misalignment, ~0.6 for a symbol in
+// white noise at −6 dB full-band SNR. Tuned on the MFSK training table
+// (`tests/fec.rs`, `mfsk_ab_table`): 0.2 is the lowest value at which white
+// noise and music-like audio still produce no phy lock for any profile
+// (at 0.15: robust 2, fast 13 locks per minute on white noise); each step
+// of 0.05 above it costs about 1 dB of AWGN cliff.
+const PURITY_MFSK: f32 = 0.2;
+
+/// Orthogonal tone step of an MFSK symbol of `symbol_duration_ms`: 1 / T
+/// (spec §3.1), so that every other tone falls on a zero of a tone's
+/// rectangular-window spectrum and leaks nothing into its Goertzel bin.
+/// 6 ms → 166⅔ Hz, 3 ms → 333⅓ Hz.
+pub fn orthogonal_step_hz(symbol_duration_ms: f32) -> f32 {
+    1000.0 / symbol_duration_ms
+}
 
 /// Receiver band of an MFSK tone plan (`PhyConfig::rx_band_hz`): from
 /// `RX_BAND_LOW` × the lowest tone to `RX_BAND_HIGH` × the highest, so
@@ -134,7 +144,8 @@ impl Default for PhyConfig {
 
 impl PhyConfig {
     /// **Robust** (the default, spec §6.1; user-facing name `analog-safe`):
-    /// MFSK-16 at 6 ms + 0.5 ms guard,
+    /// MFSK-16 at 6 ms + 0.5 ms guard with orthogonal tones (166⅔ Hz steps,
+    /// 2.5–5 kHz),
     /// an RS(11,7)x2 GF(16) coded, whitened 22-nibble body
     /// (`FecMode::Rs16 { parity: 4 }`) sent once (K = 1), and joint preamble
     /// acquisition tolerating two missed preamble symbols.
@@ -164,13 +175,13 @@ impl PhyConfig {
             release_ms: 0.3,
             amplitude: DEFAULT_AMPLITUDE,
             tone_base_hz: 2500.0,
-            tone_step_hz: 100.0,
+            tone_step_hz: orthogonal_step_hz(6.0),
             n_tones: 16,
             preamble: vec![0xA, 0x5, 0xC, 0x3],
             min_confidence_db: 3.0,
-            min_tone_purity: PURITY_ROBUST,
+            min_tone_purity: PURITY_MFSK,
             min_rms_dbfs: -60.0,
-            rx_band_hz: Some(mfsk_rx_band(2500.0, 100.0, 16)),
+            rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(6.0), 16)),
             rx_track_timing: true,
             repetition_k: 2,
             interleave_depth: 4,
@@ -182,9 +193,31 @@ impl PhyConfig {
         }
     }
 
+    /// **Robust fast** (experimental, not in the spec yet; user-facing name
+    /// `analog-safe-fast`): Robust's preamble, coded body and joint
+    /// acquisition on 4 ms symbols with orthogonal tones (step 1 / T =
+    /// 250 Hz, 2.5–6.25 kHz), no guard gap. 26 symbols = 104 ms per
+    /// message (108 ms with the trailing silence), 38 % less than Robust,
+    /// with the same error correction. In the simulator it matches Robust
+    /// within 1 dB of AWGN cliff (−9 vs −10 dB) and on dropouts; a 3 ms
+    /// variant (78 ms) measured 2 dB worse and lost 30 ms dropouts
+    /// (83 % vs 96 %), so 4 ms it is. Needs a line that passes 6.25 kHz.
+    pub fn robust_fast() -> Self {
+        Self {
+            symbol_duration_ms: 4.0,
+            guard_gap_ms: 0.0,
+            attack_ms: 0.2,
+            release_ms: 0.2,
+            tone_step_hz: orthogonal_step_hz(4.0),
+            rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(4.0), 16)),
+            ..Self::robust()
+        }
+    }
+
     /// Fast profile for clean dedicated chains (user-facing name
-    /// `analog-fast`). Targets ≤60 ms first-copy: 3 ms symbols, wider tone
-    /// spacing (Goertzel resolution), short preamble, K=1, no body FEC.
+    /// `analog-fast`). Targets ≤60 ms first-copy: 3 ms symbols, orthogonal
+    /// tones (333⅓ Hz steps, 2.5–7.5 kHz: the line must pass 7.5 kHz),
+    /// short preamble, K=1, no body FEC.
     pub fn fast() -> Self {
         Self {
             sample_rate_hz: 48_000,
@@ -195,13 +228,13 @@ impl PhyConfig {
             release_ms: 0.15,
             amplitude: DEFAULT_AMPLITUDE,
             tone_base_hz: 2500.0,
-            tone_step_hz: 200.0,
+            tone_step_hz: orthogonal_step_hz(3.0),
             n_tones: 16,
             preamble: vec![0xA, 0x5],
             min_confidence_db: 2.0,
-            min_tone_purity: PURITY_FAST,
+            min_tone_purity: PURITY_MFSK,
             min_rms_dbfs: -60.0,
-            rx_band_hz: Some(mfsk_rx_band(2500.0, 200.0, 16)),
+            rx_band_hz: Some(mfsk_rx_band(2500.0, orthogonal_step_hz(3.0), 16)),
             rx_track_timing: true,
             repetition_k: 1,
             interleave_depth: 4,
@@ -329,8 +362,9 @@ impl PhyConfig {
     /// `robust_fec`), `analog-safe-repeat` = `robust_repeat`, `analog-fast` =
     /// `fast`, `clean-line` = `ltc_fec`, `clean-line-fast` = `ltc9600_fec`,
     /// `digital-line` = `ltc14400_fec`, `digital-bit-exact` = `digital`, plus
-    /// the uncoded `ltc`, `ltc2400`, `ltc9600`, `ltc14400` and the coded
-    /// `ltc2400_fec`. A `+digital` suffix (e.g. `ltc9600+digital`) selects
+    /// the uncoded `ltc`, `ltc2400`, `ltc9600`, `ltc14400`, the coded
+    /// `ltc2400_fec` and the experimental `analog-safe-fast` = `robust_fast`.
+    /// A `+digital` suffix (e.g. `ltc9600+digital`) selects
     /// the profile with [`digital_detect`](Self::digital_detect) on.
     ///
     /// Unknown names are `None`: a typo must never silently select another
@@ -412,6 +446,12 @@ impl PhyConfig {
 
     pub fn hop_samples(&self) -> usize {
         (self.symbol_samples() / 4).max(1)
+    }
+
+    /// The receiver band ([`rx_band_hz`](Self::rx_band_hz)) that fits
+    /// this profile's tone plan, or `None` for a profile without tones.
+    pub fn default_rx_band_hz(&self) -> Option<(f32, f32)> {
+        (self.n_tones > 0).then(|| mfsk_rx_band(self.tone_base_hz, self.tone_step_hz, self.n_tones))
     }
 
     pub fn tone_hz(&self, index: u8) -> f32 {
@@ -633,6 +673,18 @@ pub static PROFILES: &[ProfileInfo] = &[
         use_when: "Digital Line without error correction",
         coded: false,
         build: || PhyConfig::ltc_fast_with_bit_rate(14400),
+    },
+    ProfileInfo {
+        name: "analog-safe-fast",
+        aliases: &["robust_fast"],
+        tier: ProfileTier::Advanced,
+        display: "Analog Safe Fast (experimental)",
+        line: "an analog or digital bus that passes 6.25 kHz; EQ, compression or a limiter are tolerated",
+        processing: "as Analog Safe",
+        latency: "~170 ms (measured in-process: mean ~170 ms, p95 ~220 ms; 108 ms airtime)",
+        use_when: "Analog Safe's error correction in 108 ms instead of 175.5 ms per message; experimental, not in the spec yet",
+        coded: true,
+        build: PhyConfig::robust_fast,
     },
 ];
 

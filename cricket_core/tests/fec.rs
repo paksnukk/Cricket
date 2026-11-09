@@ -822,7 +822,8 @@ fn acq_profiles() -> Vec<(String, PhyConfig)> {
 /// Receiver-threshold overrides for tuning runs (every MFSK profile of a
 /// table): `MFSK_PURITY` (min tone purity), `MFSK_CONFIDENCE` (dB),
 /// `MFSK_BAND` (`lo,hi` Hz, or `none` for no input band-pass), `MFSK_TRACK`
-/// (`0` disables body symbol clock tracking).
+/// (`0` disables body symbol clock tracking), `MFSK_STEP` / `MFSK_BASE`
+/// (tone plan of both ends, see below).
 fn apply_rx_overrides(config: &mut PhyConfig) {
     if config.n_tones == 0 {
         return;
@@ -841,6 +842,35 @@ fn apply_rx_overrides(config: &mut PhyConfig) {
     }
     if let Ok(t) = std::env::var("MFSK_TRACK") {
         config.rx_track_timing = t != "0";
+    }
+    // `MFSK_SYMBOL_MS`: symbol duration of both ends (ramps scaled with it).
+    if let Some(ms) = std::env::var("MFSK_SYMBOL_MS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        let scale = ms / config.symbol_duration_ms;
+        config.symbol_duration_ms = ms;
+        config.attack_ms *= scale;
+        config.release_ms *= scale;
+    }
+    // Tone plan (both ends): `MFSK_STEP=ortho` sets the step to 1 / symbol
+    // duration (orthogonal tones), a number sets it in Hz; `MFSK_BASE` the
+    // lowest tone in Hz. The receiver band follows the plan.
+    let mut plan_changed = false;
+    if let Ok(step) = std::env::var("MFSK_STEP") {
+        config.tone_step_hz = if step == "ortho" {
+            1000.0 / config.symbol_duration_ms
+        } else {
+            step.parse().expect("MFSK_STEP=ortho|<hz>")
+        };
+        plan_changed = true;
+    }
+    if let Some(base) = std::env::var("MFSK_BASE").ok().and_then(|v| v.parse().ok()) {
+        config.tone_base_hz = base;
+        plan_changed = true;
+    }
+    if plan_changed && config.rx_band_hz.is_some() {
+        config.rx_band_hz = config.default_rx_band_hz();
     }
     if let Ok(b) = std::env::var("MFSK_BAND") {
         config.rx_band_hz = if b == "none" {
