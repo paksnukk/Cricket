@@ -6,6 +6,7 @@ pub mod bmc;
 mod config;
 mod demod;
 pub mod digital;
+mod filter;
 mod goertzel;
 mod select;
 mod synth;

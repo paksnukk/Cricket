@@ -52,8 +52,11 @@ fn first_body_error(config: &PhyConfig, offset: usize, chunk: usize) -> Option<i
 }
 
 /// Residual symbol-boundary error after preamble fine alignment on a clean
-/// signal, over every start offset within two symbol periods. Must be at most
-/// hop / 8 (Robust 9, Fast 4 samples) and independent of chunking.
+/// signal, over every start offset within two symbol periods. The receiver's
+/// tone-band input filter delays the signal by a constant few samples (its
+/// group delay), which every window sees alike; after removing that median
+/// offset the residual must be at most hop / 8 (Robust 9, Fast 5 samples)
+/// and independent of chunking.
 #[test]
 fn fine_alignment_residual_error() {
     let mut failures = Vec::new();
@@ -67,13 +70,19 @@ fn fine_alignment_residual_error() {
                     .unwrap_or_else(|| panic!("[{name}] offset {offset}: no lock"));
                 errs.push((offset, err));
             }
+            let mut sorted: Vec<i64> = errs.iter().map(|e| e.1).collect();
+            sorted.sort_unstable();
+            let delay = sorted[sorted.len() / 2];
+            for e in errs.iter_mut() {
+                e.1 -= delay;
+            }
             let max = errs.iter().map(|e| e.1.abs()).max().unwrap();
             let mean = errs.iter().map(|e| e.1.abs() as f64).sum::<f64>() / errs.len() as f64;
             let min_signed = errs.iter().map(|e| e.1).min().unwrap();
             let max_signed = errs.iter().map(|e| e.1).max().unwrap();
             println!(
-                "[{name}] chunk {chunk}: |err| max {max} mean {mean:.2} samples \
-                 (signed {min_signed}..{max_signed}, bound {bound}, hop {})",
+                "[{name}] chunk {chunk}: filter delay {delay}; |err| max {max} mean {mean:.2} \
+                 samples (signed {min_signed}..{max_signed}, bound {bound}, hop {})",
                 config.hop_samples()
             );
             let worst: Vec<_> = errs.iter().filter(|e| e.1.abs() > bound).take(8).collect();

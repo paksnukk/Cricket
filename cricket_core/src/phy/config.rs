@@ -43,6 +43,18 @@ pub fn dbfs_from_amplitude(amplitude: f32) -> f32 {
 const PURITY_ROBUST: f32 = 0.25;
 const PURITY_FAST: f32 = 0.3;
 
+/// Receiver band of an MFSK tone plan (`PhyConfig::rx_band_hz`): from
+/// `RX_BAND_LOW` × the lowest tone to `RX_BAND_HIGH` × the highest, so
+/// the second-order band edges cost the outer tones less than 1 dB while
+/// hum and rumble (≤ 300 Hz) are 40–60 dB down and hiss above the band is
+/// gone.
+fn mfsk_rx_band(base_hz: f32, step_hz: f32, n_tones: usize) -> (f32, f32) {
+    let top = base_hz + step_hz * (n_tones.max(1) - 1) as f32;
+    (RX_BAND_LOW * base_hz, RX_BAND_HIGH * top)
+}
+const RX_BAND_LOW: f32 = 0.7;
+const RX_BAND_HIGH: f32 = 1.3;
+
 /// How the MFSK receiver finds a preamble (receiver-side only; the wire
 /// format is the same either way). Spec §3.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,6 +97,16 @@ pub struct PhyConfig {
     /// Silence floor: windows whose RMS is below this (dBFS, full-scale sine
     /// = -3 dBFS) are never detected as symbols.
     pub min_rms_dbfs: f32,
+    /// Receiver only (spec §3.2): the MFSK receiver band-passes its input to
+    /// `(low, high)` Hz (second-order Butterworth each side) before any
+    /// detection, so window energy, silence floor and tone purity are
+    /// measured in the tone band only. `None` disables the filter.
+    pub rx_band_hz: Option<(f32, f32)>,
+    /// Receiver only (spec §3.2.3): re-centre the symbol clock on every
+    /// body symbol that passes the detection gate (±3 / ±6 samples), so
+    /// the body survives a sample-rate mismatch of up to ~2 % between the
+    /// ends. Costs four single-tone Goertzels per body symbol.
+    pub rx_track_timing: bool,
     pub repetition_k: usize,
     pub interleave_depth: usize,
     pub link_dead_ms: u32,
@@ -148,6 +170,8 @@ impl PhyConfig {
             min_confidence_db: 3.0,
             min_tone_purity: PURITY_ROBUST,
             min_rms_dbfs: -60.0,
+            rx_band_hz: Some(mfsk_rx_band(2500.0, 100.0, 16)),
+            rx_track_timing: true,
             repetition_k: 2,
             interleave_depth: 4,
             link_dead_ms: 2000,
@@ -177,6 +201,8 @@ impl PhyConfig {
             min_confidence_db: 2.0,
             min_tone_purity: PURITY_FAST,
             min_rms_dbfs: -60.0,
+            rx_band_hz: Some(mfsk_rx_band(2500.0, 200.0, 16)),
+            rx_track_timing: true,
             repetition_k: 1,
             interleave_depth: 4,
             link_dead_ms: 2000,
@@ -216,6 +242,8 @@ impl PhyConfig {
             min_confidence_db: 0.0,
             min_tone_purity: 0.0,
             min_rms_dbfs: -60.0,
+            rx_band_hz: None,
+            rx_track_timing: false,
             repetition_k: 1,
             interleave_depth: 4,
             link_dead_ms: 2000,
@@ -284,6 +312,8 @@ impl PhyConfig {
             min_confidence_db: 0.0,
             min_tone_purity: 0.0,
             min_rms_dbfs: -120.0,
+            rx_band_hz: None,
+            rx_track_timing: false,
             repetition_k: 2,
             interleave_depth: 4,
             link_dead_ms: 2000,

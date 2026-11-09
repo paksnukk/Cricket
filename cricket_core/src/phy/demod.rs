@@ -1,4 +1,5 @@
 use super::config::{Acquisition, PhyConfig};
+use super::filter::BandPass;
 use super::goertzel::{
     best_tone, goertzel_power, goertzel_power_energy, rms_dbfs, tone_purity, ToneDetection,
 };
@@ -64,6 +65,13 @@ pub enum RxEvent {
     Frame(super::digital::DigitalFrame),
 }
 
+/// Joint acquisition: a preamble window that fails its gate *contradicts*
+/// the lock when another tone wins it with at least this fraction of the
+/// gate purity (spec §3.2.2). With the tone-band input filter, the best bin
+/// of a noise window reaches a third of the gate purity routinely, so the
+/// bar is the gate itself: a tone that would be detected as a symbol.
+const CONTRADICTING_PURITY: f32 = 1.0;
+
 /// Joint acquisition: minimum mean expected-tone purity of a candidate
 /// search window, as a fraction of `min_tone_purity`. Measured: 0.8 keeps
 /// every A/B cell (down to AWGN −4 dB) and cuts the work on unrelated MFSK
@@ -85,6 +93,17 @@ enum JointStep {
 /// Alignments this close (samples) to the last failed attempt's are the
 /// same attempt (see `ModemRx::is_failed_alignment`).
 const FAILED_ALIGNMENT_TOLERANCE: u64 = 2;
+
+/// Symbol clock tracking (`PhyConfig::rx_track_timing`): an early-late
+/// gate on each body symbol that passed the detection gate. The tone's
+/// power is measured in windows `hop / 2` samples early and late; a window
+/// that sits on the symbol gives equal powers, a window late by `e` gives
+/// `P(late) − P(early) ≈ −4 e P / N`. The estimate (times `TRACK_GAIN`, at
+/// most `N / TRACK_MAX_DIV` samples) corrects the position of the next
+/// symbol. Two percent of sample-rate error moves a 6 ms symbol by 6
+/// samples per period, inside the ±9 the gate can follow.
+const TRACK_GAIN: f32 = 0.75;
+const TRACK_MAX_DIV: usize = 32;
 
 /// A lock attempt in progress.
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +161,11 @@ enum RxPhase {
 pub struct ModemRx {
     config: PhyConfig,
     tones: Vec<f32>,
+    /// Tone-band input filter (spec §3.2): every pushed sample goes
+    /// through it before it is buffered, so window energies, the silence
+    /// floor and the purity gate see in-band energy only. `None` when the
+    /// profile asks for no filter (`PhyConfig::rx_band_hz`).
+    band: Option<BandPass>,
     buffer: VecDeque<f32>,
     phase: RxPhase,
     /// Stream position where the last confirmed (decoded) body ended.
@@ -173,9 +197,13 @@ pub struct ModemRx {
 impl ModemRx {
     pub fn new(config: PhyConfig) -> Self {
         let tones = config.tone_table();
+        let band = config
+            .rx_band_hz
+            .map(|(lo, hi)| BandPass::new(lo, hi, config.sample_rate_hz));
         Self {
             config,
             tones,
+            band,
             buffer: VecDeque::with_capacity(4096),
             phase: RxPhase::Search,
             last_confirmed_end: None,
@@ -255,6 +283,9 @@ impl ModemRx {
         self.phase = RxPhase::Search;
         self.last_confirmed_end = None;
         self.buffer.clear();
+        if let Some(band) = &mut self.band {
+            band.reset();
+        }
         self.read = self.samples_pushed;
         self.attempt = None;
         self.failed_alignment = None;
@@ -338,8 +369,12 @@ impl ModemRx {
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
-        for &s in samples {
-            self.buffer.push_back(s);
+        // A NaN or infinite sample (a glitching driver) must not poison the
+        // filter state, so it is read as silence.
+        let clean = samples.iter().map(|&s| if s.is_finite() { s } else { 0.0 });
+        match &mut self.band {
+            Some(band) => self.buffer.extend(clean.map(|s| band.process(s))),
+            None => self.buffer.extend(clean),
         }
         self.samples_pushed += samples.len() as u64;
         self.process()
@@ -471,7 +506,9 @@ impl ModemRx {
                     expected,
                     erased,
                 } => {
-                    if !self.available(self.read, period) {
+                    let track = self.config.rx_track_timing;
+                    let lookahead = if track { hop / 2 } else { 0 };
+                    if !self.available(self.read, period.max(sym + lookahead)) {
                         break;
                     }
                     let window = self.window_at(self.read, sym);
@@ -480,10 +517,23 @@ impl ModemRx {
                         self.level_ok(det)
                             && det.confidence_db >= self.config.min_confidence_db * 0.5
                     });
+                    // Symbol clock tracking (spec §3.2.3): a symbol that
+                    // passed the gate re-centres the clock on its tone, so a
+                    // sample-rate mismatch between the ends does not walk the
+                    // body windows off the symbols.
+                    let shift = match (&det, gate_ok && track) {
+                        (Some(d), true) => self.timing_shift(self.read, sym, hop, d.nibble),
+                        _ => 0,
+                    };
+                    let coded = self.config.fec.max_body_erasures() > 0;
                     // With FEC, a symbol that fails the gate becomes an
-                    // erasure instead of aborting, up to what the code can fill.
-                    let keep_as_erasure = !gate_ok && erased < self.config.fec.max_body_erasures();
-                    if gate_ok || keep_as_erasure {
+                    // erasure instead of aborting, up to what the code can
+                    // fill. Without FEC the best guess is kept: the CRC-16 and
+                    // the packet checks (spec §4.7) decide, and a wrong guess
+                    // costs nothing that an abort would not, since a rejected
+                    // body rewinds like a failed preamble.
+                    let keep = gate_ok || !coded || erased < self.config.fec.max_body_erasures();
+                    if keep {
                         let mut result = det.unwrap_or(DemodResult {
                             nibble: 0,
                             power: 0.0,
@@ -492,7 +542,7 @@ impl ModemRx {
                             erased: true,
                         });
                         result.erased = !gate_ok;
-                        self.read += period as u64;
+                        self.read = self.read.saturating_add_signed(shift) + period as u64;
                         if gate_ok {
                             self.last_confidence_db = result.confidence_db;
                         }
@@ -615,7 +665,7 @@ impl ModemRx {
                     confidence_db = d.confidence_db;
                     continue;
                 }
-                Some(d) if d.nibble != nibble && d.purity >= 0.5 * min_purity => {
+                Some(d) if d.nibble != nibble && d.purity >= CONTRADICTING_PURITY * min_purity => {
                     contradicting += 1;
                 }
                 _ => {}
@@ -630,6 +680,33 @@ impl ModemRx {
             aligned,
             confidence_db,
         }
+    }
+
+    /// Early-late clock correction (samples) for the body symbol read at
+    /// `at` showing tone `nibble`; see `TRACK_GAIN`. Needs samples up to
+    /// `at + sym + hop / 2`.
+    fn timing_shift(&self, at: u64, sym: usize, hop: usize, nibble: u8) -> i64 {
+        let d = (hop / 2).max(1) as u64;
+        if at < d || at - d < self.base() {
+            return 0;
+        }
+        let target = self.config.tone_hz(nibble);
+        let power = |start: u64| {
+            goertzel_power(
+                &self.window_at(start, sym),
+                target,
+                self.config.sample_rate_hz,
+            )
+        };
+        let (early, on, late) = (power(at - d), power(at), power(at + d));
+        if on <= 0.0 {
+            return 0;
+        }
+        // Lateness of the window: `x = -(N / 4) (late - early) / P`; the
+        // correction is `-x`.
+        let max = (sym / TRACK_MAX_DIV).max(1) as f32;
+        let shift = (sym as f32 / 4.0) * (late - early) / on * TRACK_GAIN;
+        libm::roundf(shift.clamp(-max, max)) as i64
     }
 
     fn detect_nibble(&self, window: &[f32]) -> Option<DemodResult> {
