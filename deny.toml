@@ -66,6 +66,13 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# cricket_core and cricket_engine use cricket_sim in their tests, and
+# cricket_sim depends on cricket_core. Those dev-dependencies are declared by
+# path without a version on purpose: cargo strips such dev-dependencies when
+# packaging, which breaks the cycle for crates.io. cargo-deny allows them
+# under this flag (path dev-dependencies only; regular dependencies still
+# need a version).
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
