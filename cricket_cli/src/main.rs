@@ -10,10 +10,11 @@ use cricket_core::phy::{
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, MscTarget, TransportMessage};
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
 use cricket_engine::{
-    audio, format_message, measure_chord_loopback, measure_midi_loopback_with, measure_throughput,
-    midi, rms_to_dbfs, AudioIn, AudioOptions, AudioOut, DecoderConfig, DecoderHandle,
-    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, LinkLight, LinkStats, MidiIn,
-    MidiOut, Pacing, SampleFormatPref, MIN_TX_LEVEL_DBFS,
+    audio, format_message, measure_chord_loopback, measure_midi_loopback_pattern,
+    measure_throughput, midi, parse_link_key, rms_to_dbfs, AudioIn, AudioOptions, AudioOut,
+    DecoderConfig, DecoderHandle, DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent,
+    LinkLight, LinkStats, MidiIn, MidiOut, MscFilter, NotePattern, Pacing, SampleFormatPref,
+    MIN_TX_LEVEL_DBFS,
 };
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
@@ -68,6 +69,13 @@ struct Cli {
     #[arg(long, global = true, value_name = "DB", default_value_t = DEFAULT_TX_LEVEL_DBFS, allow_negative_numbers = true, value_parser = parse_tx_level)]
     tx_level_db: f32,
 
+    /// Link key, the same on both ends: `0x1234` (hex) or a passphrase
+    /// (hashed to 16 bits). Packets from a Cricket link with another key
+    /// are ignored, so two links in one multicore or Dante domain do not
+    /// pick up each other's crosstalk. Default: unkeyed (0xFFFF)
+    #[arg(long, global = true, value_name = "KEY", default_value = "")]
+    link_key: String,
+
     /// Machine-readable output for encode / decode: one JSON object per line
     /// (NDJSON) with every engine event, instead of the human log
     #[arg(long, global = true)]
@@ -105,6 +113,17 @@ enum Commands {
         /// itself: a decoder on stage must not get notes nobody played
         #[arg(long, default_value_t = false)]
         simulate: bool,
+
+        /// Carry only MSC addressed to this device ID (0–126, decimal or 0x
+        /// hex) or to all-call 0x7F; for rigs with several MSC devices on
+        /// the MIDI line. Default: any device ID
+        #[arg(long, value_name = "ID", value_parser = parse_7bit)]
+        msc_accept_device: Option<u8>,
+
+        /// Carry only MSC in this command format (e.g. 0x10 Sound) or in
+        /// all-types 0x7F. Default: any format
+        #[arg(long, value_name = "FORMAT", value_parser = parse_7bit)]
+        msc_accept_format: Option<u8>,
     },
     /// Start the real-time decoder (Audio -> MIDI)
     ///
@@ -138,6 +157,18 @@ enum Commands {
         /// 0x10 Sound (General), 0x7F All-types, …)
         #[arg(long, value_name = "FORMAT", value_parser = parse_7bit, default_value = "0x01")]
         msc_format: u8,
+
+        /// Link-dead timeout in ms (default: the profile's, 500–2000);
+        /// no valid packet for this long sends the fail-safe burst
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u32).range(100..=60_000))]
+        link_dead_ms: Option<u32>,
+
+        /// Do not send the fail-safe burst (Note Offs, Sustain off, All
+        /// Notes Off) on link-dead, Panic or stop: for cue-only (MSC) links
+        /// where a stray All Notes Off is unwanted. Link-dead is still
+        /// detected and reported
+        #[arg(long, default_value_t = false)]
+        no_failsafe_burst: bool,
     },
     /// List available Audio and MIDI devices
     ListDevices,
@@ -175,6 +206,10 @@ enum Commands {
         /// at the sample rate: the engine's own overhead, without airtime
         #[arg(long, default_value_t = false)]
         zero_airtime: bool,
+        /// Overlap the notes (the previous note is released 60 ms after the
+        /// next one is struck) instead of hold / release / rest
+        #[arg(long, default_value_t = false)]
+        legato: bool,
     },
     /// Is an audio path bit-transparent? (for the digital-bit-exact profile)
     ///
@@ -258,6 +293,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let profile = cli.profile.as_str();
+    let link_key = parse_link_key(&cli.link_key);
     let audio = AudioOptions {
         buffer_frames: cli.buffer_frames,
         sample_format: cli.sample_format,
@@ -273,6 +309,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             audio_out,
             audio_out_name,
             simulate,
+            msc_accept_device,
+            msc_accept_format,
         } => run_encoder(
             selector(*midi_in, midi_in_name),
             selector(*audio_out, audio_out_name),
@@ -281,6 +319,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cli.tx_level_db,
             &audio,
             cli.json,
+            EncoderLink {
+                link_key,
+                msc_filter: MscFilter {
+                    device_id: *msc_accept_device,
+                    command_format: *msc_accept_format,
+                },
+            },
         ),
         Commands::Decode {
             audio_in,
@@ -289,6 +334,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             midi_out_name,
             msc_device_id,
             msc_format,
+            link_dead_ms,
+            no_failsafe_burst,
         } => run_decoder(
             selector(*audio_in, audio_in_name),
             selector(*midi_out, midi_out_name),
@@ -299,6 +346,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             profile,
             &audio,
             cli.json,
+            DecoderLink {
+                link_key,
+                link_dead_ms: *link_dead_ms,
+                fail_safe_burst: !*no_failsafe_burst,
+            },
         ),
         Commands::ListDevices => {
             list_all_devices()?;
@@ -324,13 +376,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
             chord_size,
             throughput,
             zero_airtime,
+            legato,
         } => {
             let pacing = if *zero_airtime {
                 Pacing::Instant
             } else {
                 Pacing::RealTime
             };
-            run_loopback_metrics(profiles, *notes, *chords, *chord_size, *throughput, pacing)?;
+            let pattern = if *legato {
+                NotePattern::Legato
+            } else {
+                NotePattern::Detached
+            };
+            run_loopback_metrics(
+                profiles,
+                *notes,
+                *chords,
+                *chord_size,
+                *throughput,
+                pacing,
+                pattern,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Pathcheck { action } => run_pathcheck(action, &audio),
@@ -563,6 +629,7 @@ fn run_test_mode(
 
 const LOOPBACK_NOTES: usize = 20;
 
+#[allow(clippy::too_many_arguments)]
 fn run_loopback_metrics(
     profiles: &[String],
     notes: usize,
@@ -570,12 +637,17 @@ fn run_loopback_metrics(
     chord_size: usize,
     throughput: usize,
     pacing: Pacing,
+    pattern: NotePattern,
 ) -> Result<()> {
     println!(
-        "Cricket engine loopback latency ({} MIDI in → MIDI out)...",
+        "Cricket engine loopback latency ({} MIDI in → MIDI out, {} notes)...",
         match pacing {
             Pacing::RealTime => "paced",
             Pacing::Instant => "zero-airtime",
+        },
+        match pattern {
+            NotePattern::Detached => "detached",
+            NotePattern::Legato => "legato",
         }
     );
     // Sub-millisecond results need more digits.
@@ -587,7 +659,7 @@ fn run_loopback_metrics(
         }
     };
     for profile in profiles {
-        let s = measure_midi_loopback_with(profile, notes, pacing)?;
+        let s = measure_midi_loopback_pattern(profile, notes, pacing, pattern)?;
         if s.n < notes {
             return Err(anyhow!(
                 "{}: only {} of {} NoteOns delivered",
@@ -901,7 +973,7 @@ struct Monitor {
     stats: Option<LinkStats>,
     last_msg: Option<String>,
     last_packet: Option<Instant>,
-    tx: Option<(usize, f32)>,
+    tx: Option<(usize, f32, u64)>,
     last_status: Instant,
     last_json_level: Instant,
 }
@@ -977,7 +1049,11 @@ impl Monitor {
                 }
             }
             EngineEvent::Stats(s) => self.stats = Some(s.clone()),
-            EngineEvent::TxStatus { queued, latency_ms } => self.tx = Some((*queued, *latency_ms)),
+            EngineEvent::TxStatus {
+                queued,
+                latency_ms,
+                dropped,
+            } => self.tx = Some((*queued, *latency_ms, *dropped)),
             EngineEvent::Log(line) if line.starts_with("TX ") => {
                 self.last_msg = Some(line.trim_start_matches("TX ").to_string());
             }
@@ -1017,6 +1093,7 @@ impl Monitor {
                 "link_alive": s.link_alive,
                 "crc_pass": s.crc_pass,
                 "crc_fail": s.crc_fail,
+                "wrong_key_suspects": s.wrong_key_suspects,
                 "crc_pass_rate": s.crc_pass_rate,
                 "fec_corrected": s.fec_corrected,
                 "sync_lost": s.sync_lost,
@@ -1038,8 +1115,12 @@ impl Monitor {
                 "kind": kind.as_str(),
                 "message": message,
             }),
-            EngineEvent::TxStatus { queued, latency_ms } => {
-                json!({ "event": "tx_status", "queued": queued, "latency_ms": latency_ms })
+            EngineEvent::TxStatus {
+                queued,
+                latency_ms,
+                dropped,
+            } => {
+                json!({ "event": "tx_status", "queued": queued, "latency_ms": latency_ms, "dropped": dropped })
             }
             EngineEvent::Stopped => json!({ "event": "stopped" }),
         };
@@ -1082,7 +1163,14 @@ impl Monitor {
                 };
                 let (crc, fec, conf) = match &self.stats {
                     Some(s) => (
-                        format!("{} ok / {} fail", s.crc_pass, s.crc_fail),
+                        if s.wrong_key_suspects > 0 {
+                            format!(
+                                "{} ok / {} fail ({} other key?)",
+                                s.crc_pass, s.crc_fail, s.wrong_key_suspects
+                            )
+                        } else {
+                            format!("{} ok / {} fail", s.crc_pass, s.crc_fail)
+                        },
                         s.fec_corrected.to_string(),
                         format!("{:.1} dB", s.confidence_db),
                     ),
@@ -1105,10 +1193,10 @@ impl Monitor {
                 }
             }
             Role::Encoder => {
-                let (queued, late) = self.tx.unwrap_or((0, 0.0));
+                let (queued, late, dropped) = self.tx.unwrap_or((0, 0.0, 0));
                 self.print(&format!(
-                    "[status] TX queue {} · oldest waiting {:.0} ms · last: {}",
-                    queued, late, last
+                    "[status] TX queue {} · oldest waiting {:.0} ms · dropped {} · last: {}",
+                    queued, late, dropped, last
                 ));
             }
         }
@@ -1179,6 +1267,20 @@ fn monitor(
     }
 }
 
+/// Link-level decoder options (spec §4.1 link key, §5.3 fail-safe).
+struct DecoderLink {
+    link_key: u16,
+    link_dead_ms: Option<u32>,
+    fail_safe_burst: bool,
+}
+
+/// Link-level encoder options (spec §4.1 link key, §5.4 MSC filter).
+struct EncoderLink {
+    link_key: u16,
+    msc_filter: MscFilter,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_decoder(
     audio_in: DeviceSelector,
     midi_out: DeviceSelector,
@@ -1186,6 +1288,7 @@ fn run_decoder(
     profile: &str,
     audio: &AudioOptions,
     json: bool,
+    link: DecoderLink,
 ) -> Result<ExitCode> {
     let mon = Monitor::new(Role::Decoder, json);
     mon.note("Initializing Cricket decoder...");
@@ -1203,15 +1306,21 @@ fn run_decoder(
         mon.warning(&w);
     }
     if !json {
-        mon.note("Type `panic` + Enter for Sustain off + All Notes Off on all channels; Ctrl-C stops (burst sent first).");
+        if link.fail_safe_burst {
+            mon.note("Type `panic` + Enter for Sustain off + All Notes Off on all channels; Ctrl-C stops (burst sent first).");
+        } else {
+            mon.note("Fail-safe burst off (--no-failsafe-burst): link-dead, `panic` and Ctrl-C send nothing to MIDI out.");
+        }
     }
     let mut dec = DecoderHandle::start(DecoderConfig {
         audio_in: AudioIn::Device(audio_in),
         midi_out,
         profile: profile.into(),
-        link_dead_ms: None,
+        link_dead_ms: link.link_dead_ms,
         msc,
         audio: audio.clone(),
+        link_key: link.link_key,
+        fail_safe_burst: link.fail_safe_burst,
     })?;
     let events = dec.take_events();
     monitor(Handle::Decoder(dec), events, mon)
@@ -1226,6 +1335,7 @@ fn run_encoder(
     tx_level_db: f32,
     audio: &AudioOptions,
     json: bool,
+    link: EncoderLink,
 ) -> Result<ExitCode> {
     let mon = Monitor::new(Role::Encoder, json);
     mon.note("Initializing Cricket encoder...");
@@ -1254,6 +1364,8 @@ fn run_encoder(
         simulate,
         tx_level_dbfs: Some(tx_level_db),
         audio: audio.clone(),
+        link_key: link.link_key,
+        msc_filter: link.msc_filter,
     })?;
     let events = enc.take_events();
     monitor(Handle::Encoder(enc), events, mon)

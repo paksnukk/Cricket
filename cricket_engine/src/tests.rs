@@ -1,6 +1,8 @@
 //! Engine-level tests on in-memory endpoints (no audio/MIDI hardware).
 
-use crate::testing::{FailingAudio, MemoryAudio, MemoryMidiInput, RecordingMidiSink};
+use crate::testing::{
+    FailingAudio, MemoryAudio, MemoryMidiInjector, MemoryMidiInput, RecordingMidiSink,
+};
 use crate::*;
 use cricket_core::modem::CricketModemTx;
 use cricket_core::phy::{LinkState, PhyConfig};
@@ -57,6 +59,8 @@ fn memory_decoder(source: testing::MemorySource, rec: &RecordingMidiSink) -> Dec
         link_dead_ms: None,
         msc: MscTarget::default(),
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: true,
     })
     .unwrap()
 }
@@ -76,6 +80,8 @@ fn loopback_midi_in_to_midi_out() {
         simulate: false,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .unwrap();
 
@@ -177,6 +183,8 @@ fn simulated_scale_reaches_decoder() {
         simulate: true,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .unwrap();
     let ok = wait_for(Duration::from_secs(15), || {
@@ -201,6 +209,8 @@ fn no_midi_in_sends_heartbeats_only() {
         simulate: false,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .unwrap();
     // Two heartbeat intervals plus airtime: the scale would have struck
@@ -240,6 +250,8 @@ fn stop_joins_worker_and_ends_with_stopped() {
         simulate: true,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -292,6 +304,8 @@ fn audio_open_error_is_logged_and_worker_ends() {
         link_dead_ms: None,
         msc: MscTarget::default(),
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: true,
     })
     .unwrap();
     let logs = log_lines(&expect_stopped_then_closed(dec.events()));
@@ -299,6 +313,7 @@ fn audio_open_error_is_logged_and_worker_ends() {
         logs,
         vec![
             "Starting decoder (profile=analog-safe)...".to_string(),
+            "Link key none (unkeyed link); link-dead after 2000 ms; fail-safe burst on.".to_string(),
             "No MIDI out selected — decode to UI only.".to_string(),
             "Audio input error: boom".to_string(),
         ]
@@ -312,6 +327,8 @@ fn audio_open_error_is_logged_and_worker_ends() {
         simulate: false,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .unwrap();
     let logs = log_lines(&expect_stopped_then_closed(enc.events()));
@@ -369,6 +386,8 @@ fn stall_decoder(source: testing::MemorySource, rec: &RecordingMidiSink) -> Deco
         link_dead_ms: Some(TEST_LINK_DEAD_MS as u32),
         msc: MscTarget::default(),
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: true,
     })
     .unwrap()
 }
@@ -449,9 +468,11 @@ fn input_stall_after_packet_sends_one_burst_in_time() {
     assert_eq!(midi.first(), Some(&vec![0x90, 60, 100]), "{:?}", midi);
     assert_eq!(count(&midi, &ALL_NOTES_OFF), 1, "{:?}", midi);
     assert_eq!(count(&midi, &SUSTAIN_OFF), 1, "{:?}", midi);
-    // The burst covers every channel.
+    // The burst covers every channel and starts with the explicit Note Off
+    // for the note this receiver turned on.
     assert_eq!(count(&midi, &[0xBF, 0x7B, 0x00]), 1, "{:?}", midi);
-    assert_eq!(midi.len(), 1 + 32, "{:?}", midi);
+    assert_eq!(midi.get(1), Some(&vec![0x80, 60, 0x40]), "{:?}", midi);
+    assert_eq!(midi.len(), 1 + 33, "{:?}", midi);
 
     assert!(dec.stop());
     let events: Vec<EngineEvent> = dec.events().try_iter().collect();
@@ -565,6 +586,8 @@ fn device_errors_become_alarms() {
         simulate: false,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .unwrap();
 
@@ -651,6 +674,8 @@ fn stop_and_panic_send_fail_safe_burst() {
         link_dead_ms: None,
         msc: MscTarget::default(),
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: true,
     })
     .unwrap();
     assert!(dec.stop());
@@ -671,6 +696,8 @@ fn midi_out_failure_is_one_alarm_and_clears() {
         link_dead_ms: None,
         msc: MscTarget::default(),
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: true,
     })
     .unwrap();
     let mut tx = CricketModemTx::new(PhyConfig::fast());
@@ -786,6 +813,8 @@ fn unknown_profile_is_an_error() {
         link_dead_ms: None,
         msc: MscTarget::default(),
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: true,
     })
     .err()
     .expect("unknown profile must fail");
@@ -801,6 +830,8 @@ fn unknown_profile_is_an_error() {
         simulate: false,
         tx_level_dbfs: None,
         audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        msc_filter: MscFilter::default(),
     })
     .err()
     .expect("unknown profile must fail");
@@ -821,6 +852,8 @@ fn tx_level_is_applied() {
             link_dead_ms: None,
             msc: MscTarget::default(),
             audio: AudioOptions::default(),
+            link_key: DEFAULT_LINK_KEY,
+            fail_safe_burst: true,
         })
         .unwrap();
         let mut enc = EncoderHandle::start(EncoderConfig {
@@ -830,6 +863,8 @@ fn tx_level_is_applied() {
             simulate: false,
             tx_level_dbfs: level,
             audio: AudioOptions::default(),
+            link_key: DEFAULT_LINK_KEY,
+            msc_filter: MscFilter::default(),
         })
         .unwrap();
         // A heartbeat is 169 ms of tone at the TX level: the loudest 50 ms
@@ -862,4 +897,193 @@ fn tx_level_is_applied() {
         );
         assert!(enc.stop() && dec.stop());
     }
+}
+
+// --- Link key, MSC filter, fail-safe burst switch ---------------------------
+
+/// Encoder → decoder with per-end link keys and the encoder's MSC filter.
+fn keyed_rig(
+    enc_key: u16,
+    dec_key: u16,
+    msc_filter: MscFilter,
+    fail_safe_burst: bool,
+) -> (
+    EncoderHandle,
+    DecoderHandle,
+    MemoryMidiInjector,
+    RecordingMidiSink,
+) {
+    let (sink, source) = MemoryAudio::pair(RATE, RATE as usize * 4);
+    let rec = RecordingMidiSink::new();
+    let dec = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Custom(Box::new(source)),
+        midi_out: MidiOut::Custom(Box::new(rec.clone())),
+        profile: "fast".into(),
+        link_dead_ms: None,
+        msc: MscTarget::default(),
+        audio: AudioOptions::default(),
+        link_key: dec_key,
+        fail_safe_burst,
+    })
+    .unwrap();
+    let (midi_in, injector) = MemoryMidiInput::new();
+    let enc = EncoderHandle::start(EncoderConfig {
+        audio_out: AudioOut::Custom(Box::new(sink)),
+        midi_in: MidiIn::Custom(Box::new(midi_in)),
+        profile: "fast".into(),
+        simulate: false,
+        tx_level_dbfs: None,
+        audio: AudioOptions::default(),
+        link_key: enc_key,
+        msc_filter,
+    })
+    .unwrap();
+    assert!(wait_for(Duration::from_secs(5), || injector.inject(&[0xF6])));
+    (enc, dec, injector, rec)
+}
+
+/// With different link keys nothing is delivered and the decoder counts
+/// the encoder's packets as wrong-key suspects; with the same key (a
+/// passphrase on both ends) notes arrive.
+#[test]
+fn link_key_mismatch_delivers_nothing() {
+    let key = parse_link_key("stage left");
+    let (mut enc, mut dec, injector, rec) =
+        keyed_rig(key, DEFAULT_LINK_KEY, MscFilter::default(), true);
+    injector.inject(&[0x90, 60, 100]);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(rec.is_empty(), "{:?}", rec.messages());
+    let events: Vec<EngineEvent> = dec.events().try_iter().collect();
+    let suspects = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Stats(s) => Some(s.wrong_key_suspects),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(suspects >= 1, "{:?}", events);
+    assert!(!events.iter().any(|e| matches!(e, EngineEvent::Decoded(_))));
+    let logs = log_lines(&events);
+    assert!(
+        logs.iter()
+            .any(|l| l
+                == "Link key none (unkeyed link); link-dead after 2000 ms; fail-safe burst on."),
+        "{:?}",
+        logs
+    );
+    assert!(enc.stop() && dec.stop());
+
+    let (mut enc, mut dec, injector, rec) = keyed_rig(key, key, MscFilter::default(), true);
+    injector.inject(&[0x90, 61, 100]);
+    assert!(wait_for(Duration::from_secs(3), || rec
+        .messages()
+        .contains(&vec![0x90, 61, 100])));
+    let logs = log_lines(&enc.events().try_iter().collect::<Vec<_>>());
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("Link key set (0x••••); MSC accepted any device")),
+        "{:?}",
+        logs
+    );
+    assert!(enc.stop() && dec.stop());
+}
+
+/// The encoder's MSC filter carries only cues for its device (or all-call);
+/// the first cue for another device is logged once.
+#[test]
+fn msc_filter_drops_cues_for_other_devices() {
+    let filter = MscFilter {
+        device_id: Some(3),
+        command_format: Some(0x10),
+    };
+    let (mut enc, mut dec, injector, rec) =
+        keyed_rig(DEFAULT_LINK_KEY, DEFAULT_LINK_KEY, filter, true);
+    let go = |device: u8, format: u8, cue: u8| -> Vec<u8> {
+        vec![0xF0, 0x7F, device, 0x02, format, 0x01, b'0' + cue, 0xF7]
+    };
+    injector.inject(&go(1, 0x10, 1)); // another device
+    injector.inject(&go(3, 0x01, 2)); // another format
+    injector.inject(&go(3, 0x10, 3)); // ours
+    injector.inject(&go(0x7F, 0x7F, 4)); // all-call, all-types
+    injector.inject(&go(0x7F, 0x10, 5)); // all-call, our format
+
+    // Re-stamped with the decoder's target (all-call, Lighting).
+    let out = |cue: u8| vec![0xF0, 0x7F, 0x7F, 0x02, 0x01, 0x01, b'0' + cue, 0xF7];
+    assert!(wait_for(Duration::from_secs(5), || rec
+        .messages()
+        .contains(&out(5))));
+    std::thread::sleep(Duration::from_millis(300));
+    // (The rig's connection probe, a Tune Request, arrives too.)
+    let midi: Vec<Vec<u8>> = rec
+        .messages()
+        .into_iter()
+        .filter(|m| m.first() == Some(&0xF0))
+        .collect();
+    assert_eq!(midi, vec![out(3), out(4), out(5)], "{:?}", midi);
+    let logs = log_lines(&enc.events().try_iter().collect::<Vec<_>>());
+    assert_eq!(
+        logs.iter()
+            .filter(|l| l.starts_with("MSC for device 0x01 / format 0x10 not sent"))
+            .count(),
+        1,
+        "{:?}",
+        logs
+    );
+    assert!(enc.stop() && dec.stop());
+}
+
+/// With the fail-safe burst off, Panic, link-dead and stop send nothing to
+/// MIDI out, while link-dead is still reported.
+#[test]
+fn fail_safe_burst_can_be_switched_off() {
+    let (mut sink, source) = MemoryAudio::pair(RATE, RATE as usize * 4);
+    let rec = RecordingMidiSink::new();
+    let mut dec = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Custom(Box::new(source)),
+        midi_out: MidiOut::Custom(Box::new(rec.clone())),
+        profile: "fast".into(),
+        link_dead_ms: Some(TEST_LINK_DEAD_MS as u32),
+        msc: MscTarget::default(),
+        audio: AudioOptions::default(),
+        link_key: DEFAULT_LINK_KEY,
+        fail_safe_burst: false,
+    })
+    .unwrap();
+    dec.panic();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(rec.is_empty());
+
+    let mut tx = CricketModemTx::new(PhyConfig::fast());
+    let audio = packet_audio(&mut tx, 60, TEST_LINK_DEAD_MS as usize + 400);
+    push_and_drain(&mut sink, &audio);
+    let events = collect_until(dec.events(), Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            EngineEvent::Alarm {
+                kind: AlarmKind::LinkDead,
+                ..
+            }
+        )
+    });
+    assert!(
+        alarms(&events, AlarmKind::LinkDead)
+            .iter()
+            .any(|m| m.ends_with("fail-safe burst is off: nothing sent to MIDI out")),
+        "{:?}",
+        events
+    );
+    assert_eq!(rec.messages(), vec![vec![0x90, 60, 100]]);
+    assert!(dec.stop());
+    assert_eq!(
+        rec.messages(),
+        vec![vec![0x90, 60, 100]],
+        "no burst on stop"
+    );
+    let logs = log_lines(&dec.events().try_iter().collect::<Vec<_>>());
+    assert!(
+        logs.iter().any(|l| l == "Link dead (fail-safe burst off)"),
+        "{:?}",
+        logs
+    );
 }

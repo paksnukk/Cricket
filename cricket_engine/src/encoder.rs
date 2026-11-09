@@ -11,13 +11,18 @@
 //! stage must never receive notes nobody played.
 
 use crate::audio::{AudioOptions, AudioOut, AudioSink};
+use crate::decoder::link_key_label;
 use crate::events::{format_message, AlarmKind, EngineEvent};
 use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::{anyhow, Result};
-use cricket_core::modem::{refresh_spacing_samples, repetition_samples, CricketModemTx};
+use cricket_core::modem::{
+    refresh_quiet_samples, refresh_spacing_samples, repetition_samples, CricketModemTx,
+};
 use cricket_core::phy::{Modulation, PhyConfig};
-use cricket_core::transport::{midi_input, MidiInput, TransportMessage, TxScheduler};
+use cricket_core::transport::{
+    midi_input_filtered, MidiInput, MscFilter, TransportMessage, TxScheduler,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -49,6 +54,14 @@ pub struct EncoderConfig {
     /// Device buffer size, sample format and output channel (cpal devices
     /// only).
     pub audio: AudioOptions,
+    /// Link key (spec §4.1), the same as the decoder's;
+    /// `cricket_core::link::DEFAULT_LINK_KEY` (`0xFFFF`) is the unkeyed
+    /// link.
+    pub link_key: u16,
+    /// Which MSC the encoder carries (spec §5.4, multi-device rigs): by
+    /// default every device ID and command format. With a filter, MSC
+    /// addressed to another device is not sent (logged once).
+    pub msc_filter: MscFilter,
 }
 
 /// What the MIDI callback and [`EncoderHandle::send`] hand to the worker.
@@ -56,6 +69,11 @@ enum Incoming {
     Message(TransportMessage),
     /// A message that cannot be carried exactly; reported, not sent.
     Rejected(String),
+    /// MSC for another device ID / command format than the filter accepts.
+    NotAddressed {
+        device_id: u8,
+        command_format: u8,
+    },
 }
 
 /// Messages for the worker and the condition variable that wakes it.
@@ -170,7 +188,7 @@ const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 
 fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     let name = PhyConfig::canonical_name(&cfg.profile).unwrap_or_else(|| cfg.profile.clone());
-    let mut config = phy;
+    let mut config = phy.with_link_key(cfg.link_key);
     let digital = matches!(config.modulation, Modulation::Digital);
     if let Some(db) = cfg.tx_level_dbfs {
         if digital {
@@ -185,6 +203,11 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
         config.tx_level_dbfs(),
         if cfg.simulate { "ON" } else { "off" }
     ));
+    ev.log(format!(
+        "Link key {}; MSC accepted {}.",
+        link_key_label(config.link_key),
+        msc_filter_label(&cfg.msc_filter)
+    ));
 
     let est_latency = config.estimated_first_copy_ms();
     let preferred_sample_rate = config.sample_rate_hz;
@@ -192,20 +215,30 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
 
     let on_midi = {
         let pending = pending.clone();
+        let filter = cfg.msc_filter;
         move || -> MidiCallback {
+            let pending = pending.clone();
             Box::new(move |message: &[u8]| {
-                let incoming = match midi_input(message) {
+                let incoming = match midi_input_filtered(message, &filter) {
                     MidiInput::Message(msg) => Incoming::Message(msg),
                     MidiInput::Rejected(e) => Incoming::Rejected(format!(
                         "Can't be sent over this link: {} — not sent",
                         e
                     )),
+                    MidiInput::NotAddressed {
+                        device_id,
+                        command_format,
+                    } => Incoming::NotAddressed {
+                        device_id,
+                        command_format,
+                    },
                     MidiInput::Ignored => return,
                 };
                 pending.push(incoming);
             })
         }
     };
+    let mut not_addressed_logged = false;
     // Keeps the MIDI input connected for the worker's lifetime.
     let _midi_conn = match cfg.midi_in {
         MidiIn::None => {
@@ -291,13 +324,15 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
 
     let mut tx = CricketModemTx::new(config.clone());
     let mut scheduler = TxScheduler::new(stream_sample_rate, heartbeat_samples, message_samples)
-        .with_refresh_spacing(refresh_spacing_samples(&config, stream_sample_rate));
+        .with_refresh_spacing(refresh_spacing_samples(&config, stream_sample_rate))
+        .with_refresh_quiet(refresh_quiet_samples(&config, stream_sample_rate));
     let stream_start = Instant::now();
     let mut note_idx = 0usize;
     let scale = [0u8, 2, 4, 5, 7, 9, 11, 12];
     let mut last_sim = Instant::now() - SIM_INTERVAL;
     let mut sim_sounding: Option<u8> = None;
     let mut last_status = Instant::now();
+    let mut dropped_total: u64 = 0;
     let sink = sink.as_mut();
     let rate = f64::from(stream_sample_rate.max(1));
     let mut wait = Duration::ZERO;
@@ -318,12 +353,33 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
                         message,
                     });
                 }
+                Incoming::NotAddressed {
+                    device_id,
+                    command_format,
+                } => {
+                    if !not_addressed_logged {
+                        not_addressed_logged = true;
+                        ev.log(format!(
+                            "MSC for device {:#04x} / format {:#04x} not sent (this encoder accepts {}); further ones are not logged",
+                            device_id,
+                            command_format,
+                            msc_filter_label(&cfg.msc_filter)
+                        ));
+                    }
+                }
             }
         }
 
-        if scheduler.note_on_dropped {
-            ev.log("TX dropped a queued NoteOn (queue airtime budget exceeded)");
-            scheduler.note_on_dropped = false;
+        let note_ons = core::mem::take(&mut scheduler.note_ons_dropped);
+        let others = core::mem::take(&mut scheduler.queue_dropped);
+        if note_ons > 0 || others > 0 {
+            dropped_total += u64::from(note_ons) + u64::from(others);
+            let message = drop_message(note_ons, others, scheduler.max_note_ons(), &name);
+            ev.log(format!("WARNING: {}", message));
+            ev.send(EngineEvent::Alarm {
+                kind: AlarmKind::MessageDropped,
+                message,
+            });
         }
 
         if use_sim && last_sim.elapsed() >= SIM_INTERVAL {
@@ -400,7 +456,11 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
             let queued = scheduler.queued();
             let late = scheduler.oldest_wait_samples(tx_time) + sink.buffered() as u64;
             let latency_ms = late as f32 * 1000.0 / stream_sample_rate.max(1) as f32;
-            ev.send(EngineEvent::TxStatus { queued, latency_ms });
+            ev.send(EngineEvent::TxStatus {
+                queued,
+                latency_ms,
+                dropped: dropped_total,
+            });
             last_status = Instant::now();
         }
 
@@ -420,6 +480,54 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
     }
 
     ev.log("Encoder stopped.");
+}
+
+/// The MSC filter for a log line.
+fn msc_filter_label(filter: &MscFilter) -> String {
+    let field = |v: Option<u8>| match v {
+        Some(v) => format!("{v:#04x}"),
+        None => "any".to_string(),
+    };
+    if filter.is_filtering() {
+        format!(
+            "device {} / format {} (and all-call)",
+            field(filter.device_id),
+            field(filter.command_format)
+        )
+    } else {
+        "any device ID and command format".to_string()
+    }
+}
+
+/// The alarm text for `note_ons` NoteOns refused beyond the chord limit
+/// `max_note_ons` and `others` tier-3 messages dropped for the queue bound.
+fn drop_message(note_ons: u32, others: u32, max_note_ons: usize, profile: &str) -> String {
+    let plural = |n: u32, what: &str| {
+        if n == 1 {
+            format!("1 {what}")
+        } else {
+            format!("{n} {what}s")
+        }
+    };
+    let mut parts = Vec::new();
+    if note_ons > 0 {
+        parts.push(format!(
+            "{} (more than {} notes queued at once; the ones struck first were sent)",
+            plural(note_ons, "NoteOn"),
+            max_note_ons
+        ));
+    }
+    if others > 0 {
+        parts.push(format!(
+            "{} (more than 1 s of controller / program / system traffic queued; the oldest went)",
+            plural(others, "message")
+        ));
+    }
+    format!(
+        "TX dropped {} — the link is overloaded for {}; play fewer notes at once or use a faster profile",
+        parts.join(" and "),
+        profile
+    )
 }
 
 /// Queue `samples`, waiting up to ~2 s while the sink is full (then counting

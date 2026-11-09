@@ -36,6 +36,18 @@ const mscFormatSelect = document.getElementById(
 const txLevelInput = document.getElementById(
   "tx-level-input",
 ) as HTMLInputElement;
+const linkKeyInput = document.getElementById(
+  "link-key-input",
+) as HTMLInputElement;
+const mscAcceptSelect = document.getElementById(
+  "msc-accept-select",
+) as HTMLSelectElement;
+const failsafeBurstCheck = document.getElementById(
+  "failsafe-burst-check",
+) as HTMLInputElement;
+const linkWrongKeyEl = document.getElementById(
+  "link-wrong-key",
+) as HTMLElement;
 const setupWarnings = document.getElementById(
   "setup-warnings",
 ) as HTMLUListElement;
@@ -57,6 +69,7 @@ const decoderPanicBtn = document.getElementById(
   "decoder-panic-btn",
 ) as HTMLButtonElement;
 const txQueuedEl = document.getElementById("tx-queued") as HTMLElement;
+const txDroppedEl = document.getElementById("tx-dropped") as HTMLElement;
 const txQueueLatencyEl = document.getElementById(
   "tx-queue-latency",
 ) as HTMLElement;
@@ -141,6 +154,12 @@ interface AppSettings {
   audio_out_channel: number;
   /** Encoder transmit level, peak dBFS. */
   tx_level_db: number;
+  /** Link key as typed (`0x1234` or a passphrase); empty = unkeyed. */
+  link_key: string;
+  /** Encoder MSC filter: device ID whose cues are carried (null = any). */
+  msc_accept_device: number | null;
+  /** Decoder: send the fail-safe burst on link-dead / Panic / stop. */
+  fail_safe_burst: boolean;
 }
 
 /** One profile of the catalog (`get_profiles`). */
@@ -190,11 +209,19 @@ function populateMscSelects() {
     select.appendChild(o);
   };
   add(mscDeviceSelect, 0x7f, "All-call (0x7F)");
+  // The encoder filter: any device (no filter), or one device / group
+  // (all-call cues always pass).
+  const any = document.createElement("option");
+  any.value = "";
+  any.textContent = "Any device (no filter)";
+  mscAcceptSelect.appendChild(any);
   for (let id = 0; id <= 0x6f; id++) {
     add(mscDeviceSelect, id, `${id} (${hex(id)})`);
+    add(mscAcceptSelect, id, `${id} (${hex(id)}) + all-call`);
   }
   for (let g = 0x70; g <= 0x7e; g++) {
     add(mscDeviceSelect, g, `Group ${g - 0x6f} (${hex(g)})`);
+    add(mscAcceptSelect, g, `Group ${g - 0x6f} (${hex(g)}) + all-call`);
   }
   const formats: [number, string][] = [
     [0x01, "Lighting (General)"],
@@ -432,6 +459,11 @@ function selectedChannel(select: HTMLSelectElement): number {
   return Number.isFinite(v) && v >= 1 ? v : 1;
 }
 
+/** The encoder's MSC device filter: null = any device. */
+function mscAcceptDevice(): number | null {
+  return mscAcceptSelect.value === "" ? null : Number(mscAcceptSelect.value);
+}
+
 function txLevelDb(): number {
   const v = Number(txLevelInput.value);
   if (!Number.isFinite(v)) return DEFAULT_TX_LEVEL_DB;
@@ -652,6 +684,15 @@ async function loadDevices() {
     populateMscSelects();
     selectMsc(mscDeviceSelect, settings.msc_device_id, 0x7f);
     selectMsc(mscFormatSelect, settings.msc_command_format, 0x01);
+    mscAcceptSelect.value =
+      settings.msc_accept_device === null || settings.msc_accept_device === undefined
+        ? ""
+        : String(settings.msc_accept_device);
+    if (linkKeyInput.dataset.loaded !== "1") {
+      linkKeyInput.value = settings.link_key ?? "";
+      failsafeBurstCheck.checked = settings.fail_safe_burst ?? true;
+      linkKeyInput.dataset.loaded = "1";
+    }
     const modeRadio = document.querySelector(
       `input[name="mode"][value="${settings.mode || "both"}"]`,
     ) as HTMLInputElement | null;
@@ -681,6 +722,9 @@ async function persistSettings() {
     audio_in_channel: selectedChannel(inputChannelSelect),
     audio_out_channel: selectedChannel(outputChannelSelect),
     tx_level_db: txLevelDb(),
+    link_key: linkKeyInput.value.trim(),
+    msc_accept_device: mscAcceptDevice(),
+    fail_safe_burst: failsafeBurstCheck.checked,
   };
   await invoke("set_settings", { settings });
   log("Settings saved.");
@@ -777,6 +821,9 @@ function setRunningUi(role: Role, running: boolean) {
     midiInSelect.disabled = running;
     simulateCheck.disabled = running;
     txLevelInput.disabled = running;
+    linkKeyInput.disabled = running;
+    mscAcceptSelect.disabled = running;
+    failsafeBurstCheck.disabled = running;
     if (!running) clearTxQueueDisplay();
   }
 }
@@ -818,6 +865,8 @@ interface LinkStatsPayload {
   state: string;
   crc_pass: number;
   crc_fail: number;
+  /** CRC failures with a packet's structure: another link's key. */
+  wrong_key_suspects: number;
   fec_corrected: number;
   confidence_db: number;
   last_seq: number | null;
@@ -945,6 +994,8 @@ startListenBtn.addEventListener("click", async () => {
       profile: profileSelect.value,
       mscDeviceId: Number(mscDeviceSelect.value || 0x7f),
       mscCommandFormat: Number(mscFormatSelect.value || 0x01),
+      linkKey: linkKeyInput.value.trim(),
+      failSafeBurst: failsafeBurstCheck.checked,
     });
     if (trackRun("decoder", runId)) {
       decodedDisplay.innerHTML =
@@ -988,6 +1039,8 @@ startEncodeBtn.addEventListener("click", async () => {
       // sends heartbeats only.
       simulate: simulateCheck.checked,
       txLevelDb: txLevelDb(),
+      linkKey: linkKeyInput.value.trim(),
+      mscAcceptDevice: mscAcceptDevice(),
     });
     trackRun("encoder", runId);
     await persistSettings();
@@ -1058,6 +1111,10 @@ async function bindEvents() {
     linkStateEl.textContent = s.state;
     linkConfidenceEl.textContent = s.confidence_db.toFixed(1);
     linkCrcEl.textContent = `${s.crc_pass} / ${s.crc_fail}`;
+    linkWrongKeyEl.textContent =
+      s.wrong_key_suspects > 0
+        ? `(${s.wrong_key_suspects} from another link key?)`
+        : "";
     linkCrcFailRateEl.textContent = perMinute((h) => h.crcFail);
     linkFecEl.textContent = String(s.fec_corrected);
     linkFecRateEl.textContent = perMinute((h) => h.fec);
@@ -1097,11 +1154,16 @@ async function bindEvents() {
     },
   );
 
-  await listen<{ queued: number; latency_ms: number }>("tx_status", (event) => {
-    const { queued, latency_ms } = event.payload;
-    txQueuedEl.textContent = String(queued);
-    txQueueLatencyEl.textContent = latency_ms.toFixed(0);
-  });
+  await listen<{ queued: number; latency_ms: number; dropped: number }>(
+    "tx_status",
+    (event) => {
+      const { queued, latency_ms, dropped } = event.payload;
+      txQueuedEl.textContent = String(queued);
+      txQueueLatencyEl.textContent = latency_ms.toFixed(0);
+      txDroppedEl.textContent = String(dropped);
+      txDroppedEl.style.color = dropped > 0 ? "#d64545" : "";
+    },
+  );
 }
 
 setInterval(updateLight, 250);

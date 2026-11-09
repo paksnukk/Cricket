@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Protocol** | AML (AudioMIDI Link) version **1**: header version nibble `1` (§4.1) |
-| **Document** | AML v1 — revision **r4**, 2026-11-09 |
+| **Document** | AML v1 — revision **r5**, 2026-11-09 |
 | **Status** | Pre-release draft. §3–§5 and §6.1–§6.4 are complete and tested in software; §6.5 is **provisional**. Nothing has been proven on a real show chain yet (see §7). The first tagged release of the reference implementation (Cricket **v0.2.0**) freezes the wire format of the stable sections under the policy below. |
 | **Reference implementation** | Cricket (`cricket_core`), <https://github.com/paksnukk/Cricket>; test vectors in §9 are asserted by its test suite |
 | **Informative material** | `docs/proposals/fec.md`, `docs/proposals/ltc-bmc.md` (adopted), `docs/proposals/digital-transparent.md` (experimental, not part of v1) |
@@ -16,6 +16,7 @@
 | r2 | 2026-10-15 | **Wire changes:** body FEC (Reed–Solomon over GF(16), whitening) and the packet validation rules (§4.6–§4.7); joint preamble acquisition (§3.2.2); all MIDI 1.0 channel messages and full MSC (§5.1–§5.4); `SEQ` as a 2-bit counter; controller coalescing and scheduler priorities (§5.5); Robust becomes the coded single-copy profile, Robust repeat the two-copy one (§6); LTC biphase-mark profiles as provisional (§6.5); test vectors (§9). |
 | r3 | 2026-11-09 | This header (status, revision log, errata, versioning policy); §7 renamed from "Release assumptions (v1.0)" to "Release assumptions"; title aligned with the README. Same day: the transmit amplitude becomes a SHOULD of 0.25 (−12 dBFS peak, was 0.8; §3.1, §6, §6.5.2), the §5.5 queue bounds are rewritten (1 s airtime cap on order-3 messages; the "bounded by coalescing" claim was wrong), an unknown profile name is rejected, and the user-facing profile names are listed (informative). No wire-format change: receivers are level-independent and the packet format is untouched. |
 | r4 | 2026-11-09 | **Wire change: orthogonal tone spacing.** The MFSK tone step becomes 1 / symbol duration (§3.1): Robust and Robust repeat 166⅔ Hz (tones 2500 … 5000 Hz, was 100 Hz / 2500 … 4000 Hz), Fast 333⅓ Hz (2500 … 7500 Hz, was 200 Hz / 2500 … 5500 Hz); the line bandwidth each profile needs is now a MUST (§6). Receiver (SHOULD, §3.2): tone-band input filter, purity gate 0.20 for every profile (was 0.25 / 0.30), the joint-acquisition contradiction bar at the gate purity, uncoded bodies keep the best guess instead of aborting, body symbol clock tracking. §9 tone frequencies updated. Both ends must run r4: an r3 receiver hears nothing from an r4 transmitter and vice versa. |
+| r5 | 2026-11-09 | **Wire change (policy rule 1):** the CRC-16 init value is the **link key** (§4.1); the default key `0xFFFF` is the CRC-16/CCITT-FALSE init, so an unkeyed link is bit-identical to r3 and interoperates with it. §4.7 adds the wrong-key count (informative). Fail-safe: timers per profile (§5.3, §6 table, §6.5; shorter from 9600 bit/s and on `digital`), the burst releases the receiver's sounding notes explicitly and MAY be disabled for cue-only links, a suppressed duplicate re-arms link-dead (§5.3). MSC: the transmitter MAY filter by device ID / command format for multi-device rigs (§5.4). Scheduler (§5.5, TX policy, no wire effect): MSC ahead of Note Off; the Note On limit per profile with drop-newest; Note Off repeats on a Fibonacci schedule after a quiet line (coded profiles); controller state refreshed in Heartbeat slots; §5.5 "at most 4 Note Ons" statement replaced. |
 
 Revisions are numbered r1, r2, … per document; a revision id and date identify the text an
 implementation or a measurement refers to. The crate version of the reference implementation is
@@ -269,9 +270,22 @@ SEQ only has to tell consecutive packets apart for duplicate suppression (§4.4)
 the window is shorter than two messages. The six reserved bits are part of the structure a random
 or corrupted block must match (§4.7).
 
-CRC-16/CCITT (poly `0x1021`, init `0xFFFF`, refin=false, refout=false, xorout=`0x0000`)
-covers all bytes from `HDR` through end of `PAYLOAD` (excludes the CRC itself), transmitted high byte
-first.
+CRC-16/CCITT (poly `0x1021`, refin=false, refout=false, xorout=`0x0000`) covers all bytes from
+`HDR` through end of `PAYLOAD` (excludes the CRC itself), transmitted high byte first. Its **init
+value is the link key**, a 16-bit value configured identically on both ends; the default key is
+**`0xFFFF`** (the CRC-16/CCITT-FALSE init), which is the unkeyed link.
+
+**Link key.** A receiver is level-independent down to its silence floor (§3.2), so two Cricket links
+in one multicore or Dante domain, leaking into each other at −40 dB or so, would deliver each other's
+valid packets. With different keys they do not: the CRC is affine in its init value, so for a given
+packet length two keys shift the CRC by the same non-zero amount whatever the data, and every clean
+packet from a link with another key fails the check (not merely with probability 2⁻¹⁶). The key costs
+no wire bits, changes no other field, and leaves the false-accept arithmetic of §4.7 as it is. A
+transmitter MUST compute the CRC with its configured key; a receiver MUST verify with its own. Both
+ends of a link MUST use the same key. An implementation SHOULD accept the key as four hex digits and
+MAY derive it from a passphrase (the reference implementation uses the CRC-16/CCITT-FALSE of the
+passphrase's UTF-8 bytes, mapping the one value that equals `0xFFFF` to `0x0000`). The key is an
+identity, not a secret.
 
 ### 4.2 Nibble mapping
 
@@ -403,7 +417,18 @@ Rules 3–5 exist because the erasure-tolerant decoder offers the CRC many candi
 without them, foreign audio (other profiles' traffic, a misconfigured transmitter) produced a false
 message every few hours; with them, the worst measured case is one per ≥ 62 years of continuous
 worst-case input per receiver (target: one per 10 years; see `docs/proposals/fec.md` §9). Uncoded
-bodies MAY ignore their pad nibbles (the reference receiver does).
+bodies MAY ignore their pad nibbles (the reference receiver does). A neighbouring link of the same
+profile with another link key (§4.1) is the cleanest foreign input: its bodies decode to one
+candidate each, which fails the CRC deterministically; measured, such traffic offers the CRC fewer
+candidates per body than a misconfigured uncoded transmitter.
+
+**Wrong-key count (SHOULD, informative).** A body that passes rules 2–3 (version, type, SEQ,
+canonical payload) but fails the CRC is almost always a packet from a link with another key: random
+data passes rules 2–3 with probability about 2⁻¹⁷. A receiver SHOULD count these separately from
+other CRC failures and show the count to the operator ("packets from another link key"), so a wrong
+key on one end, or crosstalk from a neighbouring link, is diagnosed in seconds instead of looking
+like noise. The reference implementation counts them per body (each of K copies, and a body read
+again after a rejected lock, counts).
 
 ## 5. Transport messages
 
@@ -451,12 +476,24 @@ output; Panic outputs the fail-safe burst (§5.3).
 
 ### 5.3 Fail-safe
 
-- Decoder marks link **dead** if no CRC-valid packet for **`link_dead_ms`** (default **2000 ms**)
-  after the first valid packet. This **sample-clock** link-dead detector is timed in received
+- Decoder marks link **dead** if no CRC-valid packet for **`link_dead_ms`** after the first valid
+  packet. `link_dead_ms` is a profile parameter (§6 table, §6.5): **2000 ms** on the MFSK profiles
+  and the LTC profiles up to 4800 bit/s, **1000 ms** from 9600 bit/s, **500 ms** on `digital`; an
+  implementation MAY let the operator override it. The Heartbeat interval (§5.5) is a quarter to
+  a fifth of it, so three to four heartbeats in a row must be lost before a link that is merely poor is
+  declared dead: at 97 % packet delivery that is one false link-dead per 5–170 h on Robust (per
+  500 ms slot, p³–p⁴), per 2.6–86 h on `ltc9600_fec` (per 250 ms slot), and at 99 % per 70 h–290 d
+  on `ltc9600_fec`; a line that bad is unusable for notes anyway, and a false link-dead costs one
+  burst. The interval is also at least 20 message airtimes, so a heartbeat occupies at most 5 % of
+  the idle line and one in flight stays out of the p95 note latency (measured: a 125 ms heartbeat on
+  `ltc_fec`, 17 %, moved its p95 from 24 to 33 ms; hence 500 ms there).
+  This **sample-clock** link-dead detector is timed in received
   samples: it fires at sample `end of last valid packet + link_dead_ms`, independent of how audio
   is chunked, and is reported in the processing call whose input contains that sample. It fires
   once per event; the next valid packet re-arms it. Link state reads **Dead** from that moment
-  until the next valid packet.
+  until the next valid packet. Every CRC-valid packet re-arms it, **a suppressed duplicate
+  (§4.4) included**: the second copy of a K = 2 transmission is proof of life even though it is
+  not delivered.
 - **Wall-clock input watchdog** (engine RX, distinct from sample-clock link-dead): if the capture
   device delivers no audio samples for **`link_dead_ms`** while the link has been alive (at least
   one valid packet received and sample-clock link-dead not yet fired), the worker emits the
@@ -470,22 +507,36 @@ output; Panic outputs the fail-safe burst (§5.3).
   that goes silent after it later produces its own link-dead burst.
 - Bad-CRC / incomplete frames are discarded; return to search
 - Idle **Heartbeat** timing and keepalive airtime are defined by the TX scheduler (§5.5).
+- An implementation MAY let the operator **disable the burst** for cue-only (MSC) links, where a
+  stray All Notes Off on a shared MIDI line is unwanted. Link-dead MUST still be detected and
+  reported; only the MIDI output of the burst is omitted (on Panic too).
 
-**Fail-safe burst.** For each MIDI channel 1–16 in order: Sustain off (`0xBn 0x40 0x00`), then
-All Notes Off (`0xBn 0x7B 0x00`), then — only on channels whose last Pitch Bend output by this
-receiver was not center and not followed by Reset All Controllers — Pitch Bend center
-(`0xEn 0x00 0x40`). That is 32–48 short messages (~31–46 ms on a 31.25 kbit/s MIDI cable).
+**Fail-safe burst.** For each MIDI channel 1–16 in order: a Note Off (`0x8n note 0x40`) for every
+note this receiver has output a Note On for and no Note Off since (nor All Notes Off / All Sound
+Off on its channel), in ascending note order; then Sustain off (`0xBn 0x40 0x00`), then All Notes
+Off (`0xBn 0x7B 0x00`), then — only on channels whose last Pitch Bend output by this receiver was
+not center and not followed by Reset All Controllers — Pitch Bend center (`0xEn 0x00 0x40`). That is
+32–48 short messages plus one per sounding note (~31–46 ms plus ~1 ms per note on a 31.25 kbit/s
+MIDI cable).
 
+- *Explicit Note Offs first*: several soft synths and DAWs ignore CC123 (All Notes Off); a Note Off
+  per note the receiver itself turned on releases them too. They come before Sustain off so a note
+  held by the pedal is released by the pedal going up right after.
 - *All 16 channels*, not only channels seen since start: the receiver may have restarted while
   notes were sounding, and a stateless burst cannot miss a channel. It is the usual "MIDI panic"
   convention and harmless on channels without notes.
-- *Sustain off first*, because All Notes Off does not release notes held by the pedal.
+- *Sustain off first* (of the channel messages), because All Notes Off does not release notes held
+  by the pedal.
 - *Pitch Bend center* only where this receiver left a bend: a pitch wheel springs back to center, so
   a lost "back to center" would detune every later note; other controllers have no rest position
   and are left alone.
 - *Not sent:* Reset All Controllers (CC121; it also resets expression, modulation and pressure
   that a show may rely on, and its exact effect varies between devices), All Sound Off (CC120;
-  it cuts release tails), and Note Offs per note.
+  it cuts release tails), and Note Offs for notes this receiver did not turn on.
+
+A receiver that restarted, or ran its fail-safe, has lost the pedal and bend state the transmitter
+still holds; the transmitter's controller refresh (§5.5) restores it within a few Heartbeat
+intervals.
 
 ### 5.4 MIDI Show Control
 
@@ -495,8 +546,17 @@ by `00` (`<cue> 00 <list> 00 <path>`).
 
 AML carries the **command and its data only**. The device ID and command format are **receiver
 settings** (default device ID **`0x7F`** all-call, so every MSC device responds; default command format
-**`0x01`** Lighting (General), the format lighting consoles listen for). A transmitter accepts MSC from
-any device ID and in any command format.
+**`0x01`** Lighting (General), the format lighting consoles listen for). By default a transmitter
+accepts MSC from any device ID and in any command format.
+
+**Multi-device rigs: filter at the transmitter.** With several MSC devices on the transmitter's MIDI
+line (a sound console on device 3 / format Sound, a lighting console on device 1 / format Lighting)
+every cue would otherwise cross the link and be re-addressed to the receiver's single target: a
+sound GO would come out as a lighting all-call GO. A transmitter MAY therefore be configured to
+carry only MSC addressed to one device ID and/or one command format; MSC addressed to the all-call
+device ID `0x7F` or in the all-types format `0x7F` always passes, as MSC semantics require. Filtered
+messages are not sent and are not errors (the transmitter SHOULD log the first one). The default,
+no filter, keeps the single-device case as it was.
 
 **Compact form** (payload bytes `b0 b1 b2`, big-endian 24 bits):
 
@@ -543,22 +603,26 @@ scheduler when due; it is not queued with user traffic.
 | Order | Messages |
 |-------|----------|
 | 1 | Panic; channel-mode messages that end notes: CC 120 (All Sound Off), 123 (All Notes Off), 124–127 (Omni Off/On, Mono, Poly) |
-| 2 | Note Off (any channel) and MSC, in arrival order |
-| 3 | Everything else: Note On, Program Change, Control Change, Pitch Bend, pressure, system common |
-| 4 | NoteOff refresh (idle keepalive; see below) |
-| 5 | Heartbeat |
+| 2 | MSC, in arrival order |
+| 3 | Note Off (any channel), in arrival order |
+| 4 | Everything else: Note On, Program Change, Control Change, Pitch Bend, pressure, system common |
+| 5 | NoteOff refresh (idle; see below) |
+| 6 | Heartbeat slot: a pending NoteOff refresh, else a controller refresh, else Heartbeat |
 
-Messages of order 1 and order 2 are never coalesced or dropped.
+Messages of orders 1–3 are never coalesced or dropped. MSC goes ahead of Note Off (r5; before, both
+shared one tier in arrival order) because a cue must not wait behind a chord release: on Robust, four
+Note Offs ahead of a GO delayed it by up to 0.7 s.
 
-**Order within tier 3.** *Continuous* messages — Control Change except Bank Select (CC 0, 32), Data
+**Order within tier 4.** *Continuous* messages — Control Change except Bank Select (CC 0, 32), Data
 Entry (6, 38), Data Increment/Decrement (96, 97), NRPN/RPN select (98–101) and the channel mode
 messages (120–127); Pitch Bend; channel pressure; polyphonic key pressure — are latest-value-wins.
-All other tier-3 messages are *discrete* and keep their arrival order. The next tier-3 message is:
+All other tier-4 messages are *discrete* and keep their arrival order. The next tier-4 message is:
 the oldest discrete message, unless a continuous message **of its channel** was queued before it,
 in which case that continuous message goes first; with no discrete message queued, the oldest
 continuous message. A note therefore waits for at most the controller values of its own channel that
 were set before it (it is struck with them), never for those of other channels. System common
-messages have no channel and keep their place relative to everything.
+messages have no channel and keep their place relative to everything. ("Tier 3" in older text and
+in the reference implementation's `tier3_*` names is this tier.)
 
 **Coalescing (latest value wins).** A continuous message replaces, in place, the newest queued
 continuous message with the same channel, kind and controller (or note, for polyphonic pressure),
@@ -580,43 +644,68 @@ of ringing). A pedal message with held Note Offs is not coalesced.
 
 **Panic and channel mode.** Panic removes queued Note Ons on every channel; a Panic-class channel
 mode message (order 1) removes queued Note Ons of its channel (they would otherwise sound after it).
-Reset All Controllers (CC 121) and Local Control (CC 122) are discrete tier-3 messages: moving them
+Reset All Controllers (CC 121) and Local Control (CC 122) are discrete tier-4 messages: moving them
 ahead of queued controller values would change the resulting state.
 
-**Heartbeat:** every **500 ms** only when fully idle: no message queued, no NoteOff held, and the
-NoteOff refresh list is empty. While user messages or refreshes are pending, Heartbeat uses no
-airtime.
+**Heartbeat slot:** one **Heartbeat interval** (§6 table: 500 ms on the MFSK profiles and the LTC
+profiles up to 4800 bit/s, 250 ms from 9600 bit/s, 100 ms on `digital`) after the last transmission of any
+kind, when nothing is queued, the transmitter sends one message: a pending Note Off refresh if there
+is one (whether or not its schedule below says it is due), else a **controller refresh** (below),
+else a **Heartbeat**. Any of them is a valid packet and keeps the link alive (§5.3). While user
+messages are pending, no Heartbeat airtime is used.
 
 **NoteOff refresh:** after a user Note Off is transmitted, it is repeated (same channel, note and
-velocity) up to **6** times within **10 s** (max **32** most recent releases). When nothing higher in
-the table is pending, each free packet sends a **Note Off** for one refresh entry instead of waiting
-for Heartbeat: the note with the **fewest** refresh transmissions so far, then the **oldest**
-original release. A **Note On** for that channel and note removes it from the refresh list. Refresh
-never runs ahead of a queued message. Each release therefore costs a bounded burst of airtime (6
-messages: about 0.35 s on Fast, 1.05 s on Robust, 1.6 s on Robust repeat, 0.13 s on `ltc_fec`) that a Note On arriving meanwhile may wait behind for
-up to one message.
+velocity) up to **6** times within **10 s** (max **32** most recent releases). Repeat *k* (1–6) is
+sent no earlier than **1, 2, 3, 5, 8, 13 message times** after the user Note Off (a Fibonacci
+spread, so consecutive copies do not fall into one dropout and the six repeats still fit within
+link-dead time: 0.74 s on Fast, 2.3 s on Robust), and on `digital` at least 20 ms after the previous
+copy. On the **coded** profiles (Robust, `ltc*_fec`) and `digital`, which lose few Note Offs
+(Robust: 0.3 % at 2 % symbol errors), a due repeat also waits for a **quiet line**: one message
+time of idle line after the message in flight, so a note struck shortly after another never waits
+behind a repeat; under sustained playing the repeats wait for a pause or the Heartbeat slot. On the
+**uncoded** profiles (Robust repeat, Fast, `ltc*`), which lose far more (Fast: 23 % at 2 %), a due
+repeat takes the first free slot. Among due repeats the note with the **fewest** repeats so far goes
+first, then the **oldest** release. A **Note On** for that channel and note removes it from the
+refresh list. A refresh never runs ahead of a queued message. Measured against the r4 policy (six
+repeats back to back in the first free slots), legato playing on Robust (a note every 300–600 ms,
+each released 60 ms after the next strike) gains 74 ms of mean Note On latency (324 → 250 ms, one
+on-wire copy included), and no note stayed stuck past link-dead time in the stuck-note harness up to
+2 % symbol errors on Robust, Robust repeat and Fast.
 
-**Queue bounds:** queued **Note On** airtime is capped at **250 ms** (one on-wire message period per
-queued Note On, plus one per Note Off held with it). Before accepting another Note On, the oldest
-queued Note On is dropped until the budget fits, but at least **4** queued Note Ons are always kept,
-so a chord survives even when one message is longer than the budget (Robust repeat, 273 ms). At most
-max(4, ⌊250 ms / airtime per message⌋) Note Ons are therefore ever queued: **4** on Robust, Robust
-repeat and Fast, **14** on `ltc`, **11** on `ltc_fec`, **29** on `ltc9600`. A Note Off held with a
-dropped Note On is dropped too, unless the note is still sounding from an earlier strike. A Note Off
-for a note already on the air, MSC, and Panic-class messages are never dropped.
+**Controller refresh:** the transmitter remembers, per channel, the last value it sent for the
+pedals (CC 64, 66, 67, 69), Modulation (CC 1) and Pitch Bend, until a Reset All Controllers (CC 121)
+on that channel. In a Heartbeat slot with no Note Off refresh pending, instead of a Heartbeat it
+re-sends one state that differs from the default — a pedal at 64 or more, Modulation not 0, a bend
+off center — round robin over channels and controllers. It costs no airtime beyond the Heartbeat it
+replaces; a receiver that restarted or ran its fail-safe (§5.3) gets its pedal and bend state back
+within a few Heartbeat intervals, and a receiver that did not sees an idempotent repeat.
 
-The airtime of **everything queued in order 3** — Note On, Program Change, controllers, pitch bend,
+**Note On limit:** at most **N** Note Ons are ever queued, where N = max(⌊250 ms / airtime per
+message⌋, min(10, max(4, ⌊1 s / airtime per message⌋))): **5** on Robust, **4** on Robust repeat,
+**10** on Fast, **14** on `ltc`, **11** on `ltc_fec`, **29** on `ltc9600`, **46** on `ltc14400`.
+A Note On arriving beyond N is **refused** (drop-newest) and counted; the Note Ons already queued
+stay. For a chord struck at once this keeps the notes struck first — the bass, the hand that leads —
+and drops the last; a note that would only have gone out N message times late is reported instead
+(the reference implementation raises an alarm with the count). A Note Off for a refused note is
+not sent either, unless the note is sounding from an earlier strike. Before r5 the oldest queued Note
+On was dropped and at most 4 were queued on the MFSK profiles, so the 6th note of a chord dropped
+the 2nd struck. The limit means a 10-note chord goes out whole on Fast (0.57 s) and a 5-note chord on
+Robust (0.88 s); a run beyond the link's capacity loses notes on either policy, and the alarm tells
+the operator to use a faster profile.
+
+The airtime of **everything queued in order 4** — Note On, Program Change, controllers, pitch bend,
 pressure, system common, plus the Note Offs held behind them — is capped at **1 s**. Before another
-order-3 message is queued, the oldest queued order-3 messages are dropped until it fits, whatever
-their kind, except the 4 protected Note Ons and pedal messages with Note Offs held behind them; the
-queue exceeds the cap only by those. Coalescing alone does not bound the queue: every discrete
-message pins the controller values of its channel queued before it, and discrete messages other than
-Note On had no budget of their own. Dropping a discrete message lets the controller values it
-separated merge again (latest value wins). Under such overload a Bank Select may be separated from
-its Program Change, or an RPN/NRPN select from its Data Entry; every drop is counted and reported.
-Orders 1 and 2 (Panic-class, Note Off, MSC) have no bound: dropping one would leave a note stuck or
-skip a cue, so their queues grow with the input. A source that sustains more Note Offs than the link
-carries is a fault of the source; the scheduler keeps them all and reports the queue depth.
+order-4 message is queued, the oldest queued order-4 messages are dropped until it fits, whatever
+their kind, except Note Ons (bounded by their own limit) and pedal messages with Note Offs held behind
+them; the queue exceeds the cap only by those. Coalescing alone does not bound the queue: every
+discrete message pins the controller values of its channel queued before it, and discrete messages
+other than Note On had no budget of their own. Dropping strictly oldest first means a controller value
+never outlives a discrete message that kept it apart from a newer one, so nothing needs merging
+afterwards. Under such overload a Bank Select may be separated from its Program Change, or an
+RPN/NRPN select from its Data Entry; every drop is counted and reported. Orders 1–3 (Panic-class,
+MSC, Note Off) have no bound: dropping one would leave a note stuck or skip a cue, so their queues
+grow with the input. A source that sustains more Note Offs than the link carries is a fault of the
+source; the scheduler keeps them all and reports the queue depth.
 
 **Audio output ring:** sized to about **two** on-wire messages. The next message is chosen and
 encoded only when buffered output has drained below **10 ms**, so a Note On that arrives while a
@@ -656,7 +745,7 @@ not in this spec: Robust's preamble and coded body on 4 ms symbols with 250 Hz o
 | Input filter (RX, §3.2) | 1750–6500 Hz | 1750–6500 Hz | 1750–9750 Hz | — |
 | Purity / confidence gate (RX) | 0.20 / 3.0 dB | 0.20 / 3.0 dB | 0.20 / 2.0 dB | — |
 | Body erasures kept (RX) | ≤ 8 | best guess kept (§3.2.3) | best guess kept | ≤ 8 coded, unlimited uncoded |
-| Heartbeat / link-dead | 500 ms / 2000 ms | same | same | same |
+| Heartbeat / link-dead (§5.3, §5.5) | 500 ms / 2000 ms | same | same | 2400, 4800: same; 9600: 250 / 1000 ms |
 
 Rows marked RX are reference receiver settings (§3.2, SHOULD); everything else is wire format (MUST),
 except the amplitude: receivers are level-independent (§3.2, silence floor −60 dBFS), so a
@@ -709,9 +798,9 @@ One copy for any packet is 18 symbols (54 ms).
 
 Airtime per message sets a practical sustained rate on a dedicated chain: Robust (**175.5 ms**)
 about **5 messages/s**, Robust repeat (**273 ms**) about **3–4 messages/s**, Fast (**57 ms**) about
-**17 messages/s**, `ltc_fec` (**21.8 ms**) about **45 messages/s**. A chord of up to 4 notes is sent
-whole (later notes wait about one message each). The TX scheduler keeps **queue** latency under
-**250 ms** by dropping queued NoteOns beyond that budget (§5.5). These are on-wire airtime budgets
+**17 messages/s**, `ltc_fec` (**21.8 ms**) about **45 messages/s**. A chord of up to 5 notes (Robust),
+4 (Robust repeat) or 10 (Fast) is sent whole (later notes wait about one message each); Note Ons
+beyond that are refused and reported (§5.5). These are on-wire airtime budgets
 for a clean dedicated path, not guarantees through EQ, dynamics, or other processing on the AML bus.
 
 ### 6.5 LTC (biphase-mark) profiles — status: provisional
@@ -725,14 +814,18 @@ EQ (an in-band boost of +12 dB at 3 kHz breaks 4800 bit/s), no compression, gate
 dropouts for the uncoded profiles. 9600 bit/s needs more than ~6 kHz of bandwidth (digital lines);
 2400 bit/s does not survive a 1 kHz high-pass.
 
-| Profile | User-facing name | Bit rate | Half cell @ 48 kHz | Body | Burst | Burst + gap |
-|---|---|---|---|---|---|---|
-| `ltc2400` | — | 2400 bit/s | 10 samples | 16 nibbles (§4.3) | 31.9 ms | 33.5 ms |
-| `ltc` = `ltc4800` | — | 4800 bit/s | 5 samples | 16 nibbles | 15.9 ms | 16.8 ms |
-| `ltc9600` | — | 9600 bit/s | 2.5 samples | 16 nibbles | 8.0 ms | 8.4 ms |
-| `ltc2400_fec` | — | 2400 bit/s | 10 samples | 22 nibbles coded (§4.6) | 41.9 ms | 43.5 ms |
-| `ltc_fec` = `ltc4800_fec` | `clean-line` | 4800 bit/s | 5 samples | 22 nibbles coded | 20.9 ms | 21.8 ms |
-| `ltc9600_fec` | `clean-line-fast` | 9600 bit/s | 2.5 samples | 22 nibbles coded | 10.5 ms | 10.9 ms |
+| Profile | User-facing name | Bit rate | Half cell @ 48 kHz | Body | Burst | Burst + gap | Heartbeat / link-dead |
+|---|---|---|---|---|---|---|---|
+| `ltc2400` | — | 2400 bit/s | 10 samples | 16 nibbles (§4.3) | 31.9 ms | 33.5 ms | 500 / 2000 ms |
+| `ltc` = `ltc4800` | — | 4800 bit/s | 5 samples | 16 nibbles | 15.9 ms | 16.8 ms | 500 / 2000 ms |
+| `ltc9600` | — | 9600 bit/s | 2.5 samples | 16 nibbles | 8.0 ms | 8.4 ms | 250 / 1000 ms |
+| `ltc2400_fec` | — | 2400 bit/s | 10 samples | 22 nibbles coded (§4.6) | 41.9 ms | 43.5 ms | 500 / 2000 ms |
+| `ltc_fec` = `ltc4800_fec` | `clean-line` | 4800 bit/s | 5 samples | 22 nibbles coded | 20.9 ms | 21.8 ms | 500 / 2000 ms |
+| `ltc9600_fec` | `clean-line-fast` | 9600 bit/s | 2.5 samples | 22 nibbles coded | 10.5 ms | 10.9 ms | 250 / 1000 ms |
+
+The fail-safe timers (§5.3) follow the bit rate: a heartbeat costs at most 5 % of the idle line
+(coded 9600: 10.9 ms per 250 ms), and from 9600 bit/s a dead line is declared in 1 s instead of 2 s
+(`ltc14400*`, not in this spec: 250 / 1000 ms too; `digital`: 100 / 500 ms).
 
 #### 6.5.1 Line code and frame
 
@@ -815,7 +908,8 @@ The MFSK and BMC receivers never decode each other's audio, so a receiver MAY ru
 Implementations should expose:
 
 - Link state: `Search` | `Locked` | `Dead`
-- CRC pass count / fail count / pass rate
+- CRC pass count / fail count / pass rate; of the failures, the wrong-key suspects (§4.7)
+- Transmitter: queued messages, wait of the oldest, messages dropped (§5.5)
 - Sync-lost count
 - Last symbol confidence (dB over runner-up)
 - Last sequence number

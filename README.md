@@ -58,14 +58,24 @@ losing the message (the LTC profiles send the same packets as a timecode-like sq
   symbol, the decoder rewinds and locks on again without throwing away audio it has already received.
 - **Copies are counted once.** With Robust repeat, every packet is sent twice; the second copy is dropped
   by sequence number within a short time window.
-- **Nothing is left hanging.** A heartbeat keeps the link alive. If no valid packet arrives for 2 s, or the
-  audio input stops delivering samples, the decoder sends **Sustain off + All Notes Off on all 16
-  channels** once (and re-centers any pitch bend it left bent). Each released note's NoteOff is
-  repeated a few times in idle airtime, so a NoteOff lost to noise doesn't leave a note droning forever.
+- **Nothing is left hanging.** A heartbeat keeps the link alive. If no valid packet arrives for the
+  profile's link-dead time (2 s; 1 s on `clean-line-fast` and `digital-line`, 0.5 s on
+  `digital-bit-exact`), or the
+  audio input stops delivering samples, the decoder sends a **fail-safe burst** once: a Note Off for
+  every note it turned on, then Sustain off + All Notes Off on all 16 channels (and re-centers any
+  pitch bend it left bent). Each released note's NoteOff is repeated a few times in idle airtime,
+  spread over seconds, so a NoteOff lost to noise doesn't leave a note droning forever; the
+  transmitter also re-sends held pedals and bends in idle slots, so a receiver that restarted
+  recovers them. Cue-only links can switch the burst off (`--no-failsafe-burst`).
 - **Important messages first.** The transmitter sends Panic and All Notes Off / All Sound Off, then
-  NoteOffs and MSC, then everything else, then NoteOff repeats, then heartbeats. When fast playing would
-  overflow the airtime, it drops the oldest queued NoteOns, never a NoteOff, MSC or Panic, and never a
-  chord of up to 4 notes.
+  MSC, then NoteOffs, then everything else, then NoteOff repeats, then heartbeats. When fast playing
+  would overflow the airtime, it refuses the newest NoteOns beyond the profile's chord limit (10 on
+  Analog Fast, 5 on Analog Safe, 11 and more on the LTC profiles) and raises an alarm, never a
+  NoteOff, MSC or Panic.
+- **Links don't hear each other.** Two Cricket links in one multicore or Dante domain leak into each
+  other, and the receiver would decode the neighbour's packets. Give each link its own **link key**
+  (`--link-key 0x1234` or a passphrase, the same on both ends) and the other link's packets are
+  rejected; the status counts them as "other key?" so a mismatch shows up at once.
 - **Faders don't clog the line.** Controllers, pitch bend and aftertouch are *latest value wins*: while
   a value is still waiting to be sent, a newer one replaces it. A fader sending 200 values a second
   costs one queued message, its final position arrives within about two message times, and a note
@@ -85,7 +95,9 @@ losing the message (the LTC profiles send the same packets as a timecode-like sq
     numbers: `05`, `5.0` and `5` all arrive as `5` (worth knowing if the receiving end is QLab, which
     matches cue numbers as text).
   - The **device ID and command format are set on the decoder** (default: device `0x7F`, all-call;
-    format `0x01`, Lighting (General)); the encoder accepts MSC for any device ID and format.
+    format `0x01`, Lighting (General)); the encoder accepts MSC for any device ID and format unless
+    told to carry only one device's cues (`encode --msc-accept-device 3`, for rigs with several MSC
+    devices on the MIDI line; all-call always passes).
   - An MSC message that does not fit (cue `12.345`, cue `1000`, list `16`, a cue path, TIMED_GO, SET,
     SET_CLOCK, OPEN/CLOSE_CUE_PATH) is **not sent**, and the encoder raises an alarm such as
     "MSC cue 12.345 not representable". It never sends a different cue.
@@ -227,6 +239,10 @@ cricket decode --audio-in-name "Dante RX 1-2" --audio-in-channel 2 --midi-out-na
 # ... sending MSC to a console that listens on device ID 1 (default: 0x7F all-call, format 0x01)
 cricket decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1" \
     --msc-device-id 1 --msc-format 0x01
+
+# Two Cricket links in one multicore: give each its own link key (the same on both ends)
+cricket --link-key "stage left" encode --midi-in-name "My Keyboard"
+cricket --link-key "stage left" decode --midi-out-name "Synth"
 
 # A dedicated clean line? Both ends:
 cricket --profile clean-line encode ...

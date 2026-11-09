@@ -39,6 +39,7 @@ use crate::events::{AlarmKind, EngineEvent, LinkStats};
 use crate::midi::{self, MidiOut, MidiSink};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::{anyhow, Result};
+use cricket_core::link::DEFAULT_LINK_KEY;
 use cricket_core::modem::{CricketModemRx, ModemOutput, ModemStats};
 use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::MscTarget;
@@ -65,6 +66,17 @@ pub struct DecoderConfig {
     /// Device buffer size, sample format and input channel (cpal devices
     /// only).
     pub audio: AudioOptions,
+    /// Link key (spec §4.1), the same as the encoder's;
+    /// `cricket_core::link::DEFAULT_LINK_KEY` (`0xFFFF`) is the unkeyed
+    /// link. Packets from a link with another key are rejected (and counted
+    /// in `LinkStats::wrong_key_suspects`).
+    pub link_key: u16,
+    /// Send the fail-safe burst (Note Offs for sounding notes, Sustain off,
+    /// All Notes Off, pitch bend to centre; spec §5.3) on link-dead, Panic,
+    /// input stall and stop. Default true; off for cue-only (MSC) links,
+    /// where a stray All Notes Off is unwanted. Link-dead is still
+    /// detected and reported.
+    pub fail_safe_burst: bool,
 }
 
 /// A running decoder worker. Dropping it stops the worker (which sends the
@@ -206,15 +218,40 @@ impl MidiOutState {
 /// The fail-safe burst as a log line.
 const BURST_TEXT: &str = "Sustain off + All Notes Off sent on all 16 channels";
 
+/// What the fail-safe did, for a log line.
+fn burst_text(rx: &CricketModemRx) -> &'static str {
+    if rx.fail_safe_burst_enabled() {
+        BURST_TEXT
+    } else {
+        "fail-safe burst is off: nothing sent to MIDI out"
+    }
+}
+
+/// The link key for a log line: a keyed link is shown masked (a passphrase
+/// should not end up in logs), the unkeyed link as such.
+pub fn link_key_label(link_key: u16) -> &'static str {
+    if link_key == DEFAULT_LINK_KEY {
+        "none (unkeyed link)"
+    } else {
+        "set (0x••••)"
+    }
+}
+
 fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, stop: &AtomicBool) {
     let name = PhyConfig::canonical_name(&cfg.profile).unwrap_or_else(|| cfg.profile.clone());
     ev.log(format!("Starting decoder (profile={})...", name));
 
-    let mut config = phy;
+    let mut config = phy.with_link_key(cfg.link_key);
     if let Some(ms) = cfg.link_dead_ms {
         config.link_dead_ms = ms;
     }
     let link_dead_timeout = Duration::from_millis(config.link_dead_ms as u64);
+    ev.log(format!(
+        "Link key {}; link-dead after {} ms; fail-safe burst {}.",
+        link_key_label(config.link_key),
+        config.link_dead_ms,
+        if cfg.fail_safe_burst { "on" } else { "off" }
+    ));
     let est_latency = config.estimated_first_copy_ms();
     let preferred_sample_rate = config.sample_rate_hz;
 
@@ -280,6 +317,7 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
 
     let mut rx = CricketModemRx::new(config);
     rx.set_msc_target(cfg.msc);
+    rx.set_fail_safe_burst(cfg.fail_safe_burst);
     let mut rms_accumulator = 0.0f32;
     let mut sample_count_for_meter = 0usize;
     let meter_report_interval = (stream_sample_rate as usize) / 20;
@@ -306,7 +344,7 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
         if panic.swap(false, Ordering::SeqCst) {
             let burst = rx.fail_safe_burst();
             midi_out.send_all(&burst, ev);
-            ev.log(format!("Panic — {}", BURST_TEXT));
+            ev.log(format!("Panic — {}", burst_text(&rx)));
         }
 
         let n = source.pull(&mut buf);
@@ -347,7 +385,8 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
                     link_alive = false;
                     let message = format!(
                         "Audio input stalled ({} ms without samples) — {}",
-                        silent_ms, BURST_TEXT
+                        silent_ms,
+                        burst_text(&rx)
                     );
                     ev.send(EngineEvent::Alarm {
                         kind: AlarmKind::AudioInputStalled,
@@ -403,13 +442,17 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
                     let message = format!(
                         "Link dead: no valid packet for {} ms — {}",
                         link_dead_timeout.as_millis(),
-                        BURST_TEXT
+                        burst_text(&rx)
                     );
                     ev.send(EngineEvent::Alarm {
                         kind: AlarmKind::LinkDead,
                         message,
                     });
-                    ev.log("Link dead — All Notes Off");
+                    ev.log(if rx.fail_safe_burst_enabled() {
+                        "Link dead — All Notes Off"
+                    } else {
+                        "Link dead (fail-safe burst off)"
+                    });
                 }
                 ModemOutput::SyncLost => {
                     sync_lost = sync_lost.saturating_add(1);
@@ -431,10 +474,10 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
     }
 
     // Orderly stop: never leave a note hanging on the far end.
-    if midi_out.is_connected() {
+    if midi_out.is_connected() && rx.fail_safe_burst_enabled() {
         let burst = rx.fail_safe_burst();
         midi_out.send_all(&burst, ev);
-        ev.log(format!("Stop — {}", BURST_TEXT));
+        ev.log(format!("Stop — {}", burst_text(&rx)));
     }
     ev.log("Decoder stopped.");
 }
@@ -456,6 +499,7 @@ fn link_stats(
         state: stats.link_state,
         crc_pass: stats.crc_pass,
         crc_fail: stats.crc_fail,
+        wrong_key_suspects: stats.wrong_key_suspects,
         fec_corrected: stats.fec_corrected,
         confidence_db: stats.last_confidence_db,
         last_seq: stats.last_seq,

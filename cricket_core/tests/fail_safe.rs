@@ -181,6 +181,85 @@ fn link_dead_fires_once_sample_accurate_and_dead_state_visible() {
     }
 }
 
+/// The burst releases the notes this receiver turned on (and has not seen
+/// released) explicitly, per channel before that channel's CC64 = 0 and
+/// CC123, so synths that ignore CC123 release them too.
+#[test]
+fn burst_releases_the_notes_this_receiver_turned_on() {
+    let config = PhyConfig::fast();
+    let mut tx = CricketModemTx::new(config.clone());
+    let mut stream = Vec::new();
+    for m in [
+        note_on(60),
+        note_on(64),
+        TransportMessage::NoteOn {
+            channel: 9,
+            note: 36,
+            velocity: 100,
+        },
+        TransportMessage::NoteOff {
+            channel: 0,
+            note: 64,
+            velocity: 0,
+        },
+    ] {
+        stream.extend(tx.encode_message(&m));
+        stream.extend(silence(&config, 20));
+    }
+    stream.extend(silence(&config, config.link_dead_ms as usize + 500));
+    for chunk in CHUNK_SIZES {
+        let mut rx = CricketModemRx::new(config.clone());
+        let evs = feed(&mut rx, &stream, chunk, 0);
+        assert_eq!(link_dead_events(&evs).len(), 1, "chunk {chunk}");
+        let midi: Vec<&[u8]> = evs
+            .iter()
+            .filter_map(|e| match &e.out {
+                ModemOutput::Midi(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        // The four messages' MIDI, then the burst: 32 + 2 Note Offs.
+        assert_eq!(midi.len(), 4 + 34, "chunk {chunk}: {midi:?}");
+        let burst = &midi[4..];
+        assert_eq!(burst[0], [0x80, 60, 0x40], "chunk {chunk}");
+        assert_eq!(burst[1], [0xB0, 0x40, 0x00]);
+        assert_eq!(burst[2], [0xB0, 0x7B, 0x00]);
+        let ch9 = burst.iter().position(|m| m[0] == 0x89).unwrap();
+        assert_eq!(burst[ch9], [0x89, 36, 0x40]);
+        assert_eq!(burst[ch9 + 1], [0xB9, 0x40, 0x00]);
+        assert!(!burst.contains(&&[0x80u8, 64, 0x40][..]), "released note");
+        assert_eq!(count_midi(&evs, &ALL_NOTES_OFF), 1);
+    }
+}
+
+/// With the burst disabled (cue-only links) link-dead is still detected
+/// and reported, but nothing goes to MIDI out, on Panic either.
+#[test]
+fn disabled_burst_reports_link_dead_without_midi() {
+    let config = PhyConfig::fast();
+    let mut tx = CricketModemTx::new(config.clone());
+    let mut stream = tx.encode_message(&note_on(60));
+    stream.extend(silence(&config, 50));
+    stream.extend(tx.encode_message(&TransportMessage::Panic));
+    stream.extend(silence(&config, config.link_dead_ms as usize + 500));
+    let mut rx = CricketModemRx::new(config.clone());
+    rx.set_fail_safe_burst(false);
+    assert!(!rx.fail_safe_burst_enabled());
+    let evs = feed(&mut rx, &stream, 512, 0);
+    assert_eq!(messages(&evs), vec![note_on(60), TransportMessage::Panic]);
+    assert_eq!(link_dead_events(&evs).len(), 1);
+    assert_eq!(rx.stats().link_state, LinkState::Dead);
+    let midi: Vec<&[u8]> = evs
+        .iter()
+        .filter_map(|e| match &e.out {
+            ModemOutput::Midi(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(midi, vec![&[0x90u8, 60, 100][..]], "only the note itself");
+    assert!(rx.fail_safe_burst().is_empty());
+}
+
 #[test]
 fn no_link_dead_before_first_packet() {
     let config = PhyConfig::robust_repeat();

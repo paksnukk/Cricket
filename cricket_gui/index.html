@@ -256,7 +256,7 @@
                     <div>Last packet: <span id="link-last-packet">—</span></div>
                     <div>Confidence: <span id="link-confidence">—</span> dB</div>
                     <div>Airtime per packet: <span id="link-latency">—</span> ms</div>
-                    <div>CRC pass / fail: <span id="link-crc">0 / 0</span></div>
+                    <div>CRC pass / fail: <span id="link-crc">0 / 0</span> <span id="link-wrong-key"></span></div>
                     <div>CRC fails per minute: <span id="link-crc-fail-rate">—</span></div>
                     <div>FEC corrected: <span id="link-fec">0</span> (<span id="link-fec-rate">—</span>/min)</div>
                     <div>Preambles found / CRC fails: <span id="link-locks">0 / 0</span></div>
@@ -335,9 +335,26 @@
                         <input type="number" id="tx-level-input" min="-60" max="0" step="1" value="-12" />
                     </div>
                 </div>
+                <div class="row" style="margin-top: 0.75rem">
+                    <div class="col">
+                        <label for="link-key-input">Link key (both ends; 0x1234 or a passphrase)</label>
+                        <input type="text" id="link-key-input" placeholder="none (unkeyed)" autocomplete="off" />
+                    </div>
+                    <div class="col">
+                        <label for="msc-accept-select">MSC accepted by the encoder (device ID)</label>
+                        <select id="msc-accept-select"></select>
+                    </div>
+                    <div class="col narrow">
+                        <label for="failsafe-burst-check">Fail-safe burst</label>
+                        <input type="checkbox" id="failsafe-burst-check" checked />
+                    </div>
+                </div>
                 <p class="hint" style="margin-top: 0.4rem">
                     TX level: −12 dBFS by default leaves headroom on the bus; the receiver decodes anything from −30 dB
-                    below that to full scale. Not used by Digital Bit-Exact.
+                    below that to full scale. Not used by Digital Bit-Exact. Link key: with two Cricket links in one
+                    multicore or Dante domain, give each its own key so crosstalk from the other is ignored. MSC filter:
+                    with several MSC devices on the MIDI line, carry only the cues addressed to one device (all-call
+                    always passes). Fail-safe burst off: cue-only links where All Notes Off is unwanted.
                 </p>
                 <ul id="setup-warnings" class="warnings"></ul>
                 <div class="actions">
@@ -379,7 +396,8 @@
                     </div>
                     <p class="hint" id="tx-queue-hint" style="margin-top: 0.5rem">
                         Queue: <span id="tx-queued">—</span> msgs · queue latency:
-                        <span id="tx-queue-latency">—</span> ms
+                        <span id="tx-queue-latency">—</span> ms · dropped:
+                        <span id="tx-dropped">—</span>
                     </p>
                     <label class="check">
                         <input type="checkbox" id="simulate-check" />

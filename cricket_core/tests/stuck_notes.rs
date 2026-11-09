@@ -19,12 +19,16 @@
 //!
 //! Idle TX slots use [`TxScheduler`]: any non-zero gap can start one packet, the
 //! way the encoder does when it does not yet know the next note is coming.
-//! Recently released notes are repeated round-robin, up to 6 times each within
-//! 10 s. Heartbeats are sent only when that list is empty (v1.1 A8 / C1).
+//! Recently released notes are repeated up to 6 times each on the doubling
+//! schedule of spec §5.5 (1, 2, 4, … message times after the release, after
+//! a quiet message time); Heartbeat slots carry pending repeats first.
 
 mod support;
 
-use cricket_core::modem::{repetition_samples, CricketModemRx, CricketModemTx, ModemOutput};
+use cricket_core::modem::{
+    refresh_quiet_samples, refresh_spacing_samples, repetition_samples, CricketModemRx,
+    CricketModemTx, ModemOutput,
+};
 use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::{TransportMessage, TxScheduler};
 use std::collections::{BTreeMap, BTreeSet};
@@ -162,7 +166,9 @@ impl StreamBuilder {
         let message_len = tx.encode_message(&TransportMessage::Heartbeat).len();
         Self {
             tx,
-            scheduler: TxScheduler::new(config.sample_rate_hz, heartbeat_samples, message_samples),
+            scheduler: TxScheduler::new(config.sample_rate_hz, heartbeat_samples, message_samples)
+                .with_refresh_spacing(refresh_spacing_samples(config, config.sample_rate_hz))
+                .with_refresh_quiet(refresh_quiet_samples(config, config.sample_rate_hz)),
             period: config.samples_per_symbol_period(),
             message_len,
             audio: Vec::new(),
@@ -220,7 +226,7 @@ impl StreamBuilder {
                 self.encode_polled(msg);
                 continue;
             }
-            let next = self.scheduler.next_keepalive_sample().max(now + 1) as usize;
+            let next = self.scheduler.next_idle_sample().max(now + 1) as usize;
             self.pad_to(next.min(target));
         }
     }

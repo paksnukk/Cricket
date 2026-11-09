@@ -233,15 +233,17 @@ fn released_after_dropout(spacing: u64, mute_ms: usize) -> bool {
 }
 
 /// A release is sent 7 times (the NoteOff and 6 refreshes, K = 2 copies
-/// each). Back to back (spec §5.5 pacing) that is 6 ms on air, all lost in
-/// one 10 ms dropout; spaced 20 ms apart (the digital profile's encoder
-/// setting) it survives a 100 ms dropout.
+/// each). On the schedule of spec §5.5 alone (1, 2, 3, 5, 8, 13 message
+/// times of 0.875 ms) that is 13 ms on air, all lost in one 20 ms dropout;
+/// spaced 20 ms apart (the digital profile's encoder setting) it survives a
+/// 100 ms dropout.
 #[test]
 fn spaced_refresh_survives_a_dropout() {
     let spacing = refresh_spacing_samples(&PhyConfig::digital(), 48_000);
     assert_eq!(spacing, 960);
     assert!(released_after_dropout(0, 0));
-    assert!(!released_after_dropout(0, 10));
+    assert!(released_after_dropout(0, 10));
+    assert!(!released_after_dropout(0, 20));
     for mute_ms in [0, 10, 50, 100] {
         assert!(released_after_dropout(spacing, mute_ms), "{mute_ms} ms");
     }

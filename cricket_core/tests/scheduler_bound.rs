@@ -47,9 +47,11 @@ fn overload(config: &PhyConfig, seconds: u64, with_note_offs: bool) -> Outcome {
     let mut now = 0u64;
     let mut next_push = 0u64;
     let mut i = 0u64;
-    // Notes struck (and sent) before the overload: their releases are
-    // NoteOffs for sounding notes, which are never dropped.
+    // Notes sounding at the far end (struck and sent, not released): their
+    // releases are NoteOffs for sounding notes, which are never dropped.
+    // A note whose release is queued is not struck again until it is out.
     let mut sounding: Vec<u8> = Vec::new();
+    let mut releasing: Vec<u8> = Vec::new();
     if with_note_offs {
         for note in 100..110u8 {
             s.push(
@@ -71,6 +73,7 @@ fn overload(config: &PhyConfig, seconds: u64, with_note_offs: bool) -> Outcome {
             let value = (i % 128) as u8;
             if with_note_offs && i % 200 == 199 {
                 if let Some(note) = sounding.pop() {
+                    releasing.push(note);
                     s.push(
                         TransportMessage::NoteOff {
                             channel: 0,
@@ -117,11 +120,14 @@ fn overload(config: &PhyConfig, seconds: u64, with_note_offs: bool) -> Outcome {
                     match r.msg {
                         TransportMessage::NoteOn { note, .. } => {
                             out.note_ons_sent += 1;
-                            if !sounding.contains(&note) {
+                            if !sounding.contains(&note) && !releasing.contains(&note) {
                                 sounding.push(note);
                             }
                         }
-                        TransportMessage::NoteOff { .. } => out.note_offs_sent += 1,
+                        TransportMessage::NoteOff { note, .. } => {
+                            out.note_offs_sent += 1;
+                            releasing.retain(|n| *n != note);
+                        }
                         TransportMessage::ProgramChange { .. } => out.program_changes_sent += 1,
                         TransportMessage::ControlChange {
                             controller: 7,
@@ -141,7 +147,7 @@ fn overload(config: &PhyConfig, seconds: u64, with_note_offs: bool) -> Outcome {
             }
         }
     }
-    out.note_on_drops = s.note_on_dropped;
+    out.note_on_drops = s.note_ons_dropped > 0;
     out.queue_dropped = s.queue_dropped;
     assert_eq!(out.last_cc7, Some(final_cc), "final CC 7 value");
     out
@@ -170,20 +176,23 @@ fn overload_keeps_queue_and_wait_bounded() {
             out.queue_dropped,
             out.note_on_drops,
         );
-        // The queue holds the bound's worth of messages plus the protected
-        // NoteOns (and their held NoteOffs), plus the undroppable tiers
-        // (NoteOffs at 5/s on a 17/s link: at most a couple).
-        let bound_msgs = (budget / msg) as usize + 2 * 4 + 1;
+        // The queue holds the bound's worth of messages plus the NoteOns
+        // (at most the profile's limit, with their held NoteOffs), plus the
+        // undroppable tiers (NoteOffs at 5/s on a 17/s link: at most a
+        // couple).
+        let bound_msgs = (budget / msg) as usize + 2 * s.max_note_ons() + 1;
         let undroppable = if with_note_offs { 3 } else { 0 };
         assert!(
             out.max_queued <= bound_msgs + undroppable,
             "queue reached {} messages (bound {bound_msgs} + {undroppable})",
             out.max_queued
         );
-        // The oldest message waits at most the bound plus what is ahead of
-        // it in tiers 1-2 and the message in flight.
+        // The oldest message waits at most the bound plus the NoteOns
+        // beyond it, what is ahead of it in tiers 1-2 and the message in
+        // flight.
         assert!(
-            out.max_oldest_wait <= budget + (undroppable as u64 + 2) * msg,
+            out.max_oldest_wait
+                <= budget + (s.max_note_ons() as u64 + undroppable as u64 + 2) * msg,
             "oldest wait {} samples",
             out.max_oldest_wait
         );
@@ -213,7 +222,9 @@ fn overload_on_a_fast_link_stays_bounded() {
         out.max_oldest_wait as f64 * 1000.0 / rate as f64,
         out.queue_dropped
     );
-    assert!(out.max_queued <= (s.queue_budget_samples() / msg) as usize + 2 * 4 + 1 + 3);
-    assert!(out.max_oldest_wait <= s.queue_budget_samples() + 10 * msg);
+    assert!(
+        out.max_queued <= (s.queue_budget_samples() / msg) as usize + 2 * s.max_note_ons() + 1 + 3
+    );
+    assert!(out.max_oldest_wait <= s.queue_budget_samples() + (s.max_note_ons() as u64 + 10) * msg);
     assert_eq!(out.note_offs_sent, out.note_offs_pushed);
 }

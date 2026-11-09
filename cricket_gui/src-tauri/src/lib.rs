@@ -21,9 +21,9 @@ pub mod settings;
 use cricket_core::modem::repetition_samples;
 use cricket_core::phy::{PhyConfig, ProfileTier, PROFILES};
 use cricket_engine::{
-    audio, format_message, link_state_name, midi, AudioIn, AudioOptions, AudioOut, DecoderConfig,
-    DecoderHandle, DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
-    MscTarget, TransportMessage, MIN_TX_LEVEL_DBFS,
+    audio, format_message, link_state_name, midi, parse_link_key, AudioIn, AudioOptions, AudioOut,
+    DecoderConfig, DecoderHandle, DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent,
+    MidiIn, MidiOut, MscFilter, MscTarget, TransportMessage, MIN_TX_LEVEL_DBFS,
 };
 use settings::{load_settings, save_settings, AppSettings};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,6 +84,8 @@ struct LinkStatsEvent {
     state: String,
     crc_pass: u64,
     crc_fail: u64,
+    /// CRC failures that had a packet's structure: another link's key.
+    wrong_key_suspects: u64,
     fec_corrected: u64,
     confidence_db: f32,
     last_seq: Option<u8>,
@@ -126,6 +128,8 @@ enum FrontendEvent {
 struct TxStatusEvent {
     queued: usize,
     latency_ms: f32,
+    /// Messages the TX scheduler dropped since the encoder started.
+    dropped: u64,
 }
 
 impl FrontendEvent {
@@ -216,6 +220,7 @@ fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
             state: link_state_name(s.state).into(),
             crc_pass: s.crc_pass,
             crc_fail: s.crc_fail,
+            wrong_key_suspects: s.wrong_key_suspects,
             fec_corrected: s.fec_corrected,
             confidence_db: s.confidence_db,
             last_seq: s.last_seq,
@@ -239,9 +244,15 @@ fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
             role: run.role,
             run_id: run.id,
         }),
-        EngineEvent::TxStatus { queued, latency_ms } => {
-            FrontendEvent::TxStatus(TxStatusEvent { queued, latency_ms })
-        }
+        EngineEvent::TxStatus {
+            queued,
+            latency_ms,
+            dropped,
+        } => FrontendEvent::TxStatus(TxStatusEvent {
+            queued,
+            latency_ms,
+            dropped,
+        }),
     })
 }
 
@@ -431,11 +442,14 @@ fn channel_index(channel: Option<u16>) -> usize {
 /// `get_input_devices` / `get_midi_outputs` (`None` = default audio input /
 /// no MIDI out); `audio_in_channel` is 1-based (`None` = 1).
 /// `msc_device_id` / `msc_command_format` address the MSC SysEx sent to
-/// MIDI out (`None` = all-call `0x7F` / Lighting `0x01`). A name that is
-/// not present fails in the engine (reported as a log line); no other
-/// device is picked. An unknown profile is an error. Returns the run id
-/// carried by this run's `worker_stopped` event. Stopping (or restarting)
-/// sends the fail-safe burst to MIDI out first.
+/// MIDI out (`None` = all-call `0x7F` / Lighting `0x01`); `link_key` is
+/// the link key text (`0x1234` or a passphrase; empty / `None` = unkeyed);
+/// `fail_safe_burst` (`None` = on) sends Note Offs + All Notes Off on
+/// link-dead, Panic and stop. A name that is not present fails in the
+/// engine (reported as a log line); no other device is picked. An unknown
+/// profile is an error. Returns the run id carried by this run's
+/// `worker_stopped` event. Stopping (or restarting) sends the fail-safe
+/// burst to MIDI out first.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn start_decoder(
@@ -447,6 +461,8 @@ fn start_decoder(
     profile: String,
     msc_device_id: Option<u8>,
     msc_command_format: Option<u8>,
+    link_key: Option<String>,
+    fail_safe_burst: Option<bool>,
 ) -> Result<u64, String> {
     parse_profile(&profile)?;
     let mut slot = state.decoder.lock().unwrap();
@@ -470,6 +486,8 @@ fn start_decoder(
             input_channel: channel_index(audio_in_channel),
             ..AudioOptions::default()
         },
+        link_key: parse_link_key(link_key.as_deref().unwrap_or("")),
+        fail_safe_burst: fail_safe_burst.unwrap_or(true),
     })
     .map_err(|e| e.to_string())?;
     let run = Run {
@@ -492,10 +510,13 @@ fn stop_decoder(state: State<'_, AppState>) -> Result<(), String> {
 /// `get_output_devices` / `get_midi_inputs` (`None` = default audio output /
 /// no MIDI in); `audio_out_channel` is 1-based (`None` = 1), the other
 /// channels stay silent; `tx_level_db` is the peak level in dBFS (`None` =
-/// the default, −12). A name that is not present fails in the engine; no
-/// other device is picked. An unknown profile is an error. Returns the run
-/// id carried by this run's `worker_stopped` event. With no MIDI in the
-/// encoder sends heartbeats only; `simulate` adds the test scale.
+/// the default, −12); `link_key` is the link key text (`0x1234` or a
+/// passphrase; empty / `None` = unkeyed); `msc_accept_device` carries only
+/// MSC addressed to that device ID or all-call (`None` = any). A name that
+/// is not present fails in the engine; no other device is picked. An
+/// unknown profile is an error. Returns the run id carried by this run's
+/// `worker_stopped` event. With no MIDI in the encoder sends heartbeats
+/// only; `simulate` adds the test scale.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn start_encoder(
@@ -507,6 +528,8 @@ fn start_encoder(
     profile: String,
     simulate: bool,
     tx_level_db: Option<f32>,
+    link_key: Option<String>,
+    msc_accept_device: Option<u8>,
 ) -> Result<u64, String> {
     parse_profile(&profile)?;
     let mut slot = state.encoder.lock().unwrap();
@@ -524,6 +547,11 @@ fn start_encoder(
         audio: AudioOptions {
             output_channel: channel_index(audio_out_channel),
             ..AudioOptions::default()
+        },
+        link_key: parse_link_key(link_key.as_deref().unwrap_or("")),
+        msc_filter: MscFilter {
+            device_id: msc_accept_device.filter(|d| *d < 0x7F),
+            command_format: None,
         },
     })
     .map_err(|e| e.to_string())?;
@@ -636,13 +664,15 @@ mod tests {
             to_frontend(
                 EngineEvent::TxStatus {
                     queued: 3,
-                    latency_ms: 12.5
+                    latency_ms: 12.5,
+                    dropped: 2,
                 },
                 RUN
             ),
             Some(FrontendEvent::TxStatus(TxStatusEvent {
                 queued: 3,
-                latency_ms: 12.5
+                latency_ms: 12.5,
+                dropped: 2,
             }))
         );
     }

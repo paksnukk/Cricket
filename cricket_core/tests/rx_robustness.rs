@@ -179,12 +179,15 @@ fn reset_is_a_hard_reset() {
 
 /// `LinkState` follows one rule on every phy: `Locked` from a decoded
 /// packet until a second without one, then `Search`, then `Dead` at
-/// link-dead time; heartbeats every 500 ms keep a live link `Locked`.
+/// link-dead time (on the profiles whose link-dead time is not longer than
+/// the hold, `digital` and the LTC profiles from 9600 bit/s, `Dead` comes
+/// first); heartbeats at the profile's interval keep a live link `Locked`.
 #[test]
 fn link_state_holds_for_a_second_after_a_packet() {
     for (name, config) in all_profiles() {
         let rate = config.sample_rate_hz as usize;
         let hold = rate * LOCK_HOLD_MS as usize / 1000;
+        let link_dead = rate * config.link_dead_ms as usize / 1000;
         let mut rx = CricketModemRx::new(config.clone());
         assert_eq!(rx.stats().link_state, LinkState::Search, "[{name}] fresh");
         let packet = CricketModemTx::new(config.clone()).encode_message(&notes(60, 1)[0]);
@@ -204,28 +207,39 @@ fn link_state_holds_for_a_second_after_a_packet() {
             push_chunked(&mut rx, &vec![0.0; step]);
             elapsed += step;
         }
-        assert_eq!(
-            rx.stats().link_state,
-            LinkState::Search,
-            "[{name}] after hold"
-        );
-        assert!(
-            elapsed > hold / 2 && elapsed <= hold + step,
-            "[{name}] lock released {} ms after the packet",
-            elapsed * 1000 / rate
-        );
-        assert!(rx.is_link_armed(), "[{name}] link-dead still pending");
+        if link_dead > hold + 2 * step {
+            assert_eq!(
+                rx.stats().link_state,
+                LinkState::Search,
+                "[{name}] after hold"
+            );
+            assert!(
+                elapsed > hold / 2 && elapsed <= hold + step,
+                "[{name}] lock released {} ms after the packet",
+                elapsed * 1000 / rate
+            );
+            assert!(rx.is_link_armed(), "[{name}] link-dead still pending");
+        } else {
+            // Link-dead is due at or before the end of the hold.
+            assert!(
+                matches!(
+                    rx.stats().link_state,
+                    LinkState::Search | LinkState::Dead
+                ),
+                "[{name}] after hold"
+            );
+        }
         // Link-dead then reports Dead.
-        let rest = rate * config.link_dead_ms as usize / 1000;
-        push_chunked(&mut rx, &vec![0.0; rest]);
+        push_chunked(&mut rx, &vec![0.0; link_dead]);
         assert_eq!(rx.stats().link_state, LinkState::Dead, "[{name}] dead");
-        // A heartbeat every 500 ms keeps the link Locked.
+        // A heartbeat every interval keeps the link Locked.
         let mut rx = CricketModemRx::new(config.clone());
         let mut tx = CricketModemTx::new(config.clone());
+        let interval = rate * config.heartbeat_interval_ms as usize / 1000;
         for _ in 0..4 {
             let hb = tx.encode_heartbeat();
             push_chunked(&mut rx, &hb);
-            push_chunked(&mut rx, &vec![0.0; rate / 2 - hb.len().min(rate / 2)]);
+            push_chunked(&mut rx, &vec![0.0; interval - hb.len().min(interval)]);
             assert_eq!(
                 rx.stats().link_state,
                 LinkState::Locked,

@@ -1,4 +1,4 @@
-use super::crc::crc16_ccitt;
+use super::crc::{crc16_keyed, DEFAULT_LINK_KEY};
 use crate::transport::MessageType;
 use alloc::vec::Vec;
 
@@ -53,7 +53,17 @@ pub fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Packet bytes with the CRC-16 of the unkeyed link ([`DEFAULT_LINK_KEY`]).
 pub fn encode_packet_bytes(packet: &Packet) -> Result<Vec<u8>, PacketDecodeError> {
+    encode_packet_bytes_keyed(packet, DEFAULT_LINK_KEY)
+}
+
+/// Packet bytes (HDR, SEQ, payload, CRC-16) with `link_key` as the CRC init
+/// value (spec §4.1).
+pub fn encode_packet_bytes_keyed(
+    packet: &Packet,
+    link_key: u16,
+) -> Result<Vec<u8>, PacketDecodeError> {
     let expected = packet.msg_type.payload_len();
     if packet.payload.len() != expected {
         return Err(PacketDecodeError::BadPayloadLen {
@@ -69,13 +79,20 @@ pub fn encode_packet_bytes(packet: &Packet) -> Result<Vec<u8>, PacketDecodeError
     body.push(hdr);
     body.push(packet.seq);
     body.extend_from_slice(&packet.payload);
-    let crc = crc16_ccitt(&body);
+    let crc = crc16_keyed(&body, link_key);
     body.push((crc >> 8) as u8);
     body.push((crc & 0xFF) as u8);
     Ok(body)
 }
 
+/// Decode exact packet bytes of the unkeyed link ([`DEFAULT_LINK_KEY`]).
 pub fn decode_packet_bytes(bytes: &[u8]) -> Result<Packet, PacketDecodeError> {
+    decode_packet_bytes_keyed(bytes, DEFAULT_LINK_KEY)
+}
+
+/// Decode exact packet bytes whose CRC-16 was computed with `link_key`
+/// (spec §4.1, §4.7 rules 1–2 and the payload length).
+pub fn decode_packet_bytes_keyed(bytes: &[u8], link_key: u16) -> Result<Packet, PacketDecodeError> {
     if bytes.len() < 4 {
         return Err(PacketDecodeError::TooShort);
     }
@@ -83,7 +100,7 @@ pub fn decode_packet_bytes(bytes: &[u8]) -> Result<Packet, PacketDecodeError> {
     let crc_hi = bytes[data_end];
     let crc_lo = bytes[data_end + 1];
     let data = &bytes[..data_end];
-    let expected_crc = crc16_ccitt(data);
+    let expected_crc = crc16_keyed(data, link_key);
     let got_crc = ((crc_hi as u16) << 8) | (crc_lo as u16);
     if expected_crc != got_crc {
         return Err(PacketDecodeError::BadCrc);
@@ -116,14 +133,39 @@ pub fn decode_packet_bytes(bytes: &[u8]) -> Result<Packet, PacketDecodeError> {
     })
 }
 
+/// Whether exact packet bytes `slice` have the structure of a packet
+/// regardless of the CRC (spec §4.7 rules 2–3: version, type, SEQ, length
+/// and a canonical payload). A structurally valid body whose CRC fails is
+/// most likely a packet from a link with another key (`docs/aml-v1-spec.md`
+/// §4.1); random data passes this with probability about 2⁻¹⁷.
+pub fn packet_structure_is_valid(slice: &[u8]) -> bool {
+    let Some(&hdr) = slice.first() else {
+        return false;
+    };
+    let Some(msg_type) = MessageType::from_u8(hdr & 0x0F) else {
+        return false;
+    };
+    let needed = 2 + msg_type.payload_len() + 2;
+    hdr >> 4 == PROTOCOL_VERSION
+        && slice.len() == needed
+        && slice[1] < SEQ_MODULUS
+        && msg_type.payload_in_range(&slice[2..needed - 2])
+}
+
+/// [`fec_candidate_is_valid_keyed`] for the unkeyed link.
+pub fn fec_candidate_is_valid(nibbles: &[u8]) -> bool {
+    fec_candidate_is_valid_keyed(nibbles, DEFAULT_LINK_KEY)
+}
+
 /// Whether an FEC-decoded data block (packet nibbles + zero pad) holds a
-/// valid packet: CRC-16, version, type and SEQ checks pass, the pad is zero
-/// and the payload is canonical ([`MessageType::payload_in_range`]).
+/// valid packet of the link with `link_key`: CRC-16, version, type and SEQ
+/// checks pass, the pad is zero and the payload is canonical
+/// ([`MessageType::payload_in_range`]).
 ///
 /// Besides the CRC-16 this leaves about 17 bits of structure a random block
 /// must also match (`docs/proposals/fec.md` §9.7), which is what keeps the
 /// erasure-tolerant FEC decoder from turning noise into messages.
-pub fn fec_candidate_is_valid(nibbles: &[u8]) -> bool {
+pub fn fec_candidate_is_valid_keyed(nibbles: &[u8], link_key: u16) -> bool {
     let bytes = nibbles_to_bytes(nibbles);
     let Some(&hdr) = bytes.first() else {
         return false;
@@ -138,7 +180,7 @@ pub fn fec_candidate_is_valid(nibbles: &[u8]) -> bool {
         && bytes[1] < SEQ_MODULUS
         && bytes[needed..].iter().all(|&b| b == 0)
         && msg_type.payload_in_range(&bytes[2..needed - 2])
-        && decode_packet_bytes(&bytes[..needed]).is_ok()
+        && decode_packet_bytes_keyed(&bytes[..needed], link_key).is_ok()
 }
 
 /// Nibble count for a packet body after interleave padding.
@@ -152,7 +194,63 @@ pub fn body_nibble_count(msg_type: MessageType, interleave_depth: usize) -> usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::crc16_ccitt;
     use crate::transport::MessageType;
+
+    /// The default key gives the CRC-16/CCITT-FALSE bytes of spec §9; a
+    /// keyed packet differs only in its CRC and decodes only with its key,
+    /// while its structure is still recognisable (the wrong-key counter).
+    #[test]
+    fn link_key_is_the_crc_init() {
+        let p = Packet {
+            msg_type: MessageType::Midi,
+            seq: 0,
+            payload: vec![0x90, 60, 100],
+        };
+        let plain = encode_packet_bytes(&p).unwrap();
+        assert_eq!(plain, [0x10, 0x00, 0x90, 0x3C, 0x64, 0x01, 0xB5]);
+        assert_eq!(
+            encode_packet_bytes_keyed(&p, DEFAULT_LINK_KEY).unwrap(),
+            plain
+        );
+        let keyed = encode_packet_bytes_keyed(&p, 0x1234).unwrap();
+        assert_eq!(keyed[..5], plain[..5]);
+        assert_ne!(keyed[5..], plain[5..]);
+        assert_eq!(decode_packet_bytes_keyed(&keyed, 0x1234), Ok(p.clone()));
+        assert_eq!(
+            decode_packet_bytes_keyed(&keyed, DEFAULT_LINK_KEY),
+            Err(PacketDecodeError::BadCrc)
+        );
+        assert_eq!(decode_packet_bytes(&keyed), Err(PacketDecodeError::BadCrc));
+        assert_eq!(
+            decode_packet_bytes_keyed(&plain, 0x1234),
+            Err(PacketDecodeError::BadCrc)
+        );
+        assert!(packet_structure_is_valid(&keyed));
+        assert!(packet_structure_is_valid(&plain));
+        assert!(!packet_structure_is_valid(&plain[..6]));
+        assert!(!packet_structure_is_valid(&[
+            0x20, 0x00, 0x90, 0x3C, 0x64, 0, 0
+        ]));
+        assert!(!packet_structure_is_valid(&[
+            0x10, 0x04, 0x90, 0x3C, 0x64, 0, 0
+        ]));
+        assert!(!packet_structure_is_valid(&[
+            0x10, 0x00, 0x90, 0x3C, 0x00, 0, 0
+        ]));
+        assert!(packet_structure_is_valid(&[0x14, 0x02, 0xF2, 0xFA]));
+        assert!(packet_structure_is_valid(&[0x14, 0x02, 0x00, 0x00]));
+        // FEC candidates likewise.
+        let mut nibbles = bytes_to_nibbles(&keyed);
+        nibbles.resize(14, 0);
+        assert!(fec_candidate_is_valid_keyed(&nibbles, 0x1234));
+        assert!(!fec_candidate_is_valid_keyed(&nibbles, DEFAULT_LINK_KEY));
+        assert!(!fec_candidate_is_valid(&nibbles));
+        let mut nibbles = bytes_to_nibbles(&plain);
+        nibbles.resize(14, 0);
+        assert!(fec_candidate_is_valid(&nibbles));
+        assert!(!fec_candidate_is_valid_keyed(&nibbles, 0x1234));
+    }
 
     #[test]
     fn packet_roundtrip() {

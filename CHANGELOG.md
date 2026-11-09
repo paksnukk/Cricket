@@ -50,6 +50,99 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   shows the version from the package instead of a hard-coded "v1.0". `cricket --version` prints
   `cricket 0.2.0`. Minimum supported Rust version is 1.87.
 
+### Link key, scheduler and fail-safe
+
+- **Wire format (link key):** the packet CRC-16 is now computed with a configurable 16-bit **link
+  key** as its init value (spec §4.1, revision r4). Two Cricket links in one multicore or Dante
+  domain leak into each other at about −40 dB, and the receivers are level-independent, so a
+  receiver delivered the neighbouring link's valid packets — including MSC GOs. With different keys
+  every such packet fails the CRC deterministically (the CRC is affine in its init), at zero wire
+  bits and with the false-accept arithmetic unchanged. The default key `0xFFFF` is the
+  CRC-16/CCITT-FALSE init, so unkeyed links are bit-identical to before and interoperate with older
+  builds; a keyed link does not. In the simulator, two links at −40 dB crosstalk deliver all 12 of
+  the neighbour's packets unkeyed on every profile and none with different keys, with the own
+  delivery unchanged (`cricket_core/tests/link_key.rs`). CLI `--link-key 0x1234` or
+  `--link-key "a passphrase"` (hashed to 16 bits), a GUI field, `PhyConfig::with_link_key`,
+  `DecoderConfig` / `EncoderConfig::link_key`. The status shows the key masked and a **wrong-key
+  suspects** count (`LinkStats::wrong_key_suspects`, `ModemStats::wrong_key_suspects`, CLI "(N other
+  key?)", GUI, `--json`): bodies with a packet's structure whose CRC failed, which random noise
+  produces with probability about 2⁻¹⁷, so a key mismatch between the two ends shows up in
+  seconds. Keying the whitening sequence as well was evaluated and not done: a neighbour's clean
+  body decodes to one candidate that fails the CRC deterministically, and measured same-profile
+  other-key traffic offers the CRC fewer candidates per body than the misconfigured uncoded
+  transmitter the whitening already guards against (`fec_false_accept.rs`,
+  `other_key_traffic_never_decodes` and the report's "other-key traffic" row).
+- **MSC goes ahead of Note Off** in the TX scheduler (spec §5.5 tiers 2 and 3): a chord release no
+  longer delays a GO by up to four messages (0.7 s on Robust).
+- **Chords on Fast and Robust:** the queued Note On limit is per profile, max(⌊250 ms / airtime⌋,
+  min(10, max(4, ⌊1 s / airtime⌋))): 5 on Robust (was 4), 4 on Robust repeat, **10 on Fast** (was
+  4), unchanged 11–46 on the LTC profiles. Beyond it the **newest** Note On is refused instead of the
+  oldest being dropped: the notes struck first (the bass, the hand that leads) are the ones that go
+  out, and a note that would only arrive late is reported; before, the 6th note of a chord on Fast
+  dropped the 2nd struck. A Note Off for a refused note is not sent either (unless the note is
+  sounding from an earlier strike). Every drop raises an alarm (`AlarmKind::MessageDropped`,
+  `"message_dropped"`, with the count and the profile's limit) and is counted in
+  `TxStatus::dropped` (CLI status "dropped N", `--json`, GUI). `TxScheduler::note_on_dropped` (a
+  flag) is now `note_ons_dropped` (a count), with `max_note_ons()`. In the scheduler harness a
+  6-note chord now arrives whole on Fast (342 ms) and loses only its last note on Robust (before: the
+  first two on both). `cricket loopback --chords 10 --chord-size 6` therefore completes on
+  `analog-fast` (it used to wait for the two lost notes) and still reports the sixth note as not
+  delivered on `analog-safe`, whose limit is 5.
+- **Note Off refresh policy** (spec §5.5): the six repeats of a released note follow a Fibonacci
+  schedule (1, 2, 3, 5, 8, 13 message times after the Note Off; `digital` keeps its 20 ms spacing)
+  instead of filling the first six free slots back to back, so consecutive copies no longer fall
+  into one dropout and a release costs a few idle slots spread over seconds instead of a 4.2 s
+  burst for a 4-note release on Robust. On the coded profiles (Robust, `clean-line`, `digital-line`)
+  and `digital-bit-exact`, which lose few Note Offs (Robust: 0.3 % at 2 % symbol errors), a due
+  repeat also waits for one message time of idle line, so a note struck shortly after another never
+  waits behind a repeat; the uncoded profiles (Robust repeat, Fast, `ltc*`), which lose 6–23 % of
+  Note Offs at 2 % errors, keep the first free slot. While repeats are pending but not due, the
+  Heartbeat slot carries one instead of a Heartbeat. Measured in the scheduler harness
+  (`tests/tx_policy.rs`, legato: a note every 300–600 ms, released 60 ms after the next strike):
+  Robust mean Note On latency 324 → **250 ms** (p95 516 → 508), with 47 instead of 145 repeats on
+  the line and the line duty 100 → 83 %; Fast 84 → 83 ms; `ltc_fec` 22 → 23 ms. The stuck-note
+  harness (`tests/stuck_notes.rs`, 0.5–2 % symbol errors, Robust / Robust repeat / Fast) still ends
+  every run with no note stuck past link-dead time; Robust repeat at 2 % now has longer stuck
+  episodes under its 11 % Note Off loss (longest 1.8 s, was 0.7 s), the price of spacing the
+  repeats. `TxScheduler::with_refresh_quiet`, `modem::refresh_quiet_samples`,
+  `next_idle_sample`; `with_refresh_spacing` now spaces the repeats of one note.
+- **Controller refresh:** the transmitter remembers the pedal (CC 64/66/67/69), Modulation (CC 1)
+  and Pitch Bend state it sent and, in idle Heartbeat slots, re-sends one state that differs from
+  the default (pedal down, modulation on, bend off centre) instead of a Heartbeat, round robin. A
+  receiver that restarted or ran its fail-safe recovers the pedal and bend within a few Heartbeat
+  intervals; the airtime cost is zero (it replaces the Heartbeat), the receiver sees an idempotent
+  repeat.
+- **Fail-safe per profile** (spec §5.3, §6): heartbeat / link-dead stay **500 / 2000 ms** on the
+  MFSK profiles and the LTC profiles up to 4800 bit/s, and become **250 / 1000 ms** on
+  `clean-line-fast` (`ltc9600*`) and `digital-line` (`ltc14400*`) and **100 / 500 ms** on
+  `digital-bit-exact`, so a dead line clears stuck notes in 1 s (0.5 s) instead of 2 s where a
+  heartbeat is cheap. The rule: the heartbeat interval is a quarter to a fifth of link-dead (3–4
+  heartbeats in a row must be lost for a false link-dead: at 97 % delivery one per 5–170 h on
+  Robust, 2.6–86 h on `clean-line-fast`, at 99 % one per 70 h–290 d) and at least 20 message
+  airtimes, so a heartbeat in flight stays out of the p95 note latency. The 125 ms heartbeat first
+  tried on `clean-line` (17 % duty) moved its loopback p95 from 24 to 33 ms, so `clean-line` keeps
+  500 / 2000 ms. CLI `decode --link-dead-ms` overrides it (`DecoderConfig::link_dead_ms` as before).
+- **Fail-safe burst content:** the burst now starts each channel with an explicit **Note Off for
+  every note this receiver turned on** and has not seen released (several soft synths and DAWs
+  ignore CC123), then Sustain off, All Notes Off and the pitch-bend centre as before (spec §5.3).
+  `MidiOutput::sounding()` exposes the tracked notes.
+- **Fail-safe burst optional** for cue-only (MSC) links where a stray All Notes Off is unwanted:
+  CLI `decode --no-failsafe-burst`, GUI checkbox, `DecoderConfig::fail_safe_burst`,
+  `CricketModemRx::set_fail_safe_burst`. Link-dead is still detected and reported; Panic, link-dead,
+  input stall and stop then send nothing to MIDI out.
+- **MSC addressing at the transmitter** (spec §5.4, "multi-device rigs: filter at TX"): with several
+  MSC devices on the MIDI line, a cue for the sound console was carried and re-addressed to the
+  receiver's single target (a lighting all-call GO). The encoder can now carry only MSC addressed to
+  one device ID and/or command format (all-call `0x7F` / all-types `0x7F` always pass): CLI
+  `encode --msc-accept-device 3 --msc-accept-format 0x10`, a GUI device selector,
+  `EncoderConfig::msc_filter` (`MscFilter`), `transport::midi_input_filtered`. The default accepts
+  everything, as before; the first filtered cue is logged.
+- Spec (`docs/aml-v1-spec.md`, revision r4): §4.1 link key, §4.7 wrong-key count, §5.3 fail-safe
+  per profile, explicit Note Offs, burst switch and "a suppressed duplicate re-arms link-dead", §5.4
+  TX filter, §5.5 tiers / Note On limit / refresh schedule / controller refresh, §6 and §6.5 timer
+  rows, §8 metrics. `cricket loopback --legato` plays overlapping notes (the previous note is
+  released 60 ms after the next strike) for the refresh measurements.
+
 #### Stage safety and profile names
 
 - An unknown profile name is an error (`PhyConfig::from_name` returns `Option`; the CLI lists the

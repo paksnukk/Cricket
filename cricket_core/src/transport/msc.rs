@@ -551,6 +551,38 @@ impl Default for MscTarget {
     }
 }
 
+/// Transmitter-side MSC filter (spec §5.4, multi-device rigs): which
+/// device ID and command format an incoming MSC SysEx must address for the
+/// transmitter to carry it. `None` accepts any value; the default accepts
+/// everything, so a single-device rig needs no setting. An all-call device
+/// ID (`0x7F`) and the all-types command format (`0x7F`) always pass: they
+/// address every device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MscFilter {
+    /// Accept only MSC addressed to this device ID (or to all-call).
+    pub device_id: Option<u8>,
+    /// Accept only MSC in this command format (or all-types).
+    pub command_format: Option<u8>,
+}
+
+impl MscFilter {
+    /// All-call device ID and all-types command format.
+    pub const ALL: u8 = 0x7F;
+
+    /// Whether an MSC SysEx with `device_id` and `command_format` passes.
+    pub fn accepts(&self, device_id: u8, command_format: u8) -> bool {
+        let device_ok = device_id == Self::ALL || self.device_id.is_none_or(|d| d == device_id);
+        let format_ok =
+            command_format == Self::ALL || self.command_format.is_none_or(|f| f == command_format);
+        device_ok && format_ok
+    }
+
+    /// Whether anything is filtered at all.
+    pub fn is_filtering(&self) -> bool {
+        self.device_id.is_some() || self.command_format.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +768,26 @@ mod tests {
             MscError::CueNotRepresentable("12.345".into()).to_string(),
             "MSC cue 12.345 not representable (cues 0–999.9 with at most one decimal)"
         );
+    }
+
+    #[test]
+    fn filter_accepts_configured_and_all_call() {
+        let any = MscFilter::default();
+        assert!(!any.is_filtering());
+        assert!(any.accepts(0, 0) && any.accepts(0x7F, 0x7F) && any.accepts(5, 0x10));
+        let f = MscFilter {
+            device_id: Some(5),
+            command_format: Some(0x10),
+        };
+        assert!(f.is_filtering());
+        assert!(f.accepts(5, 0x10));
+        assert!(f.accepts(0x7F, 0x10) && f.accepts(5, 0x7F) && f.accepts(0x7F, 0x7F));
+        assert!(!f.accepts(4, 0x10) && !f.accepts(5, 0x01) && !f.accepts(0x70, 0x10));
+        let group = MscFilter {
+            device_id: Some(0x70),
+            command_format: None,
+        };
+        assert!(group.accepts(0x70, 0x01) && group.accepts(0x7F, 0x30) && !group.accepts(0, 0x01));
     }
 
     #[test]

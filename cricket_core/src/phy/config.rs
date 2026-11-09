@@ -8,7 +8,7 @@
 //! what line a profile is for. [`PhyConfig::from_name`] accepts both.
 
 use super::bmc::{BmcParams, Modulation};
-use crate::link::FecMode;
+use crate::link::{FecMode, DEFAULT_LINK_KEY};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -119,7 +119,18 @@ pub struct PhyConfig {
     pub rx_track_timing: bool,
     pub repetition_k: usize,
     pub interleave_depth: usize,
+    /// Fail-safe: no valid packet for this long after the last one declares
+    /// the link dead (spec §5.3). Per profile (spec §6): 2000 ms on the MFSK
+    /// profiles and the LTC profiles up to 4800 bit/s, 1000 ms from
+    /// 9600 bit/s, 500 ms on `digital`: as short as the heartbeat duty
+    /// allows (below).
     pub link_dead_ms: u32,
+    /// Idle keepalive interval (spec §5.5): a quarter to a fifth of
+    /// `link_dead_ms`, so three to four heartbeats must be lost in a row for
+    /// a false link-dead, and at least 20 message airtimes, so a heartbeat
+    /// in flight (at most 5 % of the idle line) stays out of the p95 note
+    /// latency (500 ms on the MFSK and LTC profiles up to 4800 bit/s, 250 ms
+    /// from 9600 bit/s, 100 ms on `digital`).
     pub heartbeat_interval_ms: u32,
     /// Body forward error correction (spec §4.6): `Rs16 { parity: 4 }` for
     /// robust and the `*_fec` LTC profiles, `None` (block-interleaved
@@ -134,6 +145,12 @@ pub struct PhyConfig {
     /// `digital` profile itself (its only receiver). Experimental, see
     /// `docs/proposals/digital-transparent.md`.
     pub digital_detect: bool,
+    /// Link key (spec §4.1): the CRC-16 init value, the same on both ends.
+    /// Packets from a link with another key fail the CRC, so two links in
+    /// one multicore or Dante domain do not deliver each other's messages
+    /// through crosstalk. [`DEFAULT_LINK_KEY`] (`0xFFFF`) is the unkeyed
+    /// link (the wire format without a key); see [`PhyConfig::with_link_key`].
+    pub link_key: u16,
 }
 
 impl Default for PhyConfig {
@@ -190,6 +207,7 @@ impl PhyConfig {
             fec: FecMode::None,
             acquisition: Acquisition::Joint { misses: 1 },
             digital_detect: false,
+            link_key: DEFAULT_LINK_KEY,
         }
     }
 
@@ -243,6 +261,7 @@ impl PhyConfig {
             fec: FecMode::None,
             acquisition: Acquisition::FirstSymbol,
             digital_detect: false,
+            link_key: DEFAULT_LINK_KEY,
         }
     }
 
@@ -260,6 +279,16 @@ impl PhyConfig {
         // `BmcParams::new` clamps the bit rate (`bmc::BIT_RATE_RANGE`).
         let params = BmcParams::new(bit_rate);
         let bit_rate = params.bit_rate;
+        // Fail-safe timers by bit rate (spec §6.5): the faster the line,
+        // the cheaper a heartbeat and the sooner a dead link is declared,
+        // keeping a heartbeat at most 5 % of the idle line (measured: a
+        // 125 ms heartbeat on `ltc_fec` put its p95 note latency from 24 to
+        // 33 ms).
+        let (heartbeat_interval_ms, link_dead_ms) = if bit_rate < 9600 {
+            (500, 2000)
+        } else {
+            (250, 1000)
+        };
         Self {
             sample_rate_hz: 48_000,
             modulation: Modulation::Bmc(params),
@@ -279,11 +308,12 @@ impl PhyConfig {
             rx_track_timing: false,
             repetition_k: 1,
             interleave_depth: 4,
-            link_dead_ms: 2000,
-            heartbeat_interval_ms: 500,
+            link_dead_ms,
+            heartbeat_interval_ms,
             fec: FecMode::None,
             acquisition: Acquisition::FirstSymbol,
             digital_detect: false,
+            link_key: DEFAULT_LINK_KEY,
         }
     }
 
@@ -349,11 +379,12 @@ impl PhyConfig {
             rx_track_timing: false,
             repetition_k: 2,
             interleave_depth: 4,
-            link_dead_ms: 2000,
-            heartbeat_interval_ms: 500,
+            link_dead_ms: 500,
+            heartbeat_interval_ms: 100,
             fec: FecMode::None,
             acquisition: Acquisition::FirstSymbol,
             digital_detect: true,
+            link_key: DEFAULT_LINK_KEY,
         }
     }
 
@@ -413,6 +444,18 @@ impl PhyConfig {
     pub fn with_sample_rate(mut self, sample_rate_hz: u32) -> Self {
         self.sample_rate_hz = sample_rate_hz;
         self
+    }
+
+    /// Set the link key (spec §4.1; see [`PhyConfig::link_key`]). Both ends
+    /// must use the same key; [`DEFAULT_LINK_KEY`] is the unkeyed link.
+    pub fn with_link_key(mut self, link_key: u16) -> Self {
+        self.link_key = link_key;
+        self
+    }
+
+    /// Whether a link key other than the default is set.
+    pub fn is_keyed(&self) -> bool {
+        self.link_key != DEFAULT_LINK_KEY
     }
 
     /// Estimated first-copy on-wire duration for a max-size body (16 nibbles,
@@ -761,6 +804,63 @@ mod tests {
                 assert_eq!(normalize(a), *a, "{a}");
             }
         }
+    }
+
+    /// Fail-safe timers per profile (spec §6): a heartbeat interval of a
+    /// quarter to a fifth of the link-dead time everywhere, long where a
+    /// heartbeat costs airtime, short on the fast LTC profiles and `digital`.
+    #[test]
+    fn fail_safe_timers_per_profile() {
+        for (name, heartbeat, link_dead) in [
+            ("robust", 500, 2000),
+            ("robust_repeat", 500, 2000),
+            ("fast", 500, 2000),
+            ("ltc2400", 500, 2000),
+            ("ltc2400_fec", 500, 2000),
+            ("ltc", 500, 2000),
+            ("ltc_fec", 500, 2000),
+            ("ltc9600", 250, 1000),
+            ("ltc9600_fec", 250, 1000),
+            ("ltc14400", 250, 1000),
+            ("ltc14400_fec", 250, 1000),
+            ("digital", 100, 500),
+        ] {
+            let c = PhyConfig::from_name(name).unwrap();
+            assert_eq!(
+                (c.heartbeat_interval_ms, c.link_dead_ms),
+                (heartbeat, link_dead),
+                "{name}"
+            );
+            // Four to five heartbeats per link-dead time.
+            assert!(
+                c.link_dead_ms >= 4 * c.heartbeat_interval_ms
+                    && c.link_dead_ms <= 5 * c.heartbeat_interval_ms,
+                "{name}"
+            );
+            // Where the timers are shorter than the default a heartbeat
+            // costs at most 5 % of the idle line, so one in flight stays out
+            // of the p95 note latency (the profiles with the default timers
+            // cost up to 55 %: Robust repeat).
+            let airtime_ms = c.estimated_first_copy_ms() * c.repetition_k.max(1) as f32;
+            if c.link_dead_ms < 2000 {
+                assert!(
+                    airtime_ms / c.heartbeat_interval_ms as f32 <= 0.05,
+                    "{name}: {airtime_ms} ms every {} ms",
+                    c.heartbeat_interval_ms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_key_setting() {
+        let c = PhyConfig::robust();
+        assert_eq!(c.link_key, DEFAULT_LINK_KEY);
+        assert!(!c.is_keyed());
+        let k = c.with_link_key(0x1234);
+        assert_eq!(k.link_key, 0x1234);
+        assert!(k.is_keyed());
+        assert!(!PhyConfig::fast().with_link_key(DEFAULT_LINK_KEY).is_keyed());
     }
 
     #[test]

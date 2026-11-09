@@ -206,7 +206,8 @@ fn link_dead_fires_after_silence() {
     let mut rx = CricketModemRx::new(config.clone());
     let mut audio = tx.encode_heartbeat();
     let packet_end = audio.len();
-    audio.resize(packet_end + 48_000 * 3, 0.0);
+    let link_dead = 48_000 * config.link_dead_ms as usize / 1000;
+    audio.resize(packet_end + link_dead + 48_000, 0.0);
     let mut dead_at = None;
     let mut heartbeat = false;
     for (i, chunk) in audio.chunks(256).enumerate() {
@@ -219,10 +220,11 @@ fn link_dead_fires_after_silence() {
         }
     }
     assert!(heartbeat);
-    let dead_at = dead_at.expect("link-dead after 2 s of silence");
+    let dead_at = dead_at.expect("link-dead after the profile's silence");
     let fired = rx.last_link_dead_sample().unwrap() as usize;
-    // 2000 ms after the end of the packet (decoded on its terminating edge).
-    let expected = packet_end + 96_000;
+    // `link_dead_ms` (500 ms for `ltc`) after the end of the packet (decoded
+    // on its terminating edge).
+    let expected = packet_end + link_dead;
     assert!(
         fired.abs_diff(expected) < 200,
         "fired {fired} expected ~{expected}"

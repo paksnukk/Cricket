@@ -34,6 +34,20 @@ pub struct AppSettings {
     /// Encoder transmit level, peak dBFS.
     #[serde(default = "default_tx_level_db")]
     pub tx_level_db: f32,
+    /// Link key as typed (`0x1234` or a passphrase); empty = unkeyed.
+    #[serde(default)]
+    pub link_key: String,
+    /// Encoder MSC filter: carry only MSC for this device ID (or all-call);
+    /// `None` = any device ID.
+    #[serde(default)]
+    pub msc_accept_device: Option<u8>,
+    /// Decoder: send the fail-safe burst on link-dead / Panic / stop.
+    #[serde(default = "default_true")]
+    pub fail_safe_burst: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_channel() -> u16 {
@@ -58,6 +72,9 @@ impl Default for AppSettings {
             audio_in_channel: 1,
             audio_out_channel: 1,
             tx_level_db: default_tx_level_db(),
+            link_key: String::new(),
+            msc_accept_device: None,
+            fail_safe_burst: true,
         }
     }
 }
@@ -96,6 +113,12 @@ struct StoredSettings {
     audio_out_channel: Option<u16>,
     #[serde(default)]
     tx_level_db: Option<f32>,
+    #[serde(default)]
+    link_key: Option<String>,
+    #[serde(default)]
+    msc_accept_device: Option<u8>,
+    #[serde(default)]
+    fail_safe_burst: Option<bool>,
 }
 
 impl StoredSettings {
@@ -189,6 +212,9 @@ pub fn parse_settings(json: &str, names: impl FnOnce() -> DeviceNames) -> Parsed
                 .filter(|db| db.is_finite())
                 .map(|db| db.clamp(cricket_engine::MIN_TX_LEVEL_DBFS, 0.0))
                 .unwrap_or(defaults.tx_level_db),
+            link_key: stored.link_key.unwrap_or_default(),
+            msc_accept_device: stored.msc_accept_device.filter(|d| *d < 0x7F),
+            fail_safe_burst: stored.fail_safe_burst.unwrap_or(true),
         },
         migrated,
     }
@@ -273,6 +299,9 @@ mod tests {
                 audio_in_channel: 1,
                 audio_out_channel: 1,
                 tx_level_db: -12.0,
+                link_key: String::new(),
+                msc_accept_device: None,
+                fail_safe_burst: true,
             }
         );
         // The new JSON stores names.
@@ -290,7 +319,10 @@ mod tests {
                 "msc_command_format": 1,
                 "audio_in_channel": 1,
                 "audio_out_channel": 1,
-                "tx_level_db": -12.0
+                "tx_level_db": -12.0,
+                "link_key": "",
+                "msc_accept_device": null,
+                "fail_safe_burst": true
             })
         );
     }
@@ -318,6 +350,9 @@ mod tests {
             audio_in_channel: 3,
             audio_out_channel: 2,
             tx_level_db: -18.0,
+            link_key: "stage left".into(),
+            msc_accept_device: Some(3),
+            fail_safe_burst: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed = parse_settings(&json, || panic!("must not enumerate devices"));
@@ -344,6 +379,12 @@ mod tests {
         assert_eq!(parsed.settings.audio_in_channel, 1);
         assert_eq!(parsed.settings.audio_out_channel, 4);
         assert_eq!(parsed.settings.tx_level_db, 0.0);
+        assert_eq!(parsed.settings.link_key, "");
+        assert_eq!(parsed.settings.msc_accept_device, None);
+        assert!(parsed.settings.fail_safe_burst);
+        // An all-call "filter" is no filter.
+        let parsed = parse_settings(r#"{"msc_accept_device":127}"#, || panic!());
+        assert_eq!(parsed.settings.msc_accept_device, None);
     }
 
     #[test]

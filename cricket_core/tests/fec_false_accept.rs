@@ -43,6 +43,33 @@ fn white(seconds: f32, sigma: f64, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Back-to-back traffic of `config` itself with link key `key` (spec §4.1:
+/// a neighbouring link, or the far end configured differently), SNR 20 dB.
+fn other_key_traffic(config: &PhyConfig, key: u16, seconds: f32, seed: u64) -> Vec<f32> {
+    let keyed = config.clone().with_link_key(key);
+    let n = (seconds * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while out.len() < n {
+        let msgs: Vec<_> = (0..20)
+            .map(|k| TransportMessage::NoteOn {
+                channel: ((i + k) % 16) as u8,
+                note: ((i + k) % 128) as u8,
+                velocity: 1 + ((i + k) * 7 % 127) as u8,
+            })
+            .collect();
+        i += 20;
+        let block = encode_to_samples(keyed.clone(), &msgs);
+        out.extend(
+            ChannelSim::new(keyed.clone(), seed ^ i as u64)
+                .snr_db(20.0)
+                .apply(&block),
+        );
+    }
+    out.truncate(n);
+    out
+}
+
 /// Back-to-back MFSK NoteOns of `profiles` (equal shares) at SNR 20 dB.
 fn mfsk_traffic(seconds: f32, seed: u64, profiles: &[PhyConfig]) -> Vec<f32> {
     let n = (seconds * RATE as f32) as usize;
@@ -188,6 +215,11 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
         ("music", music(seconds, 6)),
         ("speech", speech(seconds, 7)),
         ("SMPTE LTC", ltc),
+        // A neighbouring link of the same profile with another link key.
+        (
+            "other-key traffic",
+            other_key_traffic(config, 0x1234, seconds, 12),
+        ),
     ];
     if bmc {
         let mfsk = [
@@ -503,6 +535,35 @@ fn worst_case_audio_rarely_reaches_the_crc() {
         assert!(
             per_body < max_per_body,
             "{name}: {per_body:.3} candidates per body ({} bodies)",
+            st.bodies
+        );
+    }
+}
+
+/// A neighbouring link of the same profile with another link key (spec
+/// §4.1): its clean packets decode to one candidate each, which fails the
+/// CRC deterministically; the GMD alternatives rarely reach the CRC.
+#[test]
+fn other_key_traffic_never_decodes() {
+    for (name, config, max_per_body) in [
+        ("robust", PhyConfig::robust(), 1.3),
+        ("ltc_fec", PhyConfig::ltc_fec(), 1.3),
+    ] {
+        let audio = other_key_traffic(&config, 0x1234, 6.0, 31);
+        let st = run_false(&config, &audio);
+        let per_body = st.candidates as f64 / st.bodies.max(1) as f64;
+        assert_eq!(st.false_msgs, 0, "{name}");
+        assert!(st.bodies >= 20, "{name}: only {} bodies", st.bodies);
+        assert!(
+            per_body < max_per_body,
+            "{name}: {per_body:.3} candidates per body ({} bodies)",
+            st.bodies
+        );
+        // Most bodies are the neighbour's packets: structurally valid.
+        assert!(
+            st.struct_strict >= st.bodies / 2,
+            "{name}: {} of {} bodies structurally valid",
+            st.struct_strict,
             st.bodies
         );
     }

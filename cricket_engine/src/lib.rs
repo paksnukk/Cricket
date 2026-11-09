@@ -13,6 +13,8 @@
 //!     link_dead_ms: None,
 //!     msc: MscTarget::default(),
 //!     audio: AudioOptions::default(),
+//!     link_key: DEFAULT_LINK_KEY,
+//!     fail_safe_burst: true,
 //! })?;
 //! let enc = EncoderHandle::start(EncoderConfig {
 //!     audio_out: AudioOut::Device(DeviceSelector::Default),
@@ -21,6 +23,8 @@
 //!     simulate: false,
 //!     tx_level_dbfs: None,
 //!     audio: AudioOptions { buffer_frames: Some(256), ..Default::default() },
+//!     link_key: DEFAULT_LINK_KEY,
+//!     msc_filter: MscFilter::default(),
 //! })?;
 //! enc.send(TransportMessage::Panic);
 //! dec.panic(); // fail-safe burst to MIDI out, as on link-dead
@@ -55,8 +59,9 @@ pub use audio::{
     AudioIn, AudioOptions, AudioOut, AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink,
     OpenAudioSource, SampleFormatPref,
 };
-pub use cricket_core::transport::{MscTarget, TransportMessage};
-pub use decoder::{DecoderConfig, DecoderHandle};
+pub use cricket_core::link::{parse_link_key, DEFAULT_LINK_KEY};
+pub use cricket_core::transport::{MscFilter, MscTarget, TransportMessage};
+pub use decoder::{link_key_label, DecoderConfig, DecoderHandle};
 pub use devices::DeviceSelector;
 pub use encoder::{EncoderConfig, EncoderHandle, MIN_TX_LEVEL_DBFS};
 pub use events::{
@@ -64,8 +69,9 @@ pub use events::{
     NO_SIGNAL_DBFS,
 };
 pub use loopback::{
-    jitter_ms, mean_ms, measure_chord_loopback, measure_midi_loopback, measure_midi_loopback_with,
-    measure_throughput, percentile_nearest_rank_ms, ChordSummary, LatencySummary, Pacing,
+    jitter_ms, mean_ms, measure_chord_loopback, measure_midi_loopback,
+    measure_midi_loopback_pattern, measure_midi_loopback_with, measure_throughput,
+    percentile_nearest_rank_ms, ChordSummary, LatencySummary, NotePattern, Pacing, LEGATO_OVERLAP,
 };
 pub use midi::{MidiCallback, MidiIn, MidiInputGuard, MidiOut, MidiSink, MidiSource};
 

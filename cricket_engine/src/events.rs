@@ -10,10 +10,10 @@
 //! | `Log(text)` | both | something worth a line in the log (devices opened, errors, TX of a user message, …) | as it happens |
 //! | `Level(rms)` | decoder | input level, RMS 0–1 ([`rms_to_dbfs`] converts) | every 1/20 s of audio |
 //! | `Decoded(msg)` | decoder | a valid packet, heartbeats included | per packet |
-//! | `Stats(LinkStats)` | decoder | link statistics (state, CRC pass/fail, FEC corrections, confidence, drops) | at most every 200 ms while audio flows |
+//! | `Stats(LinkStats)` | decoder | link statistics (state, CRC pass/fail, wrong-key suspects, FEC corrections, confidence, drops) | at most every 200 ms while audio flows |
 //! | `Alarm { kind, message }` | both | a condition the operator must see (table below) | once per occurrence |
 //! | `AlarmCleared { kind, message }` | decoder | the condition behind an earlier alarm of `kind` has ended | once |
-//! | `TxStatus { queued, latency_ms }` | encoder | TX queue depth and how late the oldest queued message is | every 200 ms |
+//! | `TxStatus { queued, latency_ms, dropped }` | encoder | TX queue depth, how late the oldest queued message is, and how many messages the scheduler has dropped since start | every 200 ms |
 //! | `Stopped` | both | the worker has finished (device error, or `stop()`); always the last event | once |
 //!
 //! Alarm kinds ([`AlarmKind`], stable string in [`AlarmKind::as_str`]):
@@ -24,6 +24,7 @@
 //! | `AudioInputStalled` | `audio_input_stalled` | the audio input delivered no samples for `link_dead_ms` (if the link was up, the fail-safe burst was sent) | when samples resume |
 //! | `AudioDeviceError` | `audio_device_error` | the audio stream reported an error (device unplugged, driver stall) | never (reopen) |
 //! | `MessageRejected` | `message_rejected` | the encoder got a message it cannot carry exactly (e.g. an MSC cue with two decimals); it was **not** sent | never (per message) |
+//! | `MessageDropped` | `message_dropped` | the TX scheduler dropped queued messages (NoteOns beyond the profile's chord limit, or tier-3 messages beyond 1 s of airtime): the link is overloaded | never (per batch of drops) |
 //! | `MidiOutputError` | `midi_output_error` | sending to the MIDI output device failed; decoded MIDI is being lost | when a send succeeds again |
 
 use cricket_core::phy::LinkState;
@@ -52,8 +53,15 @@ pub enum EngineEvent {
     AlarmCleared { kind: AlarmKind, message: String },
     /// Encoder queue status, about every 200 ms. `queued` = messages waiting
     /// in the TX scheduler, `latency_ms` = how long the oldest of them has
-    /// already waited plus the audio buffered ahead of the output.
-    TxStatus { queued: usize, latency_ms: f32 },
+    /// already waited plus the audio buffered ahead of the output,
+    /// `dropped` = messages the scheduler has dropped since the encoder
+    /// started (spec §5.5: NoteOns beyond the chord limit, tier-3 messages
+    /// beyond the queue bound).
+    TxStatus {
+        queued: usize,
+        latency_ms: f32,
+        dropped: u64,
+    },
     /// The worker has finished; no further events follow.
     Stopped,
 }
@@ -64,6 +72,12 @@ pub struct LinkStats {
     pub state: LinkState,
     pub crc_pass: u64,
     pub crc_fail: u64,
+    /// Of `crc_fail`: bodies with a packet's structure whose CRC failed,
+    /// almost always packets from a Cricket link with another link key
+    /// (crosstalk from a neighbouring link, or the two ends set
+    /// differently). Random noise passes the structure with probability
+    /// about 2⁻¹⁷.
+    pub wrong_key_suspects: u64,
     /// Body symbols repaired by the error-correcting code (0 on uncoded
     /// profiles). A rising count on a working link means the line is
     /// eating symbols: the margin is shrinking.
@@ -109,12 +123,17 @@ pub enum AlarmKind {
     /// reaching the device. Raised once per failure streak and cleared when
     /// a send succeeds again.
     MidiOutputError,
+    /// The TX scheduler dropped queued messages because the link is
+    /// overloaded: NoteOns beyond the profile's chord limit (spec §5.5), or
+    /// tier-3 messages beyond 1 s of queued airtime. The message says how
+    /// many and why. Never cleared (one alarm per batch of drops).
+    MessageDropped,
 }
 
 impl AlarmKind {
     /// Stable identifier used by the GUI and `--json` (`"link_dead"`,
     /// `"audio_input_stalled"`, `"audio_device_error"`,
-    /// `"message_rejected"`, `"midi_output_error"`).
+    /// `"message_rejected"`, `"midi_output_error"`, `"message_dropped"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             AlarmKind::LinkDead => "link_dead",
@@ -122,6 +141,7 @@ impl AlarmKind {
             AlarmKind::AudioDeviceError => "audio_device_error",
             AlarmKind::MessageRejected => "message_rejected",
             AlarmKind::MidiOutputError => "midi_output_error",
+            AlarmKind::MessageDropped => "message_dropped",
         }
     }
 
@@ -133,6 +153,7 @@ impl AlarmKind {
             AlarmKind::AudioDeviceError => "Audio device error",
             AlarmKind::MessageRejected => "Message not sent",
             AlarmKind::MidiOutputError => "MIDI output failing",
+            AlarmKind::MessageDropped => "Messages dropped",
         }
     }
 }
@@ -297,6 +318,7 @@ mod tests {
             state: LinkState::Search,
             crc_pass: 0,
             crc_fail: 0,
+            wrong_key_suspects: 0,
             fec_corrected: 0,
             confidence_db: 0.0,
             last_seq: None,

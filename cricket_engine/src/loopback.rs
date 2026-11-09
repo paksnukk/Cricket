@@ -8,7 +8,7 @@
 use crate::memory::{MemoryAudio, MemoryMidiInjector, MemoryMidiInput, RecordingMidiSink};
 use crate::{
     AudioIn, AudioOptions, AudioOut, DecoderConfig, DecoderHandle, EncoderConfig, EncoderHandle,
-    MidiIn, MidiOut, MscTarget,
+    MidiIn, MidiOut, MscFilter, MscTarget, DEFAULT_LINK_KEY,
 };
 use anyhow::{anyhow, Result};
 use cricket_core::modem::repetition_samples;
@@ -124,6 +124,8 @@ impl Rig {
             link_dead_ms: None,
             msc: MscTarget::default(),
             audio: AudioOptions::default(),
+            link_key: DEFAULT_LINK_KEY,
+            fail_safe_burst: true,
         })?;
         let (midi_in, injector) = MemoryMidiInput::new();
         let enc = EncoderHandle::start(EncoderConfig {
@@ -133,6 +135,8 @@ impl Rig {
             simulate: false,
             tx_level_dbfs: None,
             audio: AudioOptions::default(),
+            link_key: DEFAULT_LINK_KEY,
+            msc_filter: MscFilter::default(),
         })?;
         let rig = Self {
             enc,
@@ -190,6 +194,25 @@ impl Rig {
     }
 }
 
+/// How the notes of a latency run follow each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotePattern {
+    /// Strike, hold 150 ms, release, rest 150–450 ms, strike the next
+    /// (default).
+    #[default]
+    Detached,
+    /// Notes overlap: the next note is struck 300–600 ms after the
+    /// previous one and the previous note is released
+    /// [`LEGATO_OVERLAP`] after that strike, so every NoteOn is
+    /// followed closely by a NoteOff (whose repeats a following NoteOn
+    /// may wait behind).
+    Legato,
+}
+
+/// In the legato pattern, how long the previous note sounds past the next
+/// strike.
+pub const LEGATO_OVERLAP: Duration = Duration::from_millis(60);
+
 /// Measure wall-clock MIDI-in → MIDI-out NoteOn latency for `profile`
 /// (a [`PhyConfig::from_name`] name such as `"analog-safe"`, `"robust"`,
 /// `"clean-line"` or `"digital"`) over `note_count` notes, each held
@@ -204,11 +227,21 @@ pub fn measure_midi_loopback_with(
     note_count: usize,
     pacing: Pacing,
 ) -> Result<LatencySummary> {
+    measure_midi_loopback_pattern(profile, note_count, pacing, NotePattern::Detached)
+}
+
+/// [`measure_midi_loopback`] with a choice of [`Pacing`] and [`NotePattern`].
+pub fn measure_midi_loopback_pattern(
+    profile: &str,
+    note_count: usize,
+    pacing: Pacing,
+    pattern: NotePattern,
+) -> Result<LatencySummary> {
     if note_count == 0 {
         return Err(anyhow!("note_count must be at least 1"));
     }
     let rig = Rig::start(profile, pacing)?;
-    let result = play_notes(&rig, note_count);
+    let result = play_notes(&rig, note_count, pattern);
     let finished = rig.finish();
     let latencies = result?;
     finished?;
@@ -216,8 +249,9 @@ pub fn measure_midi_loopback_with(
 }
 
 /// Plays the notes and returns each NoteOn's latency in milliseconds.
-fn play_notes(rig: &Rig, note_count: usize) -> Result<Vec<f64>> {
+fn play_notes(rig: &Rig, note_count: usize, pattern: NotePattern) -> Result<Vec<f64>> {
     let mut latencies = Vec::with_capacity(note_count);
+    let mut sounding: Option<u8> = None;
     for i in 0..note_count {
         let note = 48 + (i % 40) as u8;
         let expected = vec![0x90, note, 90];
@@ -234,9 +268,24 @@ fn play_notes(rig: &Rig, note_count: usize) -> Result<Vec<f64>> {
         };
         latencies.push(at[0].duration_since(t0).as_secs_f64() * 1000.0);
 
-        std::thread::sleep(HOLD);
-        rig.inject(&[0x80, note, 0])?;
-        std::thread::sleep(rest(i));
+        match pattern {
+            NotePattern::Detached => {
+                std::thread::sleep(HOLD);
+                rig.inject(&[0x80, note, 0])?;
+                std::thread::sleep(rest(i));
+            }
+            NotePattern::Legato => {
+                let elapsed = t0.elapsed();
+                std::thread::sleep(LEGATO_OVERLAP.saturating_sub(elapsed));
+                if let Some(prev) = sounding.replace(note) {
+                    rig.inject(&[0x80, prev, 0])?;
+                }
+                std::thread::sleep((HOLD + rest(i)).saturating_sub(t0.elapsed()));
+            }
+        }
+    }
+    if let Some(prev) = sounding {
+        rig.inject(&[0x80, prev, 0])?;
     }
     Ok(latencies)
 }

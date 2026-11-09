@@ -1,7 +1,7 @@
 use crate::link::{
-    bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
-    fec_candidate_is_valid, interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
-    SEQ_MODULUS,
+    bytes_to_nibbles, decode_packet_bytes_keyed, deinterleave, encode_packet_bytes_keyed,
+    fec_candidate_is_valid_keyed, interleave, nibbles_to_bytes, packet_structure_is_valid,
+    BodySymbol, FecCodec, Packet, SEQ_MODULUS,
 };
 use crate::phy::digital::{self, DigitalFrame, DigitalRx};
 use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
@@ -23,6 +23,15 @@ pub struct ModemStats {
     /// FEC decoder found no candidate. The sum with `crc_pass` is the
     /// number of completed bodies.
     pub crc_fail: u64,
+    /// Of `crc_fail`: bodies (or FEC candidates) with the structure of a
+    /// packet (version, type, SEQ, canonical payload; spec §4.7 rules 2–3)
+    /// whose CRC-16 did not match. Random data passes the structure with
+    /// probability ~2⁻¹⁷, so these are almost always packets from a Cricket
+    /// link with another **link key** (spec §4.1): crosstalk from a
+    /// neighbouring link, or the two ends configured differently. Counted
+    /// per body like `crc_fail`: each of a packet's K copies counts, and a
+    /// body read again after a rejected lock counts again.
+    pub wrong_key_suspects: u64,
     pub last_confidence_db: f32,
     pub last_seq: Option<u8>,
     /// Body symbols repaired by FEC (0 unless `PhyConfig::fec` is enabled).
@@ -82,7 +91,7 @@ impl CricketModemTx {
             seq,
             payload: msg.to_payload(),
         };
-        let bytes = encode_packet_bytes(&packet).expect("valid packet");
+        let bytes = encode_packet_bytes_keyed(&packet, self.config.link_key).expect("valid packet");
         let mut nibbles = bytes_to_nibbles(&bytes);
         let interleaved = if matches!(self.config.modulation, Modulation::Digital) {
             // The digital frame carries the packet nibbles as they are: its
@@ -130,14 +139,30 @@ pub fn repetition_samples(config: &PhyConfig) -> u64 {
     ((config.preamble.len() + body_nibbles + 1) * config.samples_per_symbol_period()) as u64
 }
 
-/// Least spacing of NoteOff refreshes for `config` at `sample_rate_hz`
-/// (for [`crate::transport::TxScheduler::with_refresh_spacing`]): 0 (every
-/// free packet, spec §5.5) except for the digital profile
+/// Least spacing between the repeats of one released note for `config` at
+/// `sample_rate_hz` (for [`crate::transport::TxScheduler::with_refresh_spacing`]):
+/// 0 (the schedule of spec §5.5 alone) except for the digital profile
 /// ([`digital::REFRESH_SPACING_MS`]).
 pub fn refresh_spacing_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
     match config.modulation {
         Modulation::Digital => sample_rate_hz as u64 * digital::REFRESH_SPACING_MS as u64 / 1000,
         _ => 0,
+    }
+}
+
+/// Idle line a NoteOff repeat waits for, for `config` at `sample_rate_hz`
+/// (for [`crate::transport::TxScheduler::with_refresh_quiet`], spec §5.5):
+/// one message time on the profiles with a coded body and on `digital`,
+/// which lose few NoteOffs (Robust: 0.3 % at 2 % symbol errors), so a note
+/// struck shortly after another never waits behind a repeat; 0 (the first
+/// free slot) on the uncoded profiles, which lose far more (Fast: 23 %)
+/// and need their repeats promptly.
+pub fn refresh_quiet_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
+    if config.fec.is_enabled() || matches!(config.modulation, Modulation::Digital) {
+        repetition_samples(&config.clone().with_sample_rate(sample_rate_hz))
+            * config.repetition_k.max(1) as u64
+    } else {
+        0
     }
 }
 
@@ -186,6 +211,7 @@ pub struct CricketModemRx {
     last_seq: Option<u8>,
     crc_pass: u64,
     crc_fail: u64,
+    wrong_key_suspects: u64,
     fail_safe: FailSafeMonitor,
     link_dead: bool,
     last_link_dead_sample: Option<u64>,
@@ -225,6 +251,7 @@ impl CricketModemRx {
             last_seq: None,
             crc_pass: 0,
             crc_fail: 0,
+            wrong_key_suspects: 0,
             fail_safe,
             link_dead: false,
             last_link_dead_sample: None,
@@ -247,6 +274,19 @@ impl CricketModemRx {
         self.midi.msc_target()
     }
 
+    /// Enable or disable the fail-safe burst on link-dead and Panic
+    /// (spec §5.3; default enabled). Disabled, link-dead is still detected
+    /// and reported (`ModemOutput::LinkDead`, link state `Dead`) and
+    /// [`fail_safe_burst`](Self::fail_safe_burst) returns nothing: for
+    /// cue-only links, where a stray All Notes Off is unwanted.
+    pub fn set_fail_safe_burst(&mut self, enabled: bool) {
+        self.midi.set_fail_safe_burst(enabled);
+    }
+
+    pub fn fail_safe_burst_enabled(&self) -> bool {
+        self.midi.fail_safe_burst_enabled()
+    }
+
     /// The fail-safe burst (spec §5.3) for a caller that declares link-dead
     /// itself ([`declare_link_dead`](Self::declare_link_dead)): CC64 = 0 and
     /// CC123 on every channel, plus pitch bend to center on channels this
@@ -264,6 +304,7 @@ impl CricketModemRx {
             },
             crc_pass: self.crc_pass,
             crc_fail: self.crc_fail,
+            wrong_key_suspects: self.wrong_key_suspects,
             last_confidence_db: self.phy.last_confidence_db(),
             last_seq: self.last_seq,
             fec_corrected: self.fec_corrected,
@@ -311,9 +352,9 @@ impl CricketModemRx {
     /// duplicate history cleared, link-dead disarmed (traffic received
     /// before the reset cannot fire it) and `Dead` state and `last_seq`
     /// cleared. The cumulative counters (`crc_pass`, `crc_fail`,
-    /// `fec_corrected`), the sample count and `last_link_dead_sample` are
-    /// kept. Not used internally (flushing would make timing depend on
-    /// chunking).
+    /// `wrong_key_suspects`, `fec_corrected`), the sample count and
+    /// `last_link_dead_sample` are kept. Not used internally (flushing
+    /// would make timing depend on chunking).
     pub fn reset(&mut self) {
         self.phy.reset();
         if let Some(d) = self.digital.as_mut() {
@@ -479,10 +520,12 @@ impl CricketModemRx {
         aux: bool,
         outputs: &mut Vec<ModemOutput>,
     ) -> bool {
-        let decoded = decode_packet_bytes(slice).ok().and_then(|packet| {
-            let msg = TransportMessage::from_type_payload(packet.msg_type, &packet.payload)?;
-            Some((packet, msg))
-        });
+        let decoded = decode_packet_bytes_keyed(slice, self.config.link_key)
+            .ok()
+            .and_then(|packet| {
+                let msg = TransportMessage::from_type_payload(packet.msg_type, &packet.payload)?;
+                Some((packet, msg))
+            });
         match decoded {
             Some((packet, msg)) => {
                 self.crc_pass += 1;
@@ -512,6 +555,9 @@ impl CricketModemRx {
             // with a non-canonical payload is treated as a false decode).
             None => {
                 self.crc_fail += 1;
+                if packet_structure_is_valid(slice) {
+                    self.wrong_key_suspects += 1;
+                }
                 false
             }
         }
@@ -520,12 +566,43 @@ impl CricketModemRx {
 
 impl CricketModemRx {
     /// FEC-decode the collected body into packet bytes (+ zero pad). A
-    /// candidate is accepted only if [`fec_candidate_is_valid`].
+    /// candidate is accepted only if [`fec_candidate_is_valid_keyed`] for
+    /// this link's key. A candidate that has a packet's structure but fails
+    /// the CRC (another link's packet, decoded cleanly) is counted as a
+    /// wrong-key suspect when no candidate is accepted.
     fn fec_packet_bytes(&mut self) -> Option<Vec<u8>> {
         let fec = self.fec.as_ref()?;
-        let decoded = fec.decode_body(&self.body_symbols, fec_candidate_is_valid)?;
-        self.fec_corrected += decoded.corrected as u64;
-        Some(nibbles_to_bytes(&decoded.nibbles))
+        let key = self.config.link_key;
+        let mut structured_rejects = 0u64;
+        let decoded = fec.decode_body(&self.body_symbols, |nibbles| {
+            if fec_candidate_is_valid_keyed(nibbles, key) {
+                return true;
+            }
+            let bytes = nibbles_to_bytes(nibbles);
+            let needed = bytes
+                .first()
+                .and_then(|hdr| MessageType::from_u8(hdr & 0x0F))
+                .map_or(usize::MAX, |t| 2 + t.payload_len() + 2);
+            if needed <= bytes.len()
+                && bytes[needed..].iter().all(|&b| b == 0)
+                && packet_structure_is_valid(&bytes[..needed])
+            {
+                structured_rejects += 1;
+            }
+            false
+        });
+        match decoded {
+            Some(decoded) => {
+                self.fec_corrected += decoded.corrected as u64;
+                Some(nibbles_to_bytes(&decoded.nibbles))
+            }
+            None => {
+                if structured_rejects > 0 {
+                    self.wrong_key_suspects += 1;
+                }
+                None
+            }
+        }
     }
 }
 
