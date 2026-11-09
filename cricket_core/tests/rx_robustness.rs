@@ -222,10 +222,7 @@ fn link_state_holds_for_a_second_after_a_packet() {
         } else {
             // Link-dead is due at or before the end of the hold.
             assert!(
-                matches!(
-                    rx.stats().link_state,
-                    LinkState::Search | LinkState::Dead
-                ),
+                matches!(rx.stats().link_state, LinkState::Search | LinkState::Dead),
                 "[{name}] after hold"
             );
         }

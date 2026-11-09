@@ -16,16 +16,24 @@ use alloc::vec::Vec;
 
 const REFRESH_CAPACITY: usize = 32;
 const REFRESH_LIFETIME_MS: u64 = 10_000;
-/// Earliest start of repeat `k` (1-based) of a released note's NoteOff, in
-/// message times after the user NoteOff: a Fibonacci spread, so consecutive
-/// copies do not fall into one dropout and a release costs a few idle slots
-/// spread over seconds instead of a burst, while all six repeats still fit
-/// within link-dead time on Fast (0.74 s) and Robust (2.3 s). No note stayed
-/// stuck past link-dead time in `tests/stuck_notes.rs` (up to 2 % symbol
-/// errors).
-const REFRESH_SCHEDULE: [u64; 6] = [1, 2, 3, 5, 8, 13];
 /// Repeats per released note.
-const REFRESH_MAX_REPEATS: u32 = REFRESH_SCHEDULE.len() as u32;
+const REFRESH_MAX_REPEATS: u32 = 6;
+/// A repeat schedule: earliest start of repeat `k` (1-based) of a released
+/// note's NoteOff, in message times after the user NoteOff.
+pub type RefreshSchedule = [u64; REFRESH_MAX_REPEATS as usize];
+/// The spread schedule (the default; the MFSK profiles, whose messages are
+/// 57–273 ms): a Fibonacci spread, so consecutive copies do not fall into
+/// one dropout and a release costs a few idle slots spread over seconds
+/// instead of a burst, while all six repeats still fit within link-dead
+/// time on Fast (0.74 s) and Robust (2.3 s). No note stayed stuck past
+/// link-dead time in `tests/stuck_notes.rs` (up to 2 % symbol errors).
+pub const REFRESH_SCHEDULE_SPREAD: RefreshSchedule = [1, 2, 3, 5, 8, 13];
+/// The consecutive schedule (the LTC and digital profiles, whose messages
+/// are a few ms): the first six free slots, so the repeats are over before
+/// the next note is likely to come; a dropout of a few ms covers at most
+/// one of them, and `digital` spaces them with
+/// [`TxScheduler::with_refresh_spacing`].
+pub const REFRESH_SCHEDULE_CONSECUTIVE: RefreshSchedule = [1, 2, 3, 4, 5, 6];
 /// NoteOn airtime budget: queued NoteOns are capped so that they occupy at
 /// most this (spec §5.5), unless the per-profile minimum below is larger.
 const NOTEON_BUDGET_MS: u64 = 250;
@@ -276,6 +284,9 @@ pub struct TxScheduler {
     last_emit_sample: Option<u64>,
     /// When the last user message was emitted (start sample).
     last_user_emit_sample: Option<u64>,
+    /// Earliest start of each repeat of a released note, in message times
+    /// after the user NoteOff.
+    refresh_schedule: RefreshSchedule,
     /// Least time between the start of consecutive repeats of one released
     /// note (0: the schedule alone decides).
     refresh_spacing_samples: u64,
@@ -320,6 +331,7 @@ impl TxScheduler {
             state_cursor: 0,
             last_emit_sample: None,
             last_user_emit_sample: None,
+            refresh_schedule: REFRESH_SCHEDULE_SPREAD,
             refresh_spacing_samples: 0,
             refresh_quiet_samples: 0,
             note_ons_dropped: 0,
@@ -358,12 +370,20 @@ impl TxScheduler {
         self.max_note_ons
     }
 
+    /// The repeat schedule of a released note (default
+    /// [`REFRESH_SCHEDULE_SPREAD`]; `crate::modem::refresh_schedule` picks
+    /// per profile).
+    pub fn with_refresh_schedule(mut self, schedule: RefreshSchedule) -> Self {
+        self.refresh_schedule = schedule;
+        self
+    }
+
     /// Space the repeats of one released note at least `samples` apart
     /// (start to start, counted from the user NoteOff too), where the
-    /// doubling schedule would put them closer. For profiles whose messages
-    /// are a few samples long (`digital`), where repeats within one message
-    /// time would all fall into one short dropout; 0 (the default) leaves
-    /// the schedule alone.
+    /// schedule would put them closer. For profiles whose messages are a
+    /// few samples long (`digital`), where repeats within one message time
+    /// would all fall into one short dropout; 0 (the default) leaves the
+    /// schedule alone.
     pub fn with_refresh_spacing(mut self, samples: u64) -> Self {
         self.refresh_spacing_samples = samples;
         self
@@ -385,7 +405,7 @@ impl TxScheduler {
     /// Earliest start of the next repeat of `e`.
     fn refresh_due(&self, e: &RefreshEntry) -> u64 {
         let k = u64::from(e.sent);
-        let by_schedule = REFRESH_SCHEDULE[e.sent as usize] * self.message_samples;
+        let by_schedule = self.refresh_schedule[e.sent as usize] * self.message_samples;
         let by_spacing = (k + 1) * self.refresh_spacing_samples;
         e.emitted_at + by_schedule.max(by_spacing)
     }
@@ -893,7 +913,7 @@ mod tests {
         let msg = s.message_samples;
         let mut prev = t;
         for i in 1..=k {
-            prev = (t + REFRESH_SCHEDULE[i as usize - 1] * msg).max(prev + 2 * msg);
+            prev = (t + REFRESH_SCHEDULE_SPREAD[i as usize - 1] * msg).max(prev + 2 * msg);
         }
         prev
     }
@@ -1244,7 +1264,10 @@ mod tests {
             crate::modem::refresh_spacing_samples(&PhyConfig::fast(), 48_000),
             0
         );
-        let mut s = scheduler(&config).with_refresh_spacing(spacing);
+        let mut s = scheduler(&config)
+            .with_refresh_schedule(crate::modem::refresh_schedule(&config))
+            .with_refresh_spacing(spacing)
+            .with_refresh_quiet(0);
         let msg = s.message_samples;
         let t = play_and_release(&mut s, 60, 0);
         assert_eq!(s.next_refresh_sample(), Some(t + spacing));

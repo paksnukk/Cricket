@@ -5,7 +5,10 @@ use crate::link::{
 };
 use crate::phy::digital::{self, DigitalFrame, DigitalRx};
 use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
-use crate::transport::{FailSafeMonitor, MessageType, MidiOutput, MscTarget, TransportMessage};
+use crate::transport::{
+    FailSafeMonitor, MessageType, MidiOutput, MscTarget, RefreshSchedule, TransportMessage,
+    REFRESH_SCHEDULE_CONSECUTIVE, REFRESH_SCHEDULE_SPREAD,
+};
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -150,15 +153,33 @@ pub fn refresh_spacing_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
     }
 }
 
+/// The repeat schedule of a released note for `config` (for
+/// [`crate::transport::TxScheduler::with_refresh_schedule`], spec §5.5):
+/// the Fibonacci spread on the MFSK profiles, whose messages are 57–273 ms
+/// (consecutive copies would fall into one dropout, and six back to back
+/// held the line for 0.35–1.6 s); the first six free slots on the LTC and
+/// digital profiles, whose messages are a few ms (the repeats are over
+/// before the next note is likely, and a short dropout covers at most one;
+/// measured on `ltc_fec`, the spread put a repeat where the next note lands
+/// and moved the loopback p95 from 21 to 38 ms).
+pub fn refresh_schedule(config: &PhyConfig) -> RefreshSchedule {
+    match config.modulation {
+        Modulation::Mfsk => REFRESH_SCHEDULE_SPREAD,
+        Modulation::Bmc(_) | Modulation::Digital => REFRESH_SCHEDULE_CONSECUTIVE,
+    }
+}
+
 /// Idle line a NoteOff repeat waits for, for `config` at `sample_rate_hz`
 /// (for [`crate::transport::TxScheduler::with_refresh_quiet`], spec §5.5):
-/// one message time on the profiles with a coded body and on `digital`,
-/// which lose few NoteOffs (Robust: 0.3 % at 2 % symbol errors), so a note
-/// struck shortly after another never waits behind a repeat; 0 (the first
-/// free slot) on the uncoded profiles, which lose far more (Fast: 23 %)
-/// and need their repeats promptly.
+/// one message time on the coded MFSK profile (Robust), which loses few
+/// NoteOffs (0.3 % at 2 % symbol errors) and whose 175 ms message is long
+/// compared with the time between notes, so a note struck shortly after
+/// another never waits behind a repeat; 0 (the first free slot) on the
+/// uncoded MFSK profiles, which lose far more (Fast: 23 %) and need their
+/// repeats promptly, and on the LTC and digital profiles, whose repeats are
+/// over in a few tens of ms.
 pub fn refresh_quiet_samples(config: &PhyConfig, sample_rate_hz: u32) -> u64 {
-    if config.fec.is_enabled() || matches!(config.modulation, Modulation::Digital) {
+    if config.fec.is_enabled() && matches!(config.modulation, Modulation::Mfsk) {
         repetition_samples(&config.clone().with_sample_rate(sample_rate_hz))
             * config.repetition_k.max(1) as u64
     } else {

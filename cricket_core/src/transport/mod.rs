@@ -18,4 +18,6 @@ pub use msc::{
     MSC_MAX_LIST,
 };
 pub use note_set::NoteSet;
-pub use scheduler::{PollResult, TxScheduler};
+pub use scheduler::{
+    PollResult, RefreshSchedule, TxScheduler, REFRESH_SCHEDULE_CONSECUTIVE, REFRESH_SCHEDULE_SPREAD,
+};

@@ -8,7 +8,9 @@
 //! (queue wait + one on-wire copy) is compared with the same notes without
 //! the stream. Run with `-- --nocapture` for the table.
 
-use cricket_core::modem::{refresh_quiet_samples, refresh_spacing_samples, repetition_samples};
+use cricket_core::modem::{
+    refresh_quiet_samples, refresh_schedule, refresh_spacing_samples, repetition_samples,
+};
 use cricket_core::phy::PhyConfig;
 use cricket_core::transport::{TransportMessage, TxScheduler};
 
@@ -35,6 +37,7 @@ fn simulate(config: &PhyConfig, stream: bool, note_channel: u8) -> Outcome {
     let msg = rep * config.repetition_k.max(1) as u64;
     let hb = rate * config.heartbeat_interval_ms as u64 / 1000;
     let mut s = TxScheduler::new(config.sample_rate_hz, hb, msg)
+        .with_refresh_schedule(refresh_schedule(config))
         .with_refresh_spacing(refresh_spacing_samples(config, config.sample_rate_hz))
         .with_refresh_quiet(refresh_quiet_samples(config, config.sample_rate_hz));
 

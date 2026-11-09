@@ -178,7 +178,9 @@ fn second_copy_is_suppressed_and_bridges_a_hit_first_copy() {
 fn release_stream(spacing: u64) -> (Vec<f32>, usize) {
     let config = PhyConfig::digital();
     let msg = repetition_samples(&config) * config.repetition_k as u64;
-    let mut s = TxScheduler::new(48_000, 24_000, msg).with_refresh_spacing(spacing);
+    let mut s = TxScheduler::new(48_000, 24_000, msg)
+        .with_refresh_schedule(cricket_core::modem::refresh_schedule(&config))
+        .with_refresh_spacing(spacing);
     let mut tx = CricketModemTx::new(config);
     let note = |on: bool| {
         let (channel, note, velocity) = (3, 64, 90);
@@ -233,17 +235,15 @@ fn released_after_dropout(spacing: u64, mute_ms: usize) -> bool {
 }
 
 /// A release is sent 7 times (the NoteOff and 6 refreshes, K = 2 copies
-/// each). On the schedule of spec §5.5 alone (1, 2, 3, 5, 8, 13 message
-/// times of 0.875 ms) that is 13 ms on air, all lost in one 20 ms dropout;
-/// spaced 20 ms apart (the digital profile's encoder setting) it survives a
-/// 100 ms dropout.
+/// each). Back to back (the consecutive schedule of spec §5.5 alone) that
+/// is 6 ms on air, all lost in one 10 ms dropout; spaced 20 ms apart (the
+/// digital profile's encoder setting) it survives a 100 ms dropout.
 #[test]
 fn spaced_refresh_survives_a_dropout() {
     let spacing = refresh_spacing_samples(&PhyConfig::digital(), 48_000);
     assert_eq!(spacing, 960);
     assert!(released_after_dropout(0, 0));
-    assert!(released_after_dropout(0, 10));
-    assert!(!released_after_dropout(0, 20));
+    assert!(!released_after_dropout(0, 10));
     for mute_ms in [0, 10, 50, 100] {
         assert!(released_after_dropout(spacing, mute_ms), "{mute_ms} ms");
     }

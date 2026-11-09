@@ -216,10 +216,7 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
         ("speech", speech(seconds, 7)),
         ("SMPTE LTC", ltc),
         // A neighbouring link of the same profile with another link key.
-        (
-            "other-key traffic",
-            other_key_traffic(config, 0x1234, seconds, 12),
-        ),
+        (OTHER_KEY, other_key_traffic(config, 0x1234, seconds, 12)),
     ];
     if bmc {
         let mfsk = [
@@ -310,13 +307,18 @@ impl FalseStats {
     /// Expected years of this audio per false message, conservatively: the
     /// larger of the observed structural passes and `analytic` (structural
     /// pass probability of a uniformly random candidate) times the
-    /// candidates, times the CRC-16 factor.
-    fn years_per_false(&self, structural: u64, analytic: f64) -> f64 {
+    /// `candidates`, times the CRC-16 factor.
+    fn years_per_false(&self, structural: u64, candidates: u64, analytic: f64) -> f64 {
         let per_sec =
-            (structural as f64).max(self.candidates as f64 * analytic) / self.seconds * CRC_FACTOR;
+            (structural as f64).max(candidates as f64 * analytic) / self.seconds * CRC_FACTOR;
         1.0 / per_sec / (3600.0 * 8766.0)
     }
 }
+
+/// A neighbouring link's own packets (spec §4.1): structurally valid, and
+/// rejected by the CRC deterministically, not with probability 2^-16, so
+/// they are left out of the estimate; only the other candidates count.
+const OTHER_KEY: &str = "other-key traffic";
 
 /// The modem's receive flow (`CricketModemRx`) with the candidate checks
 /// counted. A decoded body is a false message (the audio holds no packet
@@ -642,6 +644,13 @@ fn false_accept_report() {
     };
     for (k, name, st) in &rows {
         total_false += st.false_msgs;
+        // The neighbour's packets fail the CRC deterministically: the
+        // estimate counts only the candidates that are not one of them.
+        let (lenient, strict, random) = if *name == OTHER_KEY {
+            (0, 0, st.candidates.saturating_sub(st.struct_strict))
+        } else {
+            (st.struct_lenient, st.struct_strict, st.candidates)
+        };
         println!(
             "| {k} | {name} | {:.1} | {:.1} | {:.2} | {} | {} | {} | {} | {} |",
             st.per_min(st.bodies),
@@ -650,10 +659,11 @@ fn false_accept_report() {
             st.struct_lenient,
             st.struct_strict,
             st.false_msgs,
-            fmt(st.years_per_false(st.struct_lenient, a_len)),
-            fmt(st.years_per_false(st.struct_strict, a_strict)),
+            fmt(st.years_per_false(lenient, random, a_len)),
+            fmt(st.years_per_false(strict, random, a_strict)),
         );
     }
     println!("\nEstimates: max(observed structural passes, candidates × analytic structural probability) × 2^-16.");
+    println!("Other-key traffic: the structural passes are the neighbour's own packets, which the CRC rejects deterministically (spec §4.1); the estimate uses the remaining candidates only.");
     assert_eq!(total_false, 0);
 }

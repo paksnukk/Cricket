@@ -281,9 +281,8 @@ impl PhyConfig {
         let bit_rate = params.bit_rate;
         // Fail-safe timers by bit rate (spec §6.5): the faster the line,
         // the cheaper a heartbeat and the sooner a dead link is declared,
-        // keeping a heartbeat at most 5 % of the idle line (measured: a
-        // 125 ms heartbeat on `ltc_fec` put its p95 note latency from 24 to
-        // 33 ms).
+        // keeping a heartbeat at most 5 % of the idle line so one in flight
+        // stays out of the p95 note latency.
         let (heartbeat_interval_ms, link_dead_ms) = if bit_rate < 9600 {
             (500, 2000)
         } else {
@@ -580,7 +579,7 @@ pub static PROFILES: &[ProfileInfo] = &[
         display: "Analog Safe",
         line: "any analog or digital bus, also one you don't control",
         processing: "EQ, compression or a limiter on the bus are tolerated",
-        latency: "~0.3 s (measured in-process: mean ~0.27 s, p95 ~0.35 s)",
+        latency: "~0.2 s (measured in-process: mean ~0.21 s, p95 ~0.33 s)",
         use_when: "the default: cues and notes over a chain you don't fully trust",
         coded: true,
         build: PhyConfig::robust,

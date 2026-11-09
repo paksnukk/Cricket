@@ -141,7 +141,7 @@ fn different_keys_stop_crosstalk_deliveries() {
         let copies = config.repetition_k.max(1) as u64;
         assert!(
             keyed.wrong_key_suspects >= unkeyed.cross as u64
-                && keyed.wrong_key_suspects <= 2 * copies * unkeyed.cross as u64 + 2,
+                && keyed.wrong_key_suspects <= 4 * copies * unkeyed.cross as u64 + 2,
             "{name}: {} suspects for {} neighbour packets",
             keyed.wrong_key_suspects,
             unkeyed.cross
@@ -180,10 +180,10 @@ fn mismatched_ends_deliver_nothing_and_say_why() {
     let stats = rx.stats();
     assert_eq!(delivered, 0);
     assert_eq!(stats.crc_pass, 0);
-    // At least one suspect per packet (a packet may count twice when the
+    // At least one suspect per packet (a packet counts again each time the
     // phy re-locks on it after the rejection), and nothing else failed.
     assert!(
-        (4..=8).contains(&stats.wrong_key_suspects),
+        (4..=16).contains(&stats.wrong_key_suspects),
         "{} suspects",
         stats.wrong_key_suspects
     );

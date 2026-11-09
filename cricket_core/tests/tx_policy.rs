@@ -7,7 +7,9 @@
 //! encoder's tick). A NoteOn's latency is its queue wait plus one on-wire
 //! copy. Run with `-- --nocapture` for the tables.
 
-use cricket_core::modem::{refresh_quiet_samples, refresh_spacing_samples, repetition_samples};
+use cricket_core::modem::{
+    refresh_quiet_samples, refresh_schedule, refresh_spacing_samples, repetition_samples,
+};
 use cricket_core::phy::PhyConfig;
 use cricket_core::transport::{TransportMessage, TxScheduler};
 
@@ -19,6 +21,7 @@ fn scheduler(config: &PhyConfig) -> (TxScheduler, u64, u64) {
     let msg = rep * config.repetition_k.max(1) as u64;
     let hb = rate * config.heartbeat_interval_ms as u64 / 1000;
     let s = TxScheduler::new(config.sample_rate_hz, hb, msg)
+        .with_refresh_schedule(refresh_schedule(config))
         .with_refresh_spacing(refresh_spacing_samples(config, config.sample_rate_hz))
         .with_refresh_quiet(refresh_quiet_samples(config, config.sample_rate_hz));
     (s, msg, rep)
