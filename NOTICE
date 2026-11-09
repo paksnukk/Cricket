@@ -1,0 +1,16 @@
+Cricket — MIDI over audio (reference implementation of the AML v1 protocol)
+Copyright (c) 2026 DPM Studios
+
+Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or
+the MIT license (LICENSE-MIT), at your option.
+
+Maintained by DPM Studios (https://github.com/paksnukk/Cricket). Much of the
+code and documentation in this repository was written with the help of
+AI-assisted development tools, under the direction and review of the
+maintainers, who are responsible for its content. Measurements quoted in the
+documentation were produced by the project's own test harnesses and channel
+simulator unless a document says otherwise.
+
+Third-party components are used under their own licenses as recorded in
+Cargo.lock and cricket_gui/package-lock.json; `cargo deny check licenses`
+verifies that they are compatible with the licenses above.

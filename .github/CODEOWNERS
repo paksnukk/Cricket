@@ -1,0 +1,8 @@
+# Default owners for everything in the repository.
+* @paksnukk
+
+# The protocol text and its versioning policy need a maintainer's review.
+/docs/aml-v1-spec.md @paksnukk
+/docs/proposals/ @paksnukk
+/CHANGELOG.md @paksnukk
+/.github/ @paksnukk

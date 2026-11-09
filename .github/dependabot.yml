@@ -1,0 +1,36 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Major upgrades with API changes are done by hand (see ROADMAP.md, Chores).
+      - dependency-name: cpal
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: midir
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: ringbuf
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: tauri
+        update-types: [version-update:semver-major]
+  - package-ecosystem: npm
+    directory: /cricket_gui
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
