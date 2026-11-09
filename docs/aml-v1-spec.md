@@ -519,10 +519,24 @@ up to one message.
 **Queue bounds:** queued **Note On** airtime is capped at **250 ms** (one on-wire message period per
 queued Note On, plus one per Note Off held with it). Before accepting another Note On, the oldest
 queued Note On is dropped until the budget fits, but at least **4** queued Note Ons are always kept,
-so a chord survives even when one message is longer than the budget (Robust repeat, 273 ms). A Note Off held with a
+so a chord survives even when one message is longer than the budget (Robust repeat, 273 ms). At most
+max(4, ⌊250 ms / airtime per message⌋) Note Ons are therefore ever queued: **4** on Robust, Robust
+repeat and Fast, **14** on `ltc`, **11** on `ltc_fec`, **29** on `ltc9600`. A Note Off held with a
 dropped Note On is dropped too, unless the note is still sounding from an earlier strike. A Note Off
-for a note already on the air, MSC, and Panic-class messages are never dropped. Continuous messages
-are bounded by coalescing.
+for a note already on the air, MSC, and Panic-class messages are never dropped.
+
+The airtime of **everything queued in order 3** — Note On, Program Change, controllers, pitch bend,
+pressure, system common, plus the Note Offs held behind them — is capped at **1 s**. Before another
+order-3 message is queued, the oldest queued order-3 messages are dropped until it fits, whatever
+their kind, except the 4 protected Note Ons and pedal messages with Note Offs held behind them; the
+queue exceeds the cap only by those. Coalescing alone does not bound the queue: every discrete
+message pins the controller values of its channel queued before it, and discrete messages other than
+Note On had no budget of their own. Dropping a discrete message lets the controller values it
+separated merge again (latest value wins). Under such overload a Bank Select may be separated from
+its Program Change, or an RPN/NRPN select from its Data Entry; every drop is counted and reported.
+Orders 1 and 2 (Panic-class, Note Off, MSC) have no bound: dropping one would leave a note stuck or
+skip a cue, so their queues grow with the input. A source that sustains more Note Offs than the link
+carries is a fault of the source; the scheduler keeps them all and reports the queue depth.
 
 **Audio output ring:** sized to about **two** on-wire messages. The next message is chosen and
 encoded only when buffered output has drained below **10 ms**, so a Note On that arrives while a

@@ -22,6 +22,14 @@ const NOTEON_BUDGET_MS: u64 = 250;
 /// Queued NoteOns that are never dropped for the airtime budget, so a chord
 /// survives even when one message is longer than the budget (Robust).
 const MIN_KEPT_NOTE_ONS: usize = 4;
+/// Default bound on the airtime of everything queued in tier 3 (NoteOns,
+/// controllers, Program Changes, system common, plus the NoteOffs held
+/// behind them): the oldest droppable message goes when a new one would
+/// exceed it. Coalescing alone does not bound the queue: every discrete
+/// message (a NoteOn, a Program Change) pins the controller values of its
+/// channel queued before it, and discrete messages other than NoteOn had
+/// no budget of their own.
+const QUEUE_BUDGET_MS: u64 = 1000;
 /// Controllers that hold notes (sustain, sostenuto, hold 2). A NoteOff never
 /// overtakes a queued one on its channel: pedal down then key up must not
 /// arrive as key up then pedal down.
@@ -181,6 +189,30 @@ fn is_note_on(msg: &TransportMessage) -> bool {
     matches!(msg, TransportMessage::NoteOn { .. })
 }
 
+/// Channels (bit per channel) and system scope touched by dropped discrete
+/// messages: where controller values may have become mergeable again.
+#[derive(Clone, Copy, Default)]
+struct DroppedScopes {
+    channels: u16,
+    system: bool,
+}
+
+impl DroppedScopes {
+    fn add(&mut self, msg: &TransportMessage) {
+        if matches!(class(msg), Class::Continuous(_)) {
+            return; // Nothing was pinned behind a continuous message.
+        }
+        match msg.channel() {
+            Some(ch) => self.channels |= 1 << (ch & 0x0F),
+            None => self.system = true,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.channels == 0 && !self.system
+    }
+}
+
 /// Result of [`TxScheduler::poll_detailed`].
 pub struct PollResult {
     pub msg: TransportMessage,
@@ -195,6 +227,7 @@ pub struct TxScheduler {
     message_samples: u64,
     refresh_lifetime_samples: u64,
     noteon_budget_samples: u64,
+    queue_budget_samples: u64,
 
     /// Panic-class messages.
     panic_q: VecDeque<Queued>,
@@ -202,6 +235,12 @@ pub struct TxScheduler {
     urgent_q: VecDeque<Queued>,
     /// Everything else (NoteOn, controllers, Program Change, system common).
     normal_q: VecDeque<Queued>,
+    /// Running counts over `normal_q`, so the budget checks on every push
+    /// do not scan the queue: NoteOns, NoteOffs held behind any message,
+    /// and NoteOffs held behind NoteOns.
+    note_ons: usize,
+    held_total: usize,
+    held_note_on: usize,
 
     /// Notes whose NoteOn has been emitted (sounding on the far side).
     sounding: NoteSet,
@@ -213,9 +252,15 @@ pub struct TxScheduler {
     refresh_spacing_samples: u64,
     /// When the last NoteOff (user or refresh) was emitted.
     last_refresh_sample: Option<u64>,
-    /// Set when a queued NoteOn was dropped because the queue exceeded its
-    /// airtime budget. The caller reports and clears it.
+    /// Set when a queued NoteOn was dropped because the queue exceeded an
+    /// airtime budget (the NoteOn budget or the whole queue's). The caller
+    /// reports and clears it.
     pub note_on_dropped: bool,
+    /// Tier-3 messages (of any kind) dropped because the queue exceeded its
+    /// airtime bound ([`with_queue_budget`](Self::with_queue_budget)), since
+    /// the caller last cleared it. NoteOns dropped for the NoteOn budget
+    /// alone are not counted here.
+    pub queue_dropped: u32,
 }
 
 impl TxScheduler {
@@ -226,16 +271,42 @@ impl TxScheduler {
             message_samples,
             refresh_lifetime_samples: hz * REFRESH_LIFETIME_MS / 1000,
             noteon_budget_samples: hz * NOTEON_BUDGET_MS / 1000,
+            queue_budget_samples: hz * QUEUE_BUDGET_MS / 1000,
             panic_q: VecDeque::new(),
             urgent_q: VecDeque::new(),
             normal_q: VecDeque::new(),
+            note_ons: 0,
+            held_total: 0,
+            held_note_on: 0,
             sounding: NoteSet::default(),
             refresh: VecDeque::new(),
             last_emit_sample: None,
             refresh_spacing_samples: 0,
             last_refresh_sample: None,
             note_on_dropped: false,
+            queue_dropped: 0,
         }
+    }
+
+    /// Bound the airtime of everything queued in tier 3 (NoteOns,
+    /// controllers, Program Changes, system common and the NoteOffs held
+    /// behind them) to `samples` (default: 1 s). Before a tier-3 message is
+    /// queued, the oldest droppable messages are dropped until it fits:
+    /// every tier-3 message except the [`MIN_KEPT_NOTE_ONS`] protected
+    /// NoteOns and pedal messages with NoteOffs held behind them, so the
+    /// queue can exceed the bound only by those. Dropping a discrete message
+    /// lets the controller values it separated merge again (latest value
+    /// wins). Panic-class messages, NoteOffs and MSC are never dropped and
+    /// have no bound: their queues grow with the input.
+    pub fn with_queue_budget(mut self, samples: u64) -> Self {
+        self.queue_budget_samples = samples;
+        self
+    }
+
+    /// The tier-3 airtime bound, in samples (see
+    /// [`with_queue_budget`](Self::with_queue_budget)).
+    pub fn queue_budget_samples(&self) -> u64 {
+        self.queue_budget_samples
     }
 
     /// Space NoteOff refreshes at least `samples` apart (start to start,
@@ -262,8 +333,7 @@ impl TxScheduler {
 
     /// Messages waiting to be sent (held NoteOffs count).
     pub fn queued(&self) -> usize {
-        let held: usize = self.normal_q.iter().map(|q| q.held.len()).sum();
-        self.panic_q.len() + self.urgent_q.len() + self.normal_q.len() + held
+        self.panic_q.len() + self.urgent_q.len() + self.normal_q.len() + self.held_total
     }
 
     /// How long the oldest queued message has waited at `now_samples`.
@@ -286,10 +356,18 @@ impl TxScheduler {
     pub fn push(&mut self, msg: TransportMessage, push_sample: u64) {
         match class(&msg) {
             Class::Panic => {
-                // A NoteOn queued before it would sound after it.
+                // A NoteOn queued before it would sound after it. Its held
+                // NoteOffs go with it: the Panic releases the note anyway.
                 let scope = msg.channel();
-                self.normal_q
-                    .retain(|q| !(is_note_on(&q.msg) && overlaps(scope, q.msg.channel())));
+                let mut i = 0;
+                while i < self.normal_q.len() {
+                    let q = &self.normal_q[i];
+                    if is_note_on(&q.msg) && overlaps(scope, q.msg.channel()) {
+                        self.remove_normal(i);
+                    } else {
+                        i += 1;
+                    }
+                }
                 self.panic_q.push_back(Queued::new(msg, push_sample));
             }
             Class::Urgent => {
@@ -303,24 +381,20 @@ impl TxScheduler {
                     // pedal on its channel, if any; otherwise the note is (or
                     // will be) sounding from an earlier, already sent NoteOn
                     // and the release goes out with priority.
-                    if let Some(q) = self
+                    if let Some(i) = self
                         .normal_q
-                        .iter_mut()
-                        .rev()
-                        .find(|q| q.holds_release_of(channel, note))
+                        .iter()
+                        .rposition(|q| q.holds_release_of(channel, note))
                     {
-                        if !q
-                            .held
-                            .iter()
-                            .any(|h| h.channel == channel && h.note == note)
-                        {
-                            q.held.push(HeldOff {
+                        self.hold_off(
+                            i,
+                            HeldOff {
                                 channel,
                                 note,
                                 velocity,
                                 push_sample,
-                            });
-                        }
+                            },
+                        );
                         return;
                     }
                 }
@@ -328,25 +402,65 @@ impl TxScheduler {
             }
             Class::Continuous(key) => {
                 if !self.coalesce(&msg, key) {
-                    self.normal_q.push_back(Queued::new(msg, push_sample));
+                    let dropped = self.enforce_queue_budget(false);
+                    self.push_normal(Queued::new(msg, push_sample));
+                    self.recoalesce(dropped);
                 }
             }
             Class::Discrete => {
+                let mut dropped = DroppedScopes::default();
                 if is_note_on(&msg) {
                     while self
-                        .droppable_airtime_samples()
+                        .note_on_airtime_samples()
                         .saturating_add(self.message_samples)
                         > self.noteon_budget_samples
-                        && self.queued_note_ons() >= MIN_KEPT_NOTE_ONS
+                        && self.note_ons >= MIN_KEPT_NOTE_ONS
                     {
-                        if !self.drop_oldest_note_on() {
+                        let Some(pos) = self.normal_q.iter().position(|q| is_note_on(&q.msg))
+                        else {
                             break;
-                        }
+                        };
+                        self.drop_normal(pos, &mut dropped);
                     }
                 }
-                self.normal_q.push_back(Queued::new(msg, push_sample));
+                let over = self.enforce_queue_budget(is_note_on(&msg));
+                dropped.channels |= over.channels;
+                dropped.system |= over.system;
+                self.push_normal(Queued::new(msg, push_sample));
+                self.recoalesce(dropped);
             }
         }
+    }
+
+    /// Drop the oldest droppable tier-3 messages until one more message of
+    /// `message_samples` fits the queue's airtime bound; `incoming_note_on`
+    /// says whether that message is a NoteOn (it counts towards the
+    /// protected NoteOns). Returns the scopes of the dropped messages.
+    fn enforce_queue_budget(&mut self, incoming_note_on: bool) -> DroppedScopes {
+        let mut dropped = DroppedScopes::default();
+        while self
+            .tier3_airtime_samples()
+            .saturating_add(self.message_samples)
+            > self.queue_budget_samples
+        {
+            // NoteOns are droppable only beyond the protected ones; a pedal
+            // with NoteOffs held behind it is never dropped (the held
+            // releases must not overtake it).
+            let note_ons_droppable =
+                self.note_ons + usize::from(incoming_note_on) > MIN_KEPT_NOTE_ONS;
+            let Some(pos) = self.normal_q.iter().position(|q| {
+                if is_note_on(&q.msg) {
+                    note_ons_droppable
+                } else {
+                    q.held.is_empty()
+                }
+            }) else {
+                break;
+            };
+            self.drop_normal(pos, &mut dropped);
+            self.queue_dropped = self.queue_dropped.saturating_add(1);
+        }
+        dropped
     }
 
     /// Latest value wins: replace the newest queued update with the same key
@@ -399,7 +513,7 @@ impl TxScheduler {
             return Some(self.emit(q.msg, now_samples, true));
         }
         if let Some(i) = self.next_normal() {
-            let q = self.normal_q.remove(i).expect("index in range");
+            let q = self.remove_normal(i);
             if let TransportMessage::NoteOn { channel, note, .. } = q.msg {
                 self.cancel_refresh(channel, note);
                 self.sounding.insert(channel, note);
@@ -502,34 +616,108 @@ impl TxScheduler {
             .retain(|e| now_samples.saturating_sub(e.emitted_at) <= self.refresh_lifetime_samples);
     }
 
-    fn queued_note_ons(&self) -> usize {
-        self.normal_q.iter().filter(|q| is_note_on(&q.msg)).count()
-    }
-
     /// Airtime of queued NoteOns, plus the NoteOffs held behind them.
-    fn droppable_airtime_samples(&self) -> u64 {
-        self.normal_q
-            .iter()
-            .filter(|q| is_note_on(&q.msg))
-            .map(|q| self.message_samples.saturating_mul(1 + q.held.len() as u64))
-            .fold(0u64, u64::saturating_add)
+    fn note_on_airtime_samples(&self) -> u64 {
+        self.message_samples
+            .saturating_mul((self.note_ons + self.held_note_on) as u64)
     }
 
-    fn drop_oldest_note_on(&mut self) -> bool {
-        let Some(pos) = self.normal_q.iter().position(|q| is_note_on(&q.msg)) else {
-            return false;
-        };
-        let q = self.normal_q.remove(pos).expect("position is in range");
-        // The held NoteOff goes with its NoteOn, unless the note is still
-        // sounding from an earlier strike: then the release must still go out.
+    /// Airtime of everything queued in tier 3, held NoteOffs included.
+    fn tier3_airtime_samples(&self) -> u64 {
+        self.message_samples
+            .saturating_mul((self.normal_q.len() + self.held_total) as u64)
+    }
+
+    fn push_normal(&mut self, q: Queued) {
+        self.note_ons += usize::from(is_note_on(&q.msg));
+        self.held_total += q.held.len();
+        if is_note_on(&q.msg) {
+            self.held_note_on += q.held.len();
+        }
+        self.normal_q.push_back(q);
+    }
+
+    /// Remove `normal_q[i]`, keeping the running counts.
+    fn remove_normal(&mut self, i: usize) -> Queued {
+        let q = self.normal_q.remove(i).expect("index in range");
+        self.note_ons -= usize::from(is_note_on(&q.msg));
+        self.held_total -= q.held.len();
+        if is_note_on(&q.msg) {
+            self.held_note_on -= q.held.len();
+        }
+        q
+    }
+
+    /// Hold `h` behind `normal_q[i]` (once per note).
+    fn hold_off(&mut self, i: usize, h: HeldOff) {
+        let q = &mut self.normal_q[i];
+        if q.held
+            .iter()
+            .any(|x| x.channel == h.channel && x.note == h.note)
+        {
+            return;
+        }
+        q.held.push(h);
+        self.held_total += 1;
+        if is_note_on(&q.msg) {
+            self.held_note_on += 1;
+        }
+    }
+
+    /// Drop `normal_q[pos]` for an airtime budget. A held NoteOff goes with
+    /// its NoteOn, unless the note is still sounding from an earlier
+    /// strike: then the release must still go out, with priority.
+    fn drop_normal(&mut self, pos: usize, dropped: &mut DroppedScopes) {
+        let q = self.remove_normal(pos);
         for h in q.held {
             if self.sounding.contains(h.channel, h.note) {
                 self.urgent_q
                     .push_back(Queued::new(h.message(), h.push_sample));
             }
         }
-        self.note_on_dropped = true;
-        true
+        if is_note_on(&q.msg) {
+            self.note_on_dropped = true;
+        }
+        dropped.add(&q.msg);
+    }
+
+    /// Merge continuous updates that dropped messages of `scopes` had kept
+    /// apart, as [`coalesce`](Self::coalesce) would have on arrival: the
+    /// newer value replaces the older entry in place and the newer entry
+    /// goes. A discrete message or a held pedal of the channel, or a system
+    /// message, still separates the values either side of it.
+    fn recoalesce(&mut self, scopes: DroppedScopes) {
+        if scopes.is_empty() {
+            return;
+        }
+        // Mergeable entry per key since the last separator of its channel.
+        let mut open: Vec<(Key, usize)> = Vec::new();
+        let mut i = 0;
+        while i < self.normal_q.len() {
+            let q = &self.normal_q[i];
+            let channel = q.msg.channel();
+            let affected =
+                scopes.system || channel.is_none_or(|ch| scopes.channels & (1 << (ch & 0x0F)) != 0);
+            if !affected {
+                i += 1;
+                continue;
+            }
+            match class(&q.msg) {
+                Class::Continuous(key) if q.held.is_empty() => {
+                    if let Some(&(_, older)) = open.iter().find(|(k, _)| *k == key) {
+                        let newer = self.remove_normal(i);
+                        self.normal_q[older].msg = newer.msg;
+                        continue;
+                    }
+                    open.push((key, i));
+                }
+                _ => match channel {
+                    Some(ch) => open.retain(|(k, _)| k.1 != ch),
+                    None => open.clear(),
+                },
+            }
+            i += 1;
+        }
     }
 }
 
@@ -1144,5 +1332,172 @@ mod tests {
             max_wait,
             budget
         );
+    }
+
+    // -- Queue bound -------------------------------------------------------
+
+    fn pc(program: u8) -> TransportMessage {
+        ProgramChange {
+            channel: 0,
+            program,
+        }
+    }
+
+    /// The running counts match the queue.
+    fn check_counts(s: &TxScheduler) {
+        let note_ons = s.normal_q.iter().filter(|q| is_note_on(&q.msg)).count();
+        let held_total: usize = s.normal_q.iter().map(|q| q.held.len()).sum();
+        let held_note_on: usize = s
+            .normal_q
+            .iter()
+            .filter(|q| is_note_on(&q.msg))
+            .map(|q| q.held.len())
+            .sum();
+        assert_eq!(
+            (s.note_ons, s.held_total, s.held_note_on),
+            (note_ons, held_total, held_note_on)
+        );
+        assert_eq!(
+            s.queued(),
+            s.panic_q.len() + s.urgent_q.len() + s.normal_q.len() + held_total
+        );
+    }
+
+    /// Dropping a NoteOn lets the controller values it kept apart merge,
+    /// latest value wins, at the older value's place.
+    #[test]
+    fn dropped_note_on_lets_controller_values_merge() {
+        let mut s = fast_scheduler();
+        s.push(cc(0, 7, 1), 0);
+        s.push(on(60), 0);
+        s.push(cc(0, 7, 2), 0); // a new entry: on(60) is between them
+        s.push(cc(1, 7, 5), 0); // another channel, untouched
+        assert_eq!(s.queued(), 4);
+        check_counts(&s);
+        for n in 61..70u8 {
+            s.push(on(n), 0); // on(60) is dropped for the NoteOn budget
+        }
+        assert!(s.note_on_dropped);
+        assert_eq!(s.queue_dropped, 0);
+        check_counts(&s);
+        let sent = drain(&mut s);
+        assert_eq!(sent[0], cc(0, 7, 2));
+        assert_eq!(
+            sent.iter().filter(|m| **m == cc(0, 7, 1)).count(),
+            0,
+            "{sent:?}"
+        );
+        assert_eq!(sent.iter().filter(|m| **m == cc(1, 7, 5)).count(), 1);
+    }
+
+    /// The queue bound drops the oldest droppable tier-3 message, Program
+    /// Changes included, and counts it; a pedal with a NoteOff held behind
+    /// it is never dropped.
+    #[test]
+    fn queue_bound_drops_oldest_discrete_messages() {
+        let mut s = fast_scheduler();
+        let msg = s.message_samples;
+        s = s.with_queue_budget(5 * msg);
+        s.push(on(60), 0);
+        assert_eq!(s.poll(0), Some(on(60)));
+        s.push(cc(0, 64, 127), 1);
+        s.push(off(60), 2); // held behind the pedal: 2 messages of airtime
+        s.push(pc(1), 3);
+        s.push(pc(2), 4);
+        s.push(pc(3), 5); // 5 messages: full
+        assert_eq!(s.queue_dropped, 0);
+        s.push(pc(4), 6); // pc(1) goes, the pedal stays
+        assert_eq!(s.queue_dropped, 1);
+        s.push(on(70), 7); // pc(2) goes
+        assert_eq!(s.queue_dropped, 2);
+        assert!(!s.note_on_dropped);
+        check_counts(&s);
+        assert_eq!(
+            drain(&mut s),
+            vec![cc(0, 64, 127), off(60), pc(3), pc(4), on(70)]
+        );
+        check_counts(&s);
+    }
+
+    /// The protected NoteOns are kept even when they alone exceed the
+    /// bound; beyond them NoteOns are droppable for the bound too, and a
+    /// dropped NoteOn counts in both flags.
+    #[test]
+    fn queue_bound_keeps_protected_note_ons() {
+        let mut s = fast_scheduler();
+        let msg = s.message_samples;
+        s = s.with_queue_budget(2 * msg);
+        for n in 60..64u8 {
+            s.push(on(n), 0);
+        }
+        assert_eq!((s.queued(), s.queue_dropped), (4, 0));
+        s.push(pc(1), 1); // nothing droppable: appended beyond the bound
+        assert_eq!((s.queued(), s.queue_dropped), (5, 0));
+        // A fifth NoteOn: on(60) goes for the NoteOn budget (the 5th would
+        // exceed 250 ms), then pc(1) for the bound; the 4 NoteOns stay.
+        s.push(on(64), 2);
+        assert!(s.note_on_dropped);
+        assert_eq!(s.queue_dropped, 1);
+        check_counts(&s);
+        assert_eq!(drain(&mut s), vec![on(61), on(62), on(63), on(64)]);
+        // With a bound far below the NoteOn budget a NoteOn is still only
+        // dropped beyond the protected four: here for the bound, not the
+        // NoteOn budget, so both flags report it.
+        let mut s = scheduler(&PhyConfig::digital()).with_queue_budget(3 * 42);
+        s.note_on_dropped = false;
+        for n in 0..5u8 {
+            s.push(on(n), 0);
+        }
+        assert_eq!((s.queued(), s.queue_dropped), (4, 1));
+        assert!(s.note_on_dropped);
+        assert_eq!(drain(&mut s), vec![on(1), on(2), on(3), on(4)]);
+    }
+
+    /// The bound drops strictly oldest first, system common messages and
+    /// controller values included (only the protected NoteOns and held
+    /// pedals are skipped), so the oldest message waits a bounded time.
+    #[test]
+    fn queue_bound_drops_oldest_first_system_messages_included() {
+        let mut s = fast_scheduler();
+        let msg = s.message_samples;
+        s = s.with_queue_budget(3 * msg);
+        s.push(cc(0, 7, 1), 0);
+        s.push(TransportMessage::TuneRequest, 0);
+        s.push(cc(0, 7, 2), 0); // kept apart by the TuneRequest: 3 queued
+        assert_eq!((s.queued(), s.queue_dropped), (3, 0));
+        s.push(cc(1, 7, 1), 0); // cc(0, 7, 1) goes
+        assert_eq!((s.queued(), s.queue_dropped), (3, 1));
+        s.push(pc(9), 0); // the TuneRequest goes
+        assert_eq!((s.queued(), s.queue_dropped), (3, 2));
+        check_counts(&s);
+        assert_eq!(drain(&mut s), vec![cc(0, 7, 2), pc(9), cc(1, 7, 1)]);
+    }
+
+    /// Spec §5.5: at most max(4, floor(250 ms / airtime)) NoteOns are ever
+    /// queued, per profile.
+    #[test]
+    fn max_queued_note_ons_per_profile() {
+        for (name, config, want) in [
+            ("robust", PhyConfig::robust(), 4usize),
+            ("robust_repeat", PhyConfig::robust_repeat(), 4),
+            ("fast", PhyConfig::fast(), 4),
+            ("ltc", PhyConfig::ltc(), 14),
+            ("ltc_fec", PhyConfig::ltc_fec(), 11),
+            ("ltc9600", PhyConfig::ltc_with_bit_rate(9600), 29),
+            ("ltc14400", PhyConfig::from_name("ltc14400").unwrap(), 46),
+            ("digital", PhyConfig::digital(), 285),
+        ] {
+            let mut s = scheduler(&config);
+            let by_budget = (s.noteon_budget_samples / s.message_samples) as usize;
+            assert_eq!(MIN_KEPT_NOTE_ONS.max(by_budget), want, "{name}");
+            for n in 0..=127u8 {
+                s.push(on_ch(n & 1, n), 0);
+                s.push(on_ch(2 + (n & 1), n), 0);
+                s.push(on_ch(4, n), 0);
+            }
+            assert_eq!(s.note_ons, want, "{name}");
+            assert!(s.note_on_dropped, "{name}");
+            check_counts(&s);
+        }
     }
 }
