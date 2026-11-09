@@ -5,7 +5,7 @@ use super::goertzel::{
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-/// Phy lock state, as [`ModemRx`], [`BmcRx`](super::BmcRx) and
+/// Phy lock state, as [`ModemRx`], `BmcRx` and
 /// [`DigitalRx`](super::digital::DigitalRx) report it (the same rule for
 /// all three).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

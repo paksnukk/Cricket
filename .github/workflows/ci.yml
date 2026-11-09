@@ -200,7 +200,7 @@ jobs:
           # Same accepted advisories as deny.toml, with the reasons there.
           ignore: RUSTSEC-2026-0293,RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
-  # The 14 `#[ignore]`d measurement harnesses: A/B tables, false-accept and chord
+  # The 15 `#[ignore]`d measurement harnesses: A/B tables, false-accept and chord
   # reports. Too slow for every push; weekly (or on demand) in release mode, one
   # job per test binary so a slow table does not hide the others.
   harnesses:
@@ -218,6 +218,7 @@ jobs:
           - ltc_fast_ab # ltc_fast_ab_table, ltc_fast_phy_diag, ltc_fast_chord_table, ltc_fast_cpu
           - ltc_fec_ab # ltc_fec_ab_table, ltc_false_message_report
           - stuck_notes # ltc_back_to_back_report
+          - search_load # search_load_report
           - digital # digital_report
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

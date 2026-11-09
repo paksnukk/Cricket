@@ -292,7 +292,7 @@ impl TxScheduler {
     /// controllers, Program Changes, system common and the NoteOffs held
     /// behind them) to `samples` (default: 1 s). Before a tier-3 message is
     /// queued, the oldest droppable messages are dropped until it fits:
-    /// every tier-3 message except the [`MIN_KEPT_NOTE_ONS`] protected
+    /// every tier-3 message except the `MIN_KEPT_NOTE_ONS` protected
     /// NoteOns and pedal messages with NoteOffs held behind them, so the
     /// queue can exceed the bound only by those. Dropping a discrete message
     /// lets the controller values it separated merge again (latest value
