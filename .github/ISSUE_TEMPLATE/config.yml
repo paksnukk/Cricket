@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/paksnukk/Cricket/security/advisories/new
+    about: Report a vulnerability privately (see SECURITY.md); do not open a public issue.
+  - name: Protocol / spec discussion
+    url: https://github.com/paksnukk/Cricket/discussions
+    about: Questions about AML v1, profile ideas and interoperability.
