@@ -1,5 +1,5 @@
 use super::{BmcParams, Modulation};
-use crate::phy::{DemodResult, LinkState, PhyConfig, RxEvent};
+use crate::phy::{DemodResult, LinkState, PhyConfig, RxEvent, LOCK_HOLD_MS};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::f32::consts::PI;
@@ -62,6 +62,14 @@ impl Biquad {
         self.y2 = self.y1;
         self.y1 = y;
         y
+    }
+
+    /// Clear the filter state (coefficients are kept).
+    fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
     }
 }
 
@@ -200,7 +208,8 @@ pub struct BmcRx {
     guard: Option<(Pos, f32)>,
     // Decoder
     body: Option<Body>,
-    link_state: LinkState,
+    /// Stream position where the last completed body ended.
+    last_body_end: Option<u64>,
     expected_body_nibbles: usize,
     max_erasures: usize,
     last_confidence_db: f32,
@@ -320,7 +329,7 @@ impl BmcRx {
             pending: None,
             guard: None,
             body: None,
-            link_state: LinkState::Search,
+            last_body_end: None,
             expected_body_nibbles: 16,
             max_erasures,
             last_confidence_db: 0.0,
@@ -331,8 +340,18 @@ impl BmcRx {
         &self.config
     }
 
+    /// See [`LinkState`]: `Locked` while a body is read and for
+    /// [`LOCK_HOLD_MS`] after a completed body.
     pub fn link_state(&self) -> LinkState {
-        self.link_state
+        let hold = self.config.sample_rate_hz as u64 * LOCK_HOLD_MS as u64 / 1000;
+        let recent = self
+            .last_body_end
+            .is_some_and(|end| self.samples_pushed.saturating_sub(end) < hold);
+        if self.body.is_some() || recent {
+            LinkState::Locked
+        } else {
+            LinkState::Search
+        }
     }
 
     /// Mean nibble reliability of the last packet (see [`margin_db`]; an
@@ -349,15 +368,26 @@ impl BmcRx {
         self.samples_pushed
     }
 
+    /// Back to search with the front end (filters, envelope, transition
+    /// memory) and the sync correlator cleared; the sample count goes on.
     pub fn reset(&mut self) {
         self.body = None;
         self.pending = None;
         self.guard = None;
         self.rho1 = 0.0;
         self.rho2 = 0.0;
-        self.link_state = LinkState::Search;
+        self.last_body_end = None;
         self.high = None;
         self.recent_edges = [None; 8];
+        self.hp_x1 = 0.0;
+        self.hp_y1 = 0.0;
+        self.lp.reset();
+        self.env = 0.0;
+        self.prev_y = 0.0;
+        self.last_zc_up = None;
+        self.last_zc_down = None;
+        self.history.fill(0.0);
+        self.boxes.fill(0.0);
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
@@ -366,7 +396,7 @@ impl BmcRx {
             self.push_one(x, &mut events);
         }
         events.push(RxEvent::Metrics {
-            state: self.link_state,
+            state: self.link_state(),
             confidence_db: self.last_confidence_db,
         });
         events
@@ -376,11 +406,22 @@ impl BmcRx {
         let index = self.samples_pushed;
         self.samples_pushed += 1;
 
+        // A non-finite sample (a glitching driver, a NaN from upstream DSP)
+        // would otherwise sit in the IIR filter state for good and silence
+        // the receiver until it is recreated; treat it as a dropout sample.
+        let x = if x.is_finite() { x } else { 0.0 };
         // DC blocker, then low-pass.
         let hp = x - self.hp_x1 + self.hp_r * self.hp_y1;
         self.hp_x1 = x;
         self.hp_y1 = hp;
-        let y = self.lp.process(hp);
+        let mut y = self.lp.process(hp);
+        if !y.is_finite() {
+            // Overflow on absurd (but finite) input: restart the filters.
+            self.hp_x1 = 0.0;
+            self.hp_y1 = 0.0;
+            self.lp.reset();
+            y = 0.0;
+        }
         let mask = self.history.len() - 1;
         self.history[index as usize & mask] = y;
 
@@ -636,7 +677,6 @@ impl BmcRx {
             bit_energy,
             margin_sum: 0.0,
         });
-        self.link_state = LinkState::Locked;
         events.push(RxEvent::PreambleLocked {
             confidence_db: margin_db(peak.rho),
         });
@@ -753,7 +793,6 @@ impl BmcRx {
             if self.max_erasures > 0 && body.erasures > self.max_erasures {
                 // More gaps than the code can fill: not (or no longer) a packet.
                 self.body = None;
-                self.link_state = LinkState::Search;
                 events.push(RxEvent::SyncLost);
                 return;
             }
@@ -783,7 +822,6 @@ impl BmcRx {
             if mean < self.params.min_body_margin || on_grid < self.params.min_on_grid {
                 // Noise-like body: a false lock (noise, MFSK tones). Dropping
                 // it keeps the CRC / FEC from ever seeing it.
-                self.link_state = LinkState::Search;
                 events.push(RxEvent::SyncLost);
                 return;
             }
@@ -791,7 +829,8 @@ impl BmcRx {
             if self.params.post_body_guard {
                 self.guard = Some(guard);
             }
-            // Packet complete; stay Locked (as the MFSK receiver does).
+            // Body complete: `Locked` for a while (see `link_state`).
+            self.last_body_end = Some(self.samples_pushed);
         }
         events.push(RxEvent::BodyNibble {
             result: DemodResult {

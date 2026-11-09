@@ -15,7 +15,7 @@ pub use config::{
     amplitude_from_dbfs, dbfs_from_amplitude, profile_info, Acquisition, PhyConfig, ProfileInfo,
     ProfileTier, DEFAULT_AMPLITUDE, DEFAULT_PROFILE, DEFAULT_TX_LEVEL_DBFS, PROFILES,
 };
-pub use demod::{DemodResult, LinkState, ModemRx, RxEvent};
+pub use demod::{DemodResult, LinkState, ModemRx, RxEvent, LOCK_HOLD_MS};
 pub use goertzel::{best_tone, goertzel_power, tone_purity, ToneDetection};
 pub use select::{PhyRx, PhyTx};
 pub use synth::ModemTx;

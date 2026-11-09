@@ -64,7 +64,7 @@
 //! packet validation of spec §4.7 (CRC-16, version, type, SEQ, canonical
 //! payload) and duplicate suppression.
 
-use super::{LinkState, PhyConfig, RxEvent};
+use super::{LinkState, PhyConfig, RxEvent, LOCK_HOLD_MS};
 use crate::link::nibbles_to_bytes;
 use alloc::vec::Vec;
 
@@ -270,12 +270,13 @@ impl DigitalRx {
         self.samples
     }
 
-    /// `Locked` within one second after a complete frame, `Search` otherwise.
+    /// See [`LinkState`]: `Locked` for [`LOCK_HOLD_MS`] after a complete
+    /// frame, `Search` otherwise (a frame is only 21 samples: there is no
+    /// "reading" state worth reporting).
     pub fn link_state(&self) -> LinkState {
+        let hold = self.sample_rate_hz as u64 * LOCK_HOLD_MS as u64 / 1000;
         match self.last_frame_end {
-            Some(end) if self.samples.saturating_sub(end) < self.sample_rate_hz as u64 => {
-                LinkState::Locked
-            }
+            Some(end) if self.samples.saturating_sub(end) < hold => LinkState::Locked,
             _ => LinkState::Search,
         }
     }
@@ -285,10 +286,13 @@ impl DigitalRx {
         self.last_margin_db
     }
 
+    /// Back to search with the symbol history and the lock cleared; the
+    /// counters and the sample count go on.
     pub fn reset(&mut self) {
         self.state = State::Search;
         self.recent = [INVALID; SYNC_LEN];
         self.head = 0;
+        self.last_frame_end = None;
     }
 
     /// Feed samples; returns one [`RxEvent::Frame`] per complete frame.

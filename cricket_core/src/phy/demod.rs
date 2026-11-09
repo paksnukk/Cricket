@@ -5,15 +5,30 @@ use super::goertzel::{
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+/// Phy lock state, as [`ModemRx`], [`BmcRx`](super::BmcRx) and
+/// [`DigitalRx`](super::digital::DigitalRx) report it (the same rule for
+/// all three).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
+    /// No body is being read and none was completed within the last
+    /// [`LOCK_HOLD_MS`].
     Search,
+    /// A body is being read (MFSK: the preamble matched; BMC: a sync was
+    /// found), or the last body the phy completed (MFSK: and decoded;
+    /// digital: a complete frame) ended less than [`LOCK_HOLD_MS`] ago. With
+    /// heartbeats every 500 ms a live link stays `Locked` through idle time;
+    /// a transmitter that stops shows `Search` after a second and `Dead` at
+    /// link-dead time.
     Locked,
     /// No valid packet within `link_dead_ms` after the link was alive. Never
-    /// produced by `ModemRx` (phy lock only); set by `CricketModemRx`, which owns
+    /// produced by the phys (lock only); set by `CricketModemRx`, which owns
     /// link-dead detection.
     Dead,
 }
+
+/// How long after a completed body a phy still reports
+/// [`LinkState::Locked`] (every phy).
+pub const LOCK_HOLD_MS: u32 = 1000;
 
 #[derive(Debug, Clone)]
 pub struct DemodResult {
@@ -67,6 +82,20 @@ enum JointStep {
     },
 }
 
+/// Alignments this close (samples) to the last failed attempt's are the
+/// same attempt (see `ModemRx::is_failed_alignment`).
+const FAILED_ALIGNMENT_TOLERANCE: u64 = 2;
+
+/// A lock attempt in progress.
+#[derive(Debug, Clone, Copy)]
+struct Attempt {
+    /// Search window that triggered it; a failed attempt resumes Search one
+    /// hop after it.
+    trigger: u64,
+    /// Fine-aligned start of the preamble it reads.
+    aligned: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RxPhase {
     Search,
@@ -96,10 +125,12 @@ enum RxPhase {
 /// the next symbol window. The buffer keeps `hop` samples of history behind
 /// `read` (for backward fine alignment) and, while a lock attempt is in
 /// progress, everything from `hop` before the window that triggered it, so a
-/// failed attempt can be rewound: Search resumes at `trigger + hop`, exactly
-/// as if the trigger window had been rejected, and no consumed sample is lost.
-/// Memory stays bounded by one packet (preamble + body periods) plus history
-/// and the caller's chunk.
+/// failed attempt can be rewound: Search resumes at `trigger + hop` (one
+/// symbol period after a rejected body, see [`reject`](Self::reject)), as
+/// if the trigger window had been rejected, and no consumed sample is lost.
+/// A hit that fine-aligns to the start the failed attempt read from is not
+/// retried. Memory stays bounded by one packet (preamble + body periods)
+/// plus history and the caller's chunk.
 ///
 /// The attempt stays open after the last body nibble: the receiver pauses
 /// until the caller (normally `CricketModemRx`) reports the packet decode
@@ -113,14 +144,24 @@ pub struct ModemRx {
     tones: Vec<f32>,
     buffer: VecDeque<f32>,
     phase: RxPhase,
-    link_state: LinkState,
+    /// Stream position where the last confirmed (decoded) body ended.
+    last_confirmed_end: Option<u64>,
     /// Total samples pushed since creation (never reset).
     samples_pushed: u64,
     /// Absolute position of the next symbol window.
     read: u64,
-    /// Search window that started the current lock attempt (ConfirmPreamble
-    /// or Body); `None` in Search.
-    attempt: Option<u64>,
+    /// The current lock attempt (ConfirmPreamble, Body or Verdict); `None`
+    /// in Search.
+    attempt: Option<Attempt>,
+    /// Aligned preamble start of the last attempt that failed (preamble
+    /// mismatch, body gate failure or rejected body). A hit whose fine
+    /// alignment lands on the same start is not retried: it would read the
+    /// same symbols and fail the same way (see
+    /// [`is_failed_alignment`](Self::is_failed_alignment)). On
+    /// preamble-like input (the preamble tones repeated back to back) every
+    /// hop near a symbol start is a hit that aligns to that start, so
+    /// without this each false body was read three to six times over.
+    failed_alignment: Option<u64>,
     /// Fine alignment never moves before this position (end of the last
     /// completed packet body), so it cannot slide into a decoded packet.
     align_floor: u64,
@@ -137,10 +178,11 @@ impl ModemRx {
             tones,
             buffer: VecDeque::with_capacity(4096),
             phase: RxPhase::Search,
-            link_state: LinkState::Search,
+            last_confirmed_end: None,
             samples_pushed: 0,
             read: 0,
             attempt: None,
+            failed_alignment: None,
             align_floor: 0,
             last_confidence_db: 0.0,
             expected_body_nibbles: 16, // default; encoder pads to multiple of interleave depth
@@ -151,8 +193,19 @@ impl ModemRx {
         &self.config
     }
 
+    /// See [`LinkState`]: `Locked` while a body is read (or awaits its
+    /// verdict) and for [`LOCK_HOLD_MS`] after a confirmed body.
     pub fn link_state(&self) -> LinkState {
-        self.link_state
+        let reading = matches!(self.phase, RxPhase::Body { .. } | RxPhase::Verdict);
+        let hold = self.config.sample_rate_hz as u64 * LOCK_HOLD_MS as u64 / 1000;
+        let recent = self
+            .last_confirmed_end
+            .is_some_and(|end| self.samples_pushed.saturating_sub(end) < hold);
+        if reading || recent {
+            LinkState::Locked
+        } else {
+            LinkState::Search
+        }
     }
 
     pub fn last_confidence_db(&self) -> f32 {
@@ -176,7 +229,9 @@ impl ModemRx {
         if self.phase == RxPhase::Verdict {
             self.phase = RxPhase::Search;
             self.attempt = None;
+            self.failed_alignment = None;
             self.align_floor = self.read;
+            self.last_confirmed_end = Some(self.read);
             self.trim(self.config.hop_samples());
         }
         self.process()
@@ -190,9 +245,7 @@ impl ModemRx {
         if self.phase == RxPhase::Verdict {
             let hop = self.config.hop_samples();
             self.phase = RxPhase::Search;
-            self.link_state = LinkState::Search;
-            let trigger = self.attempt.take().unwrap_or(self.read);
-            self.read = trigger + hop as u64;
+            self.rewind_failed(hop);
             self.trim(hop);
         }
         self.process()
@@ -200,10 +253,11 @@ impl ModemRx {
 
     pub fn reset(&mut self) {
         self.phase = RxPhase::Search;
-        self.link_state = LinkState::Search;
+        self.last_confirmed_end = None;
         self.buffer.clear();
         self.read = self.samples_pushed;
         self.attempt = None;
+        self.failed_alignment = None;
         self.align_floor = self.samples_pushed;
     }
 
@@ -232,7 +286,7 @@ impl ModemRx {
     /// Drop samples no longer needed: keep `hop` of history behind the
     /// current read position, or behind the trigger of a pending lock attempt.
     fn trim(&mut self, hop: usize) {
-        let keep_from = self.attempt.unwrap_or(self.read).min(self.read);
+        let keep_from = self.attempt.map_or(self.read, |a| a.trigger).min(self.read);
         let keep_from = keep_from.saturating_sub(hop as u64);
         let drop = keep_from.saturating_sub(self.base()) as usize;
         self.buffer.drain(0..drop.min(self.buffer.len()));
@@ -242,10 +296,39 @@ impl ModemRx {
     /// window that triggered it.
     fn fail_attempt(&mut self, hop: usize, events: &mut Vec<RxEvent>) {
         self.phase = RxPhase::Search;
-        self.link_state = LinkState::Search;
         events.push(RxEvent::SyncLost);
-        let trigger = self.attempt.take().unwrap_or(self.read);
+        self.rewind_failed(hop);
+    }
+
+    /// Close the current attempt as failed: remember its alignment (see
+    /// `failed_alignment`) and resume Search one hop after its trigger
+    /// window.
+    fn rewind_failed(&mut self, hop: usize) {
+        let trigger = match self.attempt.take() {
+            Some(a) => {
+                self.failed_alignment = Some(a.aligned);
+                a.trigger
+            }
+            None => self.read,
+        };
         self.read = trigger + hop as u64;
+    }
+
+    /// Whether a lock aligned at `at` would repeat the last failed attempt:
+    /// the same start within [`FAILED_ALIGNMENT_TOLERANCE`]. On a clean
+    /// signal every trigger window of one preamble aligns to the same
+    /// sample. The tolerance stays tight (not a hop) on purpose: a retry
+    /// at a slightly different alignment sometimes decodes what the first
+    /// attempt could not (in noise the alignments jitter; with wrong tones
+    /// a quarter-symbol offset can turn a confident wrong symbol into an
+    /// erasure the FEC can fill), and the A/B harness delivers a trial or
+    /// two per 400 fewer in those cells with any wider rule. On preamble
+    /// tones this leaves the joint-acquisition profiles one extra attempt
+    /// per preamble occurrence, from the half-overlap window whose
+    /// alignment range starts a hop past the rejected start.
+    fn is_failed_alignment(&self, at: u64) -> bool {
+        self.failed_alignment
+            .is_some_and(|failed| at.abs_diff(failed) <= FAILED_ALIGNMENT_TOLERANCE)
     }
 
     fn preamble0_ok(&self, det: &DemodResult) -> bool {
@@ -283,14 +366,13 @@ impl ModemRx {
                             confidence_db,
                         } => {
                             let n = self.config.preamble.len() as u64;
-                            self.attempt = Some(trigger);
+                            self.attempt = Some(Attempt { trigger, aligned });
                             self.read = aligned + n * period as u64;
                             self.phase = RxPhase::Body {
                                 collected: 0,
                                 expected: self.expected_body_nibbles,
                                 erased: 0,
                             };
-                            self.link_state = LinkState::Locked;
                             self.last_confidence_db = confidence_db;
                             events.push(RxEvent::PreambleLocked { confidence_db });
                             self.trim(hop);
@@ -320,12 +402,15 @@ impl ModemRx {
                         }
                         let aligned = self.best_preamble0_position(trigger, sym, hop);
                         debug_assert!(self.available(aligned, period));
-                        // Re-check the gate on the aligned window.
-                        if let Some(det) = self
-                            .detect_nibble(&self.window_at(aligned, sym))
-                            .filter(|det| self.preamble0_ok(det))
+                        // Re-check the gate on the aligned window, unless
+                        // this alignment was just tried and failed.
+                        if let Some(det) =
+                            self.detect_nibble(&self.window_at(aligned, sym))
+                                .filter(|det| {
+                                    self.preamble0_ok(det) && !self.is_failed_alignment(aligned)
+                                })
                         {
-                            self.attempt = Some(trigger);
+                            self.attempt = Some(Attempt { trigger, aligned });
                             self.read = aligned + period as u64;
                             self.phase = RxPhase::ConfirmPreamble {
                                 matched: 1,
@@ -368,7 +453,6 @@ impl ModemRx {
                                 expected: self.expected_body_nibbles,
                                 erased: 0,
                             };
-                            self.link_state = LinkState::Locked;
                             events.push(RxEvent::PreambleLocked { confidence_db });
                         } else {
                             self.phase = RxPhase::ConfirmPreamble {
@@ -439,7 +523,7 @@ impl ModemRx {
         }
 
         events.push(RxEvent::Metrics {
-            state: self.link_state,
+            state: self.link_state(),
             confidence_db: self.last_confidence_db,
         });
         events
@@ -514,6 +598,9 @@ impl ModemRx {
             return JointStep::NeedInput;
         }
         let aligned = self.best_preamble_position(trigger, sym, hop, period);
+        if self.is_failed_alignment(aligned) {
+            return JointStep::Advance;
+        }
         let mut bad = 0;
         let mut contradicting = 0;
         let mut confidence_db = 0.0;

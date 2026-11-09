@@ -1,5 +1,5 @@
 use crate::link::{
-    body_nibble_count, bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
+    bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
     fec_candidate_is_valid, interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
     SEQ_MODULUS,
 };
@@ -16,7 +16,12 @@ pub const MAX_BODY_NIBBLES: usize = 16;
 #[derive(Debug, Clone)]
 pub struct ModemStats {
     pub link_state: LinkState,
+    /// Bodies that held a valid packet (duplicates included).
     pub crc_pass: u64,
+    /// Bodies that completed but held no valid packet: CRC, version,
+    /// type (a reserved type nibble), SEQ or payload check failed, or the
+    /// FEC decoder found no candidate. The sum with `crc_pass` is the
+    /// number of completed bodies.
     pub crc_fail: u64,
     pub last_confidence_db: f32,
     pub last_seq: Option<u8>,
@@ -301,15 +306,27 @@ impl CricketModemRx {
         true
     }
 
-    /// Hard reset of the decoder: phy back to search with its buffer flushed.
-    /// Not used internally (flushing would make timing depend on chunking).
+    /// Hard reset of the decoder, as if it had just been created: phy back
+    /// to search with its buffer flushed, a body in progress discarded, the
+    /// duplicate history cleared, link-dead disarmed (traffic received
+    /// before the reset cannot fire it) and `Dead` state and `last_seq`
+    /// cleared. The cumulative counters (`crc_pass`, `crc_fail`,
+    /// `fec_corrected`), the sample count and `last_link_dead_sample` are
+    /// kept. Not used internally (flushing would make timing depend on
+    /// chunking).
     pub fn reset(&mut self) {
         self.phy.reset();
         if let Some(d) = self.digital.as_mut() {
             d.reset();
         }
         self.body_nibbles.clear();
+        self.body_symbols.clear();
         self.collecting = false;
+        self.last_seq = None;
+        self.link_dead = false;
+        self.fail_safe.disarm();
+        self.recent.clear();
+        self.recent_digital.clear();
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<ModemOutput> {
@@ -427,6 +444,8 @@ impl CricketModemRx {
         let hdr = bytes[0];
         let type_nibble = hdr & 0x0F;
         let Some(msg_type) = MessageType::from_u8(type_nibble) else {
+            // A reserved type: the body held no packet, like a CRC failure.
+            self.crc_fail += 1;
             return false;
         };
         let needed = 2 + msg_type.payload_len() + 2;
@@ -525,7 +544,18 @@ pub fn encode_to_samples(config: PhyConfig, messages: &[TransportMessage]) -> Ve
     all
 }
 
+/// Silence to feed a receiver after the last input sample so that a
+/// transmission ending there is fully decoded: one repetition of `config`
+/// plus eight symbol periods. Covers the MFSK receiver's one-period
+/// lookahead per symbol, the BMC receiver's bit decision delay (a few half
+/// cells past the last bit) and the input chunking, for every profile and
+/// sample rate.
+pub fn flush_samples(config: &PhyConfig) -> usize {
+    repetition_samples(config) as usize + config.samples_per_symbol_period() * 8
+}
+
 pub fn decode_samples(config: PhyConfig, samples: &[f32]) -> Vec<TransportMessage> {
+    let flush = flush_samples(&config);
     let mut rx = CricketModemRx::new(config);
     let mut messages = Vec::new();
     // Process in chunks to simulate streaming
@@ -538,17 +568,11 @@ pub fn decode_samples(config: PhyConfig, samples: &[f32]) -> Vec<TransportMessag
         }
     }
     // Flush remaining by pushing silence
-    let silence = vec![0.0; rx.config.samples_per_symbol_period() * 8];
+    let silence = vec![0.0; flush];
     for out in rx.push_samples(&silence) {
         if let ModemOutput::Message(m) = out {
             messages.push(m);
         }
     }
     messages
-}
-
-pub fn expected_body_nibbles_for(msg_type: MessageType, interleave_depth: usize) -> usize {
-    let n = body_nibble_count(msg_type, interleave_depth);
-    // Note: always MAX_BODY_NIBBLES (bodies are padded to that length).
-    n.clamp(MAX_BODY_NIBBLES, MAX_BODY_NIBBLES)
 }
