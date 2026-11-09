@@ -65,7 +65,7 @@ jobs:
             os: ubuntu-22.04-arm # native arm64 runner (public repositories)
             target: aarch64-unknown-linux-gnu
           - name: macos-universal
-            os: macos-14
+            os: macos-latest
             target: universal
           - name: windows-x64
             os: windows-latest
@@ -151,7 +151,7 @@ jobs:
       matrix:
         include:
           - name: macos-universal
-            os: macos-14
+            os: macos-latest
             args: --target universal-apple-darwin
           - name: linux-x64
             os: ubuntu-22.04 # AppImage/deb built on the oldest glibc of the hosted runners
@@ -179,7 +179,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
         with:
           toolchain: stable
-          targets: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
         with:
