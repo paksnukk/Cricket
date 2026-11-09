@@ -52,10 +52,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 
 #### Stage safety and profile names
 
-- an unknown profile name is an error (`PhyConfig::from_name` returns `Option`; the CLI lists the
+- An unknown profile name is an error (`PhyConfig::from_name` returns `Option`; the CLI lists the
   valid names, the GUI falls back to the default with a visible warning) instead of silently
   selecting `robust`.
-- the transmit level of the MFSK and LTC-style profiles defaults to **−12 dBFS peak** (amplitude
+- The transmit level of the MFSK and LTC-style profiles defaults to **−12 dBFS peak** (amplitude
   0.25, was 0.8) to leave headroom on the bus; `--tx-level-db` / the GUI "TX level" set it (−60 …
   0). The receiver is level-independent, so mixed versions still interoperate. `digital-bit-exact`
   is unchanged. The spec lists the level as a SHOULD.
