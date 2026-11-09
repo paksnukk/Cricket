@@ -1,67 +1,46 @@
 # Cricket — desktop app
 
-Cricket MIDI desktop app: carries MIDI / MSC-lite control over a **dedicated audio channel**
-(XLR, Dante, MADI, virtual cable), similar in operational mindset to LTC.
+The Tauri 2 desktop front end of [Cricket](../README.md) (MIDI over audio, AML v1): encoder and
+decoder side by side, live link stats, alarms, Panic and a self-test. What it does, which profile to
+pick and how to route the audio channel are in the [root README](../README.md); the protocol is in
+[`docs/aml-v1-spec.md`](../docs/aml-v1-spec.md).
 
 ## Requirements
 
-- Rust toolchain + Cargo
-- Node.js 18+
-- macOS (primary release target)
+- Rust toolchain (1.87+) and Cargo
+- Node.js 20+ (18 works) and npm
+- The [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS; on Linux also
+  `libasound2-dev` for the audio/MIDI backends
 
-## Run (dev)
+## Run (development)
 
-```bash
+```sh
 cd cricket_gui
 npm install
 npm run tauri dev
 ```
 
-## Build (release)
+## Build (release bundles)
 
-```bash
+```sh
 cd cricket_gui
 npm install
 npm run tauri build
 ```
 
-Artifacts land under `cricket_gui/src-tauri/target/release/bundle/`.
+Bundles land under `target/release/bundle/` of the workspace (`.dmg`/`.app`, `.msi`/`.exe`,
+`.AppImage`/`.deb` depending on the OS). The [release workflow](../.github/workflows/release.yml)
+builds and signs them on tags; see [`docs/release-process.md`](../docs/release-process.md).
 
-## How to route (like LTC)
+## Notes
 
-1. Patch a **dedicated** mono bus from the TX machine/console to the RX machine.
-2. Do **not** put EQ, compression, limiting, or noise reduction on that bus.
-3. Set gain once; leave it alone during the show.
-4. In Cricket: pick Audio Out + MIDI In on the encoder side; Audio In + MIDI Out on the decoder side.
-5. Prefer **Analog Safe** unless the chain is known-clean — then **Clean Line** (~20 ms) or, for
-   notes only, **Analog Fast** (~80 ms).
-6. **Stop** and **Panic** on the decoder send Sustain off + All Notes Off on all channels to MIDI out.
-
-## Profiles
-
-Named after the line they are for (the older names still work); see the main README for the table.
-
-| Profile | When | Measured NoteOn latency (in-process) |
-|---------|------|-----------------|
-| Analog Safe (`analog-safe`, was `robust`) | Default / any bus you don't control | ~0.3 s |
-| Analog Fast (`analog-fast`, was `fast`) | Clean dedicated analog line, notes only | ~80 ms |
-| Clean Line (`clean-line`, was `ltc_fec`) | Dedicated line without processing | ~20 ms |
-| Digital Line (`digital-line`, was `ltc14400_fec`) | Dante / MADI / AES at 48 / 96 kHz | ~7 ms |
-| Digital Bit-Exact (`digital-bit-exact`, was `digital`) | `cricket pathcheck` passed | < 1 ms |
-
-## Self-test
-
-Use **Self-Test** in the UI (offline encode→decode in process) before going on air.
-
-## CLI (lab)
-
-```bash
-cargo run -p cricket_cli -- test
-cargo run -p cricket_cli -- loopback
-cargo run -p cricket_cli -- list-devices
-```
-
-## Docs
-
-- [AML v1 spec](../docs/aml-v1-spec.md)
-- [Release / field checklist](../docs/release-checklist.md)
+- **Stop** and **Panic** on the decoder side send Sustain off + All Notes Off on all 16 channels to
+  MIDI out; the test scale is an explicit checkbox (without MIDI in the encoder sends heartbeats only).
+- The version shown in the window header comes from the package version (`tauri.conf.json`, kept
+  equal to the workspace `Cargo.toml` by `.github/scripts/check-versions.sh`).
+- `app.security.csp` is `null` for now: a Content Security Policy has to be verified with `tauri dev`
+  (HMR) and the IPC bridge before it is enabled (tracked in `ROADMAP.md`).
+- Icons: `src-tauri/icons/icon.svg` is the source; the PNG/ICNS/ICO set is generated with
+  `npx tauri icon` (see the release process).
+- `Info.plist` adds `NSMicrophoneUsageDescription`; `Entitlements.plist` grants audio input to signed
+  builds.
