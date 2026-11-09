@@ -662,6 +662,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "cricket_core",
+ "cricket_sim",
  "midir",
  "ringbuf",
 ]

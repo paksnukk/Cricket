@@ -156,21 +156,22 @@ const IDLE_WAIT: Duration = Duration::from_millis(5);
 /// Minimum interval between `Stats` events.
 const STATS_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The MIDI sink plus the state of its send-failure alarm.
-struct MidiOutState {
-    sink: Option<Box<dyn MidiSink>>,
+/// The MIDI sink plus the state of its send-failure alarm (shared with the
+/// pass-through worker's tap decoder).
+pub(crate) struct MidiOutState {
+    pub(crate) sink: Option<Box<dyn MidiSink>>,
     /// A send has failed and no send has succeeded since.
-    failing: bool,
+    pub(crate) failing: bool,
     /// Messages lost in the current failure streak.
-    lost: u64,
+    pub(crate) lost: u64,
 }
 
 impl MidiOutState {
-    fn is_connected(&self) -> bool {
+    pub(crate) fn is_connected(&self) -> bool {
         self.sink.is_some()
     }
 
-    fn send(&mut self, bytes: &[u8], ev: &Emitter) {
+    pub(crate) fn send(&mut self, bytes: &[u8], ev: &Emitter) {
         let Some(sink) = self.sink.as_mut() else {
             return;
         };
@@ -208,7 +209,7 @@ impl MidiOutState {
         }
     }
 
-    fn send_all(&mut self, messages: &[Vec<u8>], ev: &Emitter) {
+    pub(crate) fn send_all(&mut self, messages: &[Vec<u8>], ev: &Emitter) {
         for bytes in messages {
             self.send(bytes, ev);
         }
@@ -219,7 +220,7 @@ impl MidiOutState {
 const BURST_TEXT: &str = "Sustain off + All Notes Off sent on all 16 channels";
 
 /// What the fail-safe did, for a log line.
-fn burst_text(rx: &CricketModemRx) -> &'static str {
+pub(crate) fn burst_text(rx: &CricketModemRx) -> &'static str {
     if rx.fail_safe_burst_enabled() {
         BURST_TEXT
     } else {
@@ -485,7 +486,7 @@ fn run(cfg: DecoderConfig, phy: PhyConfig, panic: &AtomicBool, ev: &Emitter, sto
     ev.log("Decoder stopped.");
 }
 
-fn link_stats(
+pub(crate) fn link_stats(
     stats: &ModemStats,
     sync_lost: u64,
     est_latency_ms: f32,

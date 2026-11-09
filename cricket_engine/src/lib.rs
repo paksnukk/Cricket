@@ -1,8 +1,9 @@
 //! Cricket real-time engine.
 //!
 //! Owns everything between the operating system and the `cricket_core` modem:
-//! audio streams (cpal), MIDI ports (midir), and the decoder / encoder worker
-//! threads. The GUI and CLI are thin shells over this crate.
+//! audio streams (cpal), MIDI ports (midir), and the decoder / encoder /
+//! pass-through worker threads. The GUI and CLI are thin shells over this
+//! crate; `docs/architecture.md` describes the threads.
 //!
 //! ```no_run
 //! use cricket_engine::*;
@@ -46,6 +47,7 @@ pub mod events;
 pub mod loopback;
 pub mod memory;
 pub mod midi;
+pub mod passthrough;
 pub mod pathcheck;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -54,6 +56,8 @@ mod tests;
 
 #[cfg(test)]
 mod loopback_tests;
+#[cfg(test)]
+mod passthrough_tests;
 
 pub use audio::{
     AudioIn, AudioOptions, AudioOut, AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink,
@@ -74,6 +78,10 @@ pub use loopback::{
     percentile_nearest_rank_ms, ChordSummary, LatencySummary, NotePattern, Pacing, LEGATO_OVERLAP,
 };
 pub use midi::{MidiCallback, MidiIn, MidiInputGuard, MidiOut, MidiSink, MidiSource};
+pub use passthrough::{
+    measure_passthrough_latency, AudioProcessor, Passthrough, PassthroughConfig, PassthroughHandle,
+    PassthroughLatency, ProcessContext, StripFilter, TapConfig, TapDecoder,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};

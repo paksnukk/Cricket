@@ -22,3 +22,6 @@ cpal = "0.15"
 midir = "0.9"
 ringbuf = "0.3"
 anyhow = "1.0"
+
+[dev-dependencies]
+cricket_sim = { path = "../cricket_sim" }

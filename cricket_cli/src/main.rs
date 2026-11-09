@@ -15,8 +15,8 @@ use cricket_engine::{
     audio, format_message, measure_chord_loopback, measure_midi_loopback_pattern,
     measure_throughput, midi, parse_link_key, rms_to_dbfs, AudioIn, AudioOptions, AudioOut,
     DecoderConfig, DecoderHandle, DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent,
-    LinkLight, LinkStats, MidiIn, MidiOut, MscFilter, NotePattern, Pacing, SampleFormatPref,
-    MIN_TX_LEVEL_DBFS,
+    LinkLight, LinkStats, MidiIn, MidiOut, MscFilter, NotePattern, Pacing, PassthroughConfig,
+    PassthroughHandle, SampleFormatPref, TapConfig, TapDecoder, MIN_TX_LEVEL_DBFS,
 };
 use cricket_sim::PathImpairment;
 use std::io::{BufRead, Write};
@@ -45,7 +45,8 @@ struct Cli {
     /// Profile, same on both ends: analog-safe (default), analog-safe-repeat,
     /// analog-fast, clean-line, clean-line-fast, digital-line,
     /// digital-bit-exact, instrument; `cricket profiles` lists all, with the
-    /// older names. `hf-mix` and `hf-scan` default to `instrument`
+    /// older names. `hf-mix`, `hf-scan` and `passthrough` default to
+    /// `instrument`
     #[arg(long, global = true, value_name = "NAME", value_parser = parse_profile)]
     profile: Option<String>,
 
@@ -173,6 +174,64 @@ enum Commands {
         /// Notes Off) on link-dead, Panic or stop: for cue-only (MSC) links
         /// where a stray All Notes Off is unwanted. Link-dead is still
         /// detected and reported
+        #[arg(long, default_value_t = false)]
+        no_failsafe_burst: bool,
+    },
+    /// Pass audio through (in → out) while decoding a copy (the box)
+    ///
+    /// The instrument's signal goes from the audio input to the audio
+    /// output unchanged (bit-exact; the device buffers set the delay) while
+    /// a copy is decoded with --profile (default `instrument`) and the MIDI
+    /// goes to --midi-out. With --strip the data band (the profile's
+    /// receiver band, 18–22.5 kHz for the instrument profiles) is removed
+    /// from the output by a linear-phase filter: 1.33 ms more delay on
+    /// that output, nothing above 18 kHz left for a drive stage to
+    /// intermodulate. Both devices must run at the same rate (48 kHz).
+    /// Ctrl-C sends the fail-safe burst to MIDI out before stopping.
+    Passthrough {
+        /// Input Audio device index (default device if neither is given)
+        #[arg(short, long)]
+        audio_in: Option<usize>,
+
+        /// Input Audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_in")]
+        audio_in_name: Option<String>,
+
+        /// Output Audio device index (default device if neither is given)
+        #[arg(short = 'o', long)]
+        audio_out: Option<usize>,
+
+        /// Output Audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_out")]
+        audio_out_name: Option<String>,
+
+        /// Output MIDI device index (none: decode to the log only)
+        #[arg(short, long)]
+        midi_out: Option<usize>,
+
+        /// Output MIDI port by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "midi_out")]
+        midi_out_name: Option<String>,
+
+        /// Remove the data band from the audio output (the box's "stripped"
+        /// output); adds the filter's group delay (1.33 ms at 48 kHz)
+        #[arg(long, default_value_t = false)]
+        strip: bool,
+
+        /// MSC device ID put on MSC output (0–127, decimal or 0x hex;
+        /// 0x7F = all-call)
+        #[arg(long, value_name = "ID", value_parser = parse_7bit, default_value = "0x7F")]
+        msc_device_id: u8,
+
+        /// MSC command format put on MSC output
+        #[arg(long, value_name = "FORMAT", value_parser = parse_7bit, default_value = "0x01")]
+        msc_format: u8,
+
+        /// Link-dead timeout in ms (default: the profile's)
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u32).range(100..=60_000))]
+        link_dead_ms: Option<u32>,
+
+        /// Do not send the fail-safe burst on link-dead, input stall or stop
         #[arg(long, default_value_t = false)]
         no_failsafe_burst: bool,
     },
@@ -350,7 +409,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     // the catalog default.
     let hf_tool = matches!(
         cli.command,
-        Commands::HfMix { .. } | Commands::HfScan { .. }
+        Commands::HfMix { .. } | Commands::HfScan { .. } | Commands::Passthrough { .. }
     );
     let profile_name = cli.profile.clone().unwrap_or_else(|| {
         if hf_tool {
@@ -418,6 +477,36 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 link_dead_ms: *link_dead_ms,
                 fail_safe_burst: !*no_failsafe_burst,
             },
+        ),
+        Commands::Passthrough {
+            audio_in,
+            audio_in_name,
+            audio_out,
+            audio_out_name,
+            midi_out,
+            midi_out_name,
+            strip,
+            msc_device_id,
+            msc_format,
+            link_dead_ms,
+            no_failsafe_burst,
+        } => run_passthrough(
+            selector(*audio_in, audio_in_name),
+            selector(*audio_out, audio_out_name),
+            selector(*midi_out, midi_out_name),
+            MscTarget {
+                device_id: *msc_device_id,
+                command_format: *msc_format,
+            },
+            profile,
+            &audio,
+            cli.json,
+            DecoderLink {
+                link_key,
+                link_dead_ms: *link_dead_ms,
+                fail_safe_burst: !*no_failsafe_burst,
+            },
+            *strip,
         ),
         Commands::ListDevices => {
             list_all_devices()?;
@@ -1327,6 +1416,8 @@ const JSON_LEVEL_INTERVAL: Duration = Duration::from_millis(250);
 enum Role {
     Decoder,
     Encoder,
+    /// Audio in → out with a tap decoder: reports like a decoder.
+    Passthrough,
 }
 
 impl Role {
@@ -1334,6 +1425,15 @@ impl Role {
         match self {
             Role::Decoder => "decoder",
             Role::Encoder => "encoder",
+            Role::Passthrough => "passthrough",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Role::Decoder => "Decoder",
+            Role::Encoder => "Encoder",
+            Role::Passthrough => "Pass-through",
         }
     }
 }
@@ -1342,6 +1442,7 @@ impl Role {
 enum Handle {
     Decoder(DecoderHandle),
     Encoder(EncoderHandle),
+    Passthrough(PassthroughHandle),
 }
 
 impl Handle {
@@ -1349,16 +1450,20 @@ impl Handle {
         match self {
             Handle::Decoder(d) => d.stop(),
             Handle::Encoder(e) => e.stop(),
+            Handle::Passthrough(p) => p.stop(),
         }
     }
 
     /// Fail-safe burst: the decoder sends it to MIDI out, the encoder sends
-    /// a Panic message over the link.
-    fn panic(&self) {
+    /// a Panic message over the link. Returns false when the worker has no
+    /// such command (the pass-through sends its burst on stop only).
+    fn panic(&self) -> bool {
         match self {
             Handle::Decoder(d) => d.panic(),
             Handle::Encoder(e) => e.send(TransportMessage::Panic),
+            Handle::Passthrough(_) => return false,
         }
+        true
     }
 }
 
@@ -1571,7 +1676,7 @@ impl Monitor {
         self.last_status = Instant::now();
         let last = self.last_msg.as_deref().unwrap_or("—");
         match self.role {
-            Role::Decoder => {
+            Role::Decoder | Role::Passthrough => {
                 let light = LinkLight::from_stats(self.stats.as_ref(), self.level_db);
                 let ago = match self.last_packet {
                     Some(t) => format!("{:.1} s ago", t.elapsed().as_secs_f32()),
@@ -1629,10 +1734,7 @@ fn monitor(
     let interrupted = Arc::new(AtomicBool::new(false));
     install_ctrlc(&interrupted);
     let commands = stdin_lines();
-    let what = match mon.role {
-        Role::Decoder => "Decoder",
-        Role::Encoder => "Encoder",
-    };
+    let what = mon.role.title();
     loop {
         if mon.stdout_closed.load(Ordering::Relaxed) {
             // Whoever read our output is gone: stop in order (burst first).
@@ -1640,7 +1742,7 @@ fn monitor(
         }
         if interrupted.swap(false, Ordering::SeqCst) {
             mon.note(match handle {
-                Handle::Decoder(_) => {
+                Handle::Decoder(_) | Handle::Passthrough(_) => {
                     "Stopping — Sustain off + All Notes Off go to MIDI out first..."
                 }
                 Handle::Encoder(_) => "Stopping encoder...",
@@ -1658,8 +1760,11 @@ fn monitor(
         while let Ok(line) = commands.try_recv() {
             match line.trim().to_ascii_lowercase().as_str() {
                 "p" | "panic" => {
-                    handle.panic();
-                    mon.note("Panic requested.");
+                    if handle.panic() {
+                        mon.note("Panic requested.");
+                    } else {
+                        mon.note("No panic command in pass-through mode; `quit` sends the fail-safe burst and stops.");
+                    }
                 }
                 "q" | "quit" | "exit" => interrupted.store(true, Ordering::SeqCst),
                 "" => {}
@@ -1740,6 +1845,57 @@ fn run_decoder(
     })?;
     let events = dec.take_events();
     monitor(Handle::Decoder(dec), events, mon)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_passthrough(
+    audio_in: DeviceSelector,
+    audio_out: DeviceSelector,
+    midi_out: DeviceSelector,
+    msc: MscTarget,
+    profile: &str,
+    audio: &AudioOptions,
+    json: bool,
+    link: DecoderLink,
+    strip: bool,
+) -> Result<ExitCode> {
+    let mon = Monitor::new(Role::Passthrough, json);
+    mon.note("Initializing Cricket pass-through...");
+    let midi_out = match midi_out {
+        DeviceSelector::Default => MidiOut::None,
+        sel => {
+            mon.note(&format!("MIDI Out: {}", midi::output_port_name(&sel)?));
+            MidiOut::Device(sel)
+        }
+    };
+    let config = PhyConfig::from_name(profile).ok_or_else(|| anyhow!("unknown profile"))?;
+    let in_name = audio::resolve_device_name(&audio_in, true).ok();
+    let out_name = audio::resolve_device_name(&audio_out, false).ok();
+    for w in audio::setup_warnings(&config, in_name.as_deref(), out_name.as_deref()) {
+        mon.warning(&w);
+    }
+    if strip && config.rx_band_hz().is_none() {
+        mon.warning(
+            "--strip has nothing to remove on this profile (it uses the whole audio band); the output is unchanged.",
+        );
+    }
+    if !json {
+        mon.note("Audio passes through unchanged while the copy is decoded; Ctrl-C stops (fail-safe burst sent first).");
+    }
+    let mut tap = TapConfig::new(profile);
+    tap.msc = msc;
+    tap.link_dead_ms = link.link_dead_ms;
+    tap.link_key = link.link_key;
+    tap.fail_safe_burst = link.fail_safe_burst;
+    tap.strip = strip;
+    let processor = TapDecoder::new(tap)?;
+    let mut cfg = PassthroughConfig::new(AudioIn::Device(audio_in), AudioOut::Device(audio_out));
+    cfg.sample_rate_hz = config.sample_rate_hz;
+    cfg.audio = audio.clone();
+    cfg.midi_out = midi_out;
+    let mut handle = PassthroughHandle::start(cfg, Box::new(processor))?;
+    let events = handle.take_events();
+    monitor(Handle::Passthrough(handle), events, mon)
 }
 
 #[allow(clippy::too_many_arguments)]
