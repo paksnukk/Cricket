@@ -41,7 +41,7 @@ jobs:
           components: clippy, rustfmt
           targets: thumbv8m.main-none-eabihf
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 
       - name: Format
         run: cargo fmt --all --check
@@ -82,7 +82,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 
       # Linux also builds and tests the GUI crate (the Tauri deps are installed above).
       - name: Test (workspace, including cricket_gui)
@@ -112,7 +112,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 
       - name: Build for a bare-metal target
         run: cargo build -p cricket_core --no-default-features --target ${{ matrix.target }} --release
@@ -133,7 +133,7 @@ jobs:
         with:
           toolchain: "1.87.0" # keep equal to rust-version in Cargo.toml
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 
       - name: Check with the minimum supported Rust version
         run: cargo check -p cricket_core -p cricket_engine -p cricket_cli
@@ -169,7 +169,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 
       - name: Install frontend dependencies
         run: npm ci
@@ -231,7 +231,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
         with:
           key: harnesses
 
@@ -278,7 +278,7 @@ jobs:
         with:
           toolchain: nightly
 
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
         with:
           key: fuzz
           workspaces: cricket_core/fuzz
