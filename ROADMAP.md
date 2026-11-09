@@ -45,8 +45,10 @@ As soon as hardware is available. Logging per symbol and per packet to CSV first
 
 ## Product track — HF profile family and the hardware box
 
-- `hf_robust` (19–20.5 kHz) and `hf_fast` (19–22 kHz) profiles with a band-pass front end and purity
-  measured after the filter: AML's link layer, scheduler and fail-safe unchanged. Replaces the
+- [x] `hf_robust` (`instrument`, 19.0–21.5 kHz) and `hf_fast` (`instrument-fast`, 8 tones at
+  19.0–21.33 kHz) profiles with an 8th-order band-pass front end and purity measured after the
+  filter: AML's link layer, scheduler and fail-safe unchanged; spec §6.6 (provisional), measurements
+  in `docs/proposals/hf-instrument.md`, `cricket hf-mix` / `hf-scan` for recordings. Replaces the
   tone-signature "pedal" experiment, which stays outside AML.
 - Measure the 19.5–24 kHz noise floor on real pedalboards and power supplies before building anything.
 - ESP32-S3 / RP2350 firmware on `cricket_core`, an analog hard-wired pass-through with a high-impedance

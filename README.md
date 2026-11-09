@@ -142,9 +142,11 @@ GUI lists them under "Advanced: no error correction". The same group holds the *
 `analog-safe-fast` (`robust_fast`): Analog Safe's error correction on 4 ms symbols, 108 ms per
 message instead of 175.5 ms, for lines that pass 6.25 kHz; in the simulator it is within 1 dB of
 Analog Safe, and `cricket loopback` measures mean ~170 ms, p95 ~220 ms NoteOn latency (Analog Safe
-~270 / ~350 ms); not in the spec. Every profile except `digital-bit-exact`
-transmits at **−12 dBFS peak** by default (`--tx-level-db`, GUI "TX level"), which leaves headroom
-on the bus; the receiver is level-independent and decodes anything from 30 dB below that to full
+~270 / ~350 ms); not in the spec. A third group, **instrument audio (experimental)**, holds
+`instrument` and `instrument-fast` for MIDI on an instrument's own cable (below). Every profile
+except `digital-bit-exact` and the instrument profiles transmits at **−12 dBFS peak** by default
+(`--tx-level-db`, GUI "TX level"), which leaves headroom on the bus; the instrument profiles default
+to −30 dBFS; the receiver is level-independent and decodes anything from 30 dB below that to full
 scale.
 
 The three MFSK profiles in detail:
@@ -217,6 +219,33 @@ is chosen on Windows). A decoder profile with `+digital` (e.g. `clean-line-fast+
 accepts digital frames. Design, false-accept analysis (worst case ~10¹⁰ years per false message), the
 fail-safe table and path requirements: [docs/proposals/digital-transparent.md](docs/proposals/digital-transparent.md).
 Not part of the spec yet.
+
+### Instrument-audio (HF) profiles — experimental
+
+For MIDI **on an instrument's own cable**: a guitar, bass or keyboard carries the messages above its
+music, at 19.0–21.5 kHz on a 48 kHz chain, and a box on the pedalboard passes the audio through
+(analog, 0 ms) and taps it to extract the MIDI. `--profile instrument` (older name `hf_robust`) is
+Analog Safe's timing, error correction and acquisition moved up; `instrument-fast` (`hf_fast`) is the
+same code on 3 ms symbols with 8 tones (3 bits each), 105 ms per message. Both default to
+**−30 dBFS** (inaudible to adults above the music; the GUI follows). Spec §6.6, status provisional;
+measurements, the level / intermodulation budget, the box sketch and the acceptance criteria are in
+[docs/proposals/hf-instrument.md](docs/proposals/hf-instrument.md).
+
+| | `instrument` (`hf_robust`) | `instrument-fast` (`hf_fast`) |
+|---|---|---|
+| Tones | 16 × 166⅔ Hz, 19.0–21.5 kHz, 6 ms + 0.5 ms guard | 8 × 333⅓ Hz, 19.0–21.33 kHz, 3 ms |
+| Airtime per message | 175.5 ms | 105 ms |
+| Measured NoteOn latency\* | mean ~213 ms, p95 ~330 ms | mean ~121 ms, p95 ~196 ms |
+| In the simulator (−18 dBFS program) | 100 % over guitar, bass and keys from −20 to −50 dBFS and over a bright synth to −40 dBFS, with a −85 dBFS hiss floor, PSU spurs in a tone slot, compressors, gates and 48 kHz converters | the same at every level; dropouts cost more (30 ms: 84 % vs 96 %) |
+| Needs | 48 kHz end to end, copper or 48 kHz PCM; nothing nonlinear between embedder and box | same |
+| Does not survive | a 44.1 kHz device or SRC, a codec or wireless link, a 1 % sample-rate mismatch, a drive or fuzz before the box | same |
+
+Try it on a real recording before any hardware exists: `cricket hf-mix --wav-in guitar.wav --wav-out
+mixed.wav --messages "pc=1:10,note=1:60:100,go=14.5:2"` embeds the messages, and after the mixed file
+has been through the rig and recorded at 48 kHz, `cricket hf-scan --wav-in recording.wav` lists what
+arrived, with the receiver's counters and the recording's level in the tone band. The tone-signature
+"pedal" prototype that preceded this (a branch, never merged) was not adopted: bounded vocabulary, no
+CRC, relative-only state (see the proposal §9 and `docs/review-2026-11.md` §F).
 
 \* MIDI in → MIDI out through the engine, in-process (`cricket loopback`, 20–60 notes), while notes are
 being played *and released*. Real audio interfaces add their own buffering on top. Run the measurement

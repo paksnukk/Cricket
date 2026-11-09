@@ -23,7 +23,8 @@ spec applies.
 | [`proposals/ltc-bmc.md`](proposals/ltc-bmc.md) | LTC-style biphase-mark phy (`ltc`, `ltc2400`, `ltc4800`, `ltc9600`, and `_fec` variants), soft-decision receiver | **Adopted as provisional** | §6.5 (provisional: may change with a revision + minor bump) |
 | [`proposals/ltc-bmc.md`](proposals/ltc-bmc.md) §11 | `ltc14400`, `ltc14400_fec` for digital lines | **Experimental** | not yet (candidate for §6.5) |
 | [`proposals/digital-transparent.md`](proposals/digital-transparent.md) | Bit-transparent `digital` phy, `+digital` decoder suffix, `cricket pathcheck`, engine latency audit | **Experimental** | not yet (candidate for §6.6) |
-| *pedal commands* (branch, not in `main`) | Tone-signature preset commands embedded in an instrument's own signal | **Experiment, not AML** | no; the review recommends an HF profile family in AML instead (see `review-2026-11.md` §F) |
+| [`proposals/hf-instrument.md`](proposals/hf-instrument.md) | HF (instrument-audio) profiles `hf_robust` / `hf_fast` (`instrument`, `instrument-fast`): MIDI on an instrument's own cable at 19–21.5 kHz, 8th-order receiver band, 3-bit alphabet, level / IMD budget, box sketch, `cricket hf-mix` / `hf-scan` | **Adopted as provisional** | §6.6 (provisional: may change with a revision + minor bump) |
+| *pedal commands* (branch, not in `main`) | Tone-signature preset commands embedded in an instrument's own signal | **Experiment, not AML; superseded** | no; replaced by the HF profiles above (see `review-2026-11.md` §F and `proposals/hf-instrument.md` §9) |
 
 Status words: **adopted** = normative text exists and is frozen under the spec's versioning policy;
 **provisional** = in the spec but may change with a revision; **experimental** = code and

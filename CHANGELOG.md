@@ -11,7 +11,41 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **HF (instrument-audio) profiles** `instrument` (= `hf_robust`) and `instrument-fast`
+  (= `hf_fast`), spec **§6.6 (provisional, revision r6)**: MIDI embedded on an instrument's own
+  signal above the music and extracted by a box that passes the audio through. `instrument` is
+  Analog Safe's timing, coded body and joint acquisition with the 16 orthogonal tones moved to
+  19.0–21.5 kHz (175.5 ms per message); `instrument-fast` is the same code on 3 ms symbols with an
+  **8-tone alphabet (3 bits per symbol)** at 19.0–21.33 kHz, 105 ms per message. Both use
+  raised-cosine symbol ramps (−58 dB of leakage below 17 kHz against −40 dB with linear ramps) and
+  send at **−30 dBFS** by default; the receiver band-passes 18–22.5 kHz with an **8th-order**
+  Butterworth (`PhyConfig::rx_band_order`; the baseband profiles keep their 2nd-order filter,
+  bit-identically). In the channel simulator (400 trials per cell, training and held-out tables):
+  100 % delivered over a passive-pickup guitar, a bass and keys at every level from −20 to −50 dBFS
+  and over a bright synth to −40 dBFS, with a −85 dBFS pedalboard hiss floor, PSU spurs in a tone slot, compressors,
+  gates and sharp or slow 48 kHz converters; 0 false messages in 60 s each of guitar, bass, keys,
+  synth, cymbals, noise, speech, music, MFSK and LTC traffic (no phy lock at all), and the baseband
+  receivers never lock on HF traffic. Not supported, as measured: 44.1 kHz devices or SRC, codecs
+  and wireless links, a 1 % sample-rate mismatch, and any drive stage between embedder and box (the
+  tones' intermodulation residue through a fuzz is only 17 dB under the music at −30 dBFS). A 96 kHz
+  variant (`PhyConfig::hf_fast_96k`, 24–29 kHz) exists as a constructor only. Catalog tier
+  "instrument" (CLI `cricket profiles`, GUI selector group); `cricket loopback` measures mean
+  ~213 / ~121 ms NoteOn latency. `docs/proposals/hf-instrument.md`.
+- `cricket hf-mix --wav-in rec.wav --wav-out mixed.wav --messages "pc=1:10,note=1:60:100,go=14.5:2"`
+  embeds messages into a 48 kHz recording, and `cricket hf-scan --wav-in rec.wav` decodes one and
+  prints the receiver's counters and the recording's level in the tone band, so a real rig can be
+  tried before hardware exists (a 44.1 kHz recording is refused with the reason).
+- Simulator (`cricket_core/tests/support`): instrument sources (passive-pickup and bright-pickup
+  guitar, bass, PolyBLEP synth, electric-piano keys, cymbals), pedalboard hiss floors, PSU spurs,
+  converter and link models (sharp / slow 48 kHz, 44.1 kHz hop and SRC, 19 kHz codec LP and wall,
+  96→48 kHz hop), windowed-sinc clock drift, and an intermodulation-residue helper; the HF
+  measurement harness `tests/hf_profiles.rs` (`hf_report`).
+- Engine: a warning when an instrument profile ends up on a device that opened below 48 kHz. CLI:
+  `--tx-level-db` and `--profile` now default to the profile's own level and to `analog-safe`
+  (`instrument` for the HF tools) instead of always passing −12 dBFS; the GUI moves the TX level
+  field to a profile's default when the field was never customized.
 
 ## [0.2.0] — 2026-11-09
 
