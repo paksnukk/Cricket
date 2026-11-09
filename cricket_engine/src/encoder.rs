@@ -17,7 +17,8 @@ use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::{anyhow, Result};
 use cricket_core::modem::{
-    refresh_quiet_samples, refresh_spacing_samples, repetition_samples, CricketModemTx,
+    refresh_quiet_samples, refresh_schedule, refresh_spacing_samples, repetition_samples,
+    CricketModemTx,
 };
 use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::{
@@ -324,6 +325,7 @@ fn run(cfg: EncoderConfig, phy: PhyConfig, pending: Pending, ev: &Emitter, stop:
 
     let mut tx = CricketModemTx::new(config.clone());
     let mut scheduler = TxScheduler::new(stream_sample_rate, heartbeat_samples, message_samples)
+        .with_refresh_schedule(refresh_schedule(&config))
         .with_refresh_spacing(refresh_spacing_samples(&config, stream_sample_rate))
         .with_refresh_quiet(refresh_quiet_samples(&config, stream_sample_rate));
     let stream_start = Instant::now();

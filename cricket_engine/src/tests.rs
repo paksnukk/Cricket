@@ -313,7 +313,8 @@ fn audio_open_error_is_logged_and_worker_ends() {
         logs,
         vec![
             "Starting decoder (profile=analog-safe)...".to_string(),
-            "Link key none (unkeyed link); link-dead after 2000 ms; fail-safe burst on.".to_string(),
+            "Link key none (unkeyed link); link-dead after 2000 ms; fail-safe burst on."
+                .to_string(),
             "No MIDI out selected — decode to UI only.".to_string(),
             "Audio input error: boom".to_string(),
         ]
