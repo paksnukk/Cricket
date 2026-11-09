@@ -27,7 +27,6 @@ use cricket_core::link::{
 use cricket_core::modem::{encode_to_samples, CricketModemTx};
 use cricket_core::phy::{PhyConfig, PhyRx, RxEvent};
 use cricket_core::transport::{MessageType, TransportMessage};
-use std::f32::consts::PI;
 use support::{ChannelSim, XorShift64};
 
 const RATE: usize = 48_000;
@@ -117,112 +116,14 @@ fn clicks(seconds: f32, per_second: f64, seed: u64) -> Vec<f32> {
     out
 }
 
-/// Pink-ish noise (Paul Kellet's economy filter) with unit-ish RMS.
-struct Pink {
-    b: [f32; 3],
-}
-
-impl Pink {
-    fn next(&mut self, white: f32) -> f32 {
-        self.b[0] = 0.99765 * self.b[0] + white * 0.0990460;
-        self.b[1] = 0.96300 * self.b[1] + white * 0.2965164;
-        self.b[2] = 0.57000 * self.b[2] + white * 1.0526913;
-        (self.b[0] + self.b[1] + self.b[2] + white * 0.1848) * 0.25
-    }
-}
-
-/// Music-like: 1–3 voices of harmonic tones (random notes, ADSR envelopes,
-/// some square-ish timbres), drum-like noise hits and a pink-noise bed.
+/// Music-like program material (`support::music`).
 fn music(seconds: f32, seed: u64) -> Vec<f32> {
-    let mut rng = XorShift64::new(seed);
-    let n = (seconds * RATE as f32) as usize;
-    let mut out = vec![0f32; n];
-    for voice in 0..3 {
-        let mut t = rng.below(RATE / 4);
-        while t < n {
-            let dur = RATE / 10 + rng.below(RATE / 2);
-            let note = 36 + rng.below(60) as i32 + voice * 5;
-            let f0 = 440.0 * 2f32.powf((note - 69) as f32 / 12.0);
-            let square = rng.below(3) == 0;
-            let harmonics = 1 + rng.below(12);
-            let level = 0.05 + 0.15 * rng.next_f64() as f32;
-            for (k, s) in out.iter_mut().skip(t).take(dur).enumerate() {
-                let env = (k as f32 / 480.0).min(1.0) * (-(k as f32) / dur as f32 * 2.0).exp();
-                let ph = 2.0 * PI * f0 * k as f32 / RATE as f32;
-                let mut v = 0.0;
-                for h in 1..=harmonics {
-                    if square && h % 2 == 0 {
-                        continue;
-                    }
-                    v += (ph * h as f32).sin() / h as f32;
-                }
-                *s += level * env * v;
-            }
-            t += dur + rng.below(RATE / 8);
-        }
-    }
-    // Drum hits and a pink bed.
-    let mut pink = Pink { b: [0.0; 3] };
-    let mut hit = 0usize;
-    let mut hit_level = 0.0f32;
-    for (i, s) in out.iter_mut().enumerate() {
-        if i >= hit {
-            hit = i + RATE / 8 + rng.below(RATE / 2);
-            hit_level = 0.1 + 0.3 * rng.next_f64() as f32;
-        }
-        let w = rng.gaussian() as f32;
-        let since = (i + RATE / 2).saturating_sub(hit) as f32;
-        let drum = hit_level * (-since / 2400.0).exp() * w;
-        *s += 0.02 * pink.next(w) + drum * (since < 9600.0) as u8 as f32;
-    }
-    out
+    support::music(RATE, seconds, seed)
 }
 
-/// Speech-like: a pitch-varying glottal pulse train through three formant
-/// resonators, syllabic envelope with pauses, and fricative noise bursts.
+/// Speech-like program material (`support::speech`).
 fn speech(seconds: f32, seed: u64) -> Vec<f32> {
-    let mut rng = XorShift64::new(seed);
-    let n = (seconds * RATE as f32) as usize;
-    let mut out = vec![0f32; n];
-    let mut t = 0usize;
-    let mut phase = 0.0f32;
-    while t < n {
-        let syll = RATE / 8 + rng.below(RATE / 4);
-        let voiced = rng.below(4) != 0;
-        let formants = [
-            300.0 + 500.0 * rng.next_f64() as f32,
-            900.0 + 1400.0 * rng.next_f64() as f32,
-            2300.0 + 900.0 * rng.next_f64() as f32,
-        ];
-        let mut res: Vec<support::Biquad> = formants
-            .iter()
-            .map(|&f| support::Biquad::peaking(f, 18.0, 6.0, RATE as u32))
-            .collect();
-        let f0 = 90.0 + 140.0 * rng.next_f64() as f32;
-        let mut seg = vec![0f32; syll.min(n - t)];
-        for (k, s) in seg.iter_mut().enumerate() {
-            let x = if voiced {
-                let f = f0 * (1.0 + 0.1 * (k as f32 / syll as f32 - 0.5));
-                phase += f / RATE as f32;
-                if phase >= 1.0 {
-                    phase -= 1.0;
-                    1.0
-                } else {
-                    0.0
-                }
-            } else {
-                0.3 * rng.gaussian() as f32
-            };
-            let env = (PI * k as f32 / syll as f32).sin();
-            *s = 0.3 * env * x;
-        }
-        for r in &mut res {
-            r.run(&mut seg);
-        }
-        out[t..t + seg.len()].copy_from_slice(&seg);
-        t += syll + if rng.below(3) == 0 { RATE / 5 } else { 0 };
-    }
-    out
+    support::speech(RATE, seconds, seed)
 }
 
 /// SMPTE/EBU LTC timecode (80-bit frames, biphase mark) at `fps`.

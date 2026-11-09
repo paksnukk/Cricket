@@ -17,7 +17,7 @@ use cricket_core::modem::{
 };
 use cricket_core::phy::{Acquisition, PhyConfig};
 use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
-use support::{decode_chunked, ChannelSim, XorShift64};
+use support::{decode_chunked, ChannelSim, Dynamics, Program, XorShift64};
 
 fn all_types() -> Vec<TransportMessage> {
     vec![
@@ -317,6 +317,8 @@ enum Impairment {
     LowpassSnr(f32, f32),
     /// Clock drift (ppm), at an SNR (dB).
     DriftSnr(f64, f32),
+    /// Any other channel: label and the impairments to apply.
+    Custom(&'static str, fn(ChannelSim) -> ChannelSim),
 }
 
 impl Impairment {
@@ -329,6 +331,7 @@ impl Impairment {
             Impairment::GainSnr(g, s) => format!("gain {g} dB, SNR {s}"),
             Impairment::LowpassSnr(f, s) => format!("LP {f} Hz, SNR {s}"),
             Impairment::DriftSnr(p, s) => format!("drift {p} ppm, SNR {s}"),
+            Impairment::Custom(label, _) => label.into(),
         }
     }
 
@@ -343,9 +346,166 @@ impl Impairment {
             Impairment::GainSnr(g, s) => base.gain(10f32.powf(g / 20.0)).snr_db(s),
             Impairment::LowpassSnr(f, s) => base.lowpass_hz(f).snr_db(s),
             Impairment::DriftSnr(p, s) => base.drift_ppm(p).snr_db(s),
+            Impairment::Custom(_, f) => f(base),
         }
     }
 }
+
+/// Dropout of `ms` at SNR 20 dB (for `Custom` cells; the `Dropout` variant
+/// also reports where the dropout fell).
+fn burst(s: ChannelSim, block_ms: f32, blocks: usize, per_second: f32) -> ChannelSim {
+    s.burst_loss(block_ms, blocks, per_second).snr_db(20.0)
+}
+
+/// The MFSK training cells: the §4/§10 channels plus the impairments added
+/// for the receiver sprint (hum, program bleed, pink noise, dynamics, bursty
+/// packet loss, converters, codecs, band limits, sample-rate error).
+/// Thresholds are tuned on these; `HELD_OUT` is for the final report only.
+const TRAINING: &[Impairment] = &[
+    Impairment::Clean,
+    Impairment::Snr(2.0),
+    Impairment::Snr(0.0),
+    Impairment::Snr(-2.0),
+    Impairment::Snr(-3.0),
+    Impairment::Snr(-4.0),
+    Impairment::Snr(-6.0),
+    Impairment::SymErr(0.02),
+    Impairment::SymErr(0.05),
+    Impairment::Dropout(10.0),
+    Impairment::Dropout(30.0),
+    Impairment::Dropout(60.0),
+    Impairment::Custom("hum 50 Hz @ 0 dB, SNR 20", |s| {
+        s.hum(50.0, 0.0).snr_db(20.0)
+    }),
+    Impairment::Custom("hum 100 Hz @ +6 dB, SNR 20", |s| {
+        s.hum(100.0, 6.0).snr_db(20.0)
+    }),
+    Impairment::Custom("speech bleed -20 dB, SNR 20", |s| {
+        s.program(Program::Speech, -20.0).snr_db(20.0)
+    }),
+    Impairment::Custom("speech bleed -30 dB, SNR 20", |s| {
+        s.program(Program::Speech, -30.0).snr_db(20.0)
+    }),
+    Impairment::Custom("music bleed -20 dB, SNR 20", |s| {
+        s.program(Program::Music, -20.0).snr_db(20.0)
+    }),
+    Impairment::Custom("music bleed -30 dB, SNR 20", |s| {
+        s.program(Program::Music, -30.0).snr_db(20.0)
+    }),
+    Impairment::Custom("pink SNR -3 dB", |s| s.pink_snr_db(-3.0)),
+    Impairment::Custom("pink SNR -6 dB", |s| s.pink_snr_db(-6.0)),
+    Impairment::Custom("pink SNR -9 dB", |s| s.pink_snr_db(-9.0)),
+    Impairment::Custom("gate -40 dBFS 5/50/100 ms, SNR 20", |s| {
+        s.gate(-40.0, 5.0, 50.0, 100.0).snr_db(20.0)
+    }),
+    Impairment::Custom("gate -30 dBFS 20/20/50 ms, SNR 20", |s| {
+        s.gate(-30.0, 20.0, 20.0, 50.0).snr_db(20.0)
+    }),
+    Impairment::Custom("comp -30 dBFS 4:1 5/100 ms, SNR 20", |s| {
+        s.compressor(Dynamics::compressor(-30.0, 4.0, 5.0, 100.0))
+            .snr_db(20.0)
+    }),
+    Impairment::Custom("limiter -20 dBFS, SNR 20", |s| {
+        s.limiter(Dynamics::limiter(-20.0, 50.0)).snr_db(20.0)
+    }),
+    Impairment::Custom("burst 3 x 1 ms, 10/s, SNR 20", |s| burst(s, 1.0, 3, 10.0)),
+    Impairment::Custom("burst 2 x 5 ms, 5/s, SNR 20", |s| burst(s, 5.0, 2, 5.0)),
+    Impairment::Custom("3 steep converters, SNR 6", |s| {
+        s.converters(3, false).snr_db(6.0)
+    }),
+    Impairment::Custom("2 slow-rolloff converters, SNR 6", |s| {
+        s.converters(2, true).snr_db(6.0)
+    }),
+    Impairment::Custom("16 kHz codec, SNR 6", |s| s.codec_16k().snr_db(6.0)),
+    Impairment::Custom("2-pole LP 3.4 kHz, SNR 6", |s| {
+        s.lowpass2_hz(3_400.0).snr_db(6.0)
+    }),
+    Impairment::Custom("2-pole LP 5 kHz, SNR 6", |s| {
+        s.lowpass2_hz(5_000.0).snr_db(6.0)
+    }),
+    Impairment::Custom("2-pole LP 6 kHz, SNR 6", |s| {
+        s.lowpass2_hz(6_000.0).snr_db(6.0)
+    }),
+    Impairment::DriftSnr(1000.0, 6.0),
+    Impairment::DriftSnr(5000.0, 6.0),
+    Impairment::DriftSnr(10000.0, 6.0),
+    Impairment::DriftSnr(-10000.0, 6.0),
+    Impairment::DriftSnr(20000.0, 6.0),
+];
+
+/// Held-out cells: other parameter values, other combinations and other
+/// seeds (`HELD_OUT_SEED`). Never used for tuning; reported once per
+/// change in the CHANGELOG / proposal.
+const HELD_OUT: &[Impairment] = &[
+    Impairment::Snr(-1.0),
+    Impairment::Snr(-2.5),
+    Impairment::Snr(-3.5),
+    Impairment::Snr(-5.0),
+    Impairment::SymErr(0.03),
+    Impairment::Dropout(20.0),
+    Impairment::Dropout(45.0),
+    Impairment::Custom("hum 60 Hz @ +3 dB, SNR 15", |s| {
+        s.hum(60.0, 3.0).snr_db(15.0)
+    }),
+    Impairment::Custom("hum 150 Hz @ 0 dB, SNR 10", |s| {
+        s.hum(150.0, 0.0).snr_db(10.0)
+    }),
+    Impairment::Custom("speech bleed -25 dB, SNR 15", |s| {
+        s.program(Program::Speech, -25.0).snr_db(15.0)
+    }),
+    Impairment::Custom("music bleed -25 dB, SNR 15", |s| {
+        s.program(Program::Music, -25.0).snr_db(15.0)
+    }),
+    Impairment::Custom("speech -40 dB + pink SNR -6", |s| {
+        s.program(Program::Speech, -40.0).pink_snr_db(-6.0)
+    }),
+    Impairment::Custom("pink SNR -4.5 dB", |s| s.pink_snr_db(-4.5)),
+    Impairment::Custom("pink SNR -7.5 dB", |s| s.pink_snr_db(-7.5)),
+    Impairment::Custom("gate -35 dBFS 10/30/200 ms, SNR 15", |s| {
+        s.gate(-35.0, 10.0, 30.0, 200.0).snr_db(15.0)
+    }),
+    Impairment::Custom("comp -25 dBFS 8:1 2/50 ms, SNR 15", |s| {
+        s.compressor(Dynamics::compressor(-25.0, 8.0, 2.0, 50.0))
+            .snr_db(15.0)
+    }),
+    Impairment::Custom("limiter -16 dBFS, SNR 15", |s| {
+        s.limiter(Dynamics::limiter(-16.0, 100.0)).snr_db(15.0)
+    }),
+    Impairment::Custom("burst 5 x 1 ms, 8/s, SNR 20", |s| burst(s, 1.0, 5, 8.0)),
+    Impairment::Custom("burst 1 x 5 ms, 10/s, SNR 20", |s| burst(s, 5.0, 1, 10.0)),
+    Impairment::Custom("4 steep converters, SNR 3", |s| {
+        s.converters(4, false).snr_db(3.0)
+    }),
+    Impairment::Custom("slow converter + 16 kHz codec, SNR 3", |s| {
+        s.converters(1, true).codec_16k().snr_db(3.0)
+    }),
+    Impairment::Custom("2-pole LP 4 kHz, SNR 3", |s| {
+        s.lowpass2_hz(4_000.0).snr_db(3.0)
+    }),
+    Impairment::Custom("2-pole LP 5.5 kHz, SNR 3", |s| {
+        s.lowpass2_hz(5_500.0).snr_db(3.0)
+    }),
+    Impairment::Custom("1-pole LP 3 kHz, SNR 6", |s| {
+        s.lowpass_hz(3_000.0).snr_db(6.0)
+    }),
+    Impairment::Custom("HP 300 Hz + EQ -12 dB @ 3 kHz, SNR 6", |s| {
+        s.highpass_hz(300.0)
+            .peaking_eq(3_000.0, -12.0, 1.0)
+            .snr_db(6.0)
+    }),
+    Impairment::DriftSnr(7000.0, 3.0),
+    Impairment::DriftSnr(-15000.0, 6.0),
+    Impairment::Custom("speech -20 dB + drift 5000 ppm, SNR 10", |s| {
+        s.program(Program::Speech, -20.0)
+            .drift_ppm(5000.0)
+            .snr_db(10.0)
+    }),
+];
+
+/// Seed bases: the training tables use `0xFEC0` / `0xACC0` / `TRAINING_SEED`
+/// + cell index, the held-out table `HELD_OUT_SEED` + cell index.
+const TRAINING_SEED: u64 = 0x7A10;
+const HELD_OUT_SEED: u64 = 0x4E1D_0000;
 
 struct Cell {
     ok: usize,
@@ -438,25 +598,175 @@ fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Ce
     }
 }
 
+/// Lowest AWGN SNR (dB, 0.5 dB grid in [-12, 6]) at which `config` delivers
+/// at least 95 % of `trials` messages: the profile's "cliff". Bisection,
+/// assuming delivery is monotonic in SNR; `NAN` if 95 % is not reached at
+/// 6 dB. The seed is fixed and the same for every profile.
+fn cliff95_db(config: &PhyConfig, trials: usize) -> f32 {
+    let ok_at = |snr: f32| {
+        let c = run_cell(config, Impairment::Snr(snr), trials, 0xC11F);
+        c.ok as f64 >= 0.95 * c.trials as f64
+    };
+    let (mut lo, mut hi) = (-24i32, 12i32); // half-dB units
+    if !ok_at(hi as f32 * 0.5) {
+        return f32::NAN;
+    }
+    // Invariant: hi passes; lo fails (or is the floor).
+    if ok_at(lo as f32 * 0.5) {
+        return lo as f32 * 0.5;
+    }
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if ok_at(mid as f32 * 0.5) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi as f32 * 0.5
+}
+
+/// Print a delivery table (`results[profile][cell]`), then the "distance
+/// to cliff" rows: each profile's 95 % AWGN cliff and the margin a 0 dB
+/// line has to it. Returns the number of false messages over all cells.
+fn print_delivery_table(
+    profiles: &[(String, PhyConfig)],
+    imps: &[Impairment],
+    results: &[Vec<Cell>],
+    trials: usize,
+) -> usize {
+    println!("\nDelivery rate % (mean start→delivery ms), {trials} trials per cell:");
+    print!("| {:<36} |", "channel");
+    for (name, _) in profiles {
+        print!(" {name:>17} |");
+    }
+    println!();
+    print!("|{:-<38}|", "");
+    for _ in profiles {
+        print!("{:->19}|", "");
+    }
+    println!();
+    let mut false_total = 0;
+    for (i, imp) in imps.iter().enumerate() {
+        print!("| {:<36} |", imp.label());
+        for r in results {
+            let c = &r[i];
+            false_total += c.false_msgs;
+            let pct = 100.0 * c.ok as f64 / c.trials as f64;
+            print!(" {:>7.1} ({:>5.0} ms) |", pct, c.mean_latency_ms);
+        }
+        println!();
+    }
+    let cliffs: Vec<f32> = std::thread::scope(|s| {
+        let handles: Vec<_> = profiles
+            .iter()
+            .map(|(_, c)| s.spawn(move || cliff95_db(c, trials)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    print!("| {:<36} |", "AWGN cliff (95 % delivery), dB");
+    for c in &cliffs {
+        print!(" {:>17} |", format!("{c:+.1}"));
+    }
+    println!();
+    print!("| {:<36} |", "distance to cliff from 0 dB, dB");
+    for c in &cliffs {
+        print!(" {:>17} |", format!("{:+.1}", -c));
+    }
+    println!();
+    false_total
+}
+
+/// `results[profile][cell]`, one thread per cell.
+fn run_table(
+    profiles: &[(String, PhyConfig)],
+    imps: &[Impairment],
+    trials: usize,
+    seed_base: u64,
+) -> Vec<Vec<Cell>> {
+    std::thread::scope(|s| {
+        let handles: Vec<Vec<_>> = profiles
+            .iter()
+            .map(|(_, c)| {
+                imps.iter()
+                    .enumerate()
+                    .map(|(i, imp)| {
+                        s.spawn(move || run_cell(c, *imp, trials, seed_base + i as u64))
+                    })
+                    .collect()
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|hs| hs.into_iter().map(|h| h.join().unwrap()).collect())
+            .collect()
+    })
+}
+
+fn env_trials() -> usize {
+    std::env::var("FEC_AB_TRIALS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400)
+}
+
+/// Profiles of the MFSK tables (`MFSK_PROFILES`, same syntax as
+/// `ACQ_PROFILES`; default `robust_repeat,robust,fast`).
+fn mfsk_profiles() -> Vec<(String, PhyConfig)> {
+    parse_profiles(
+        &std::env::var("MFSK_PROFILES").unwrap_or_else(|_| "robust_repeat,robust,fast".to_string()),
+    )
+}
+
+/// The MFSK receiver sprint's training table (`TRAINING` cells).
+///
+/// ```sh
+/// cargo test --release -p cricket_core --test fec mfsk_ab_table -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "long-running A/B table; run with --release -- --ignored --nocapture"]
+fn mfsk_ab_table() {
+    let trials = env_trials();
+    let profiles = mfsk_profiles();
+    let results = run_table(&profiles, TRAINING, trials, TRAINING_SEED);
+    let false_total = print_delivery_table(&profiles, TRAINING, &results, trials);
+    println!("\nfalse messages (all cells): {false_total}");
+    assert_eq!(false_total, 0);
+}
+
+/// The held-out table (`HELD_OUT` cells, `HELD_OUT_SEED`): final reporting
+/// only, never for tuning.
+///
+/// ```sh
+/// cargo test --release -p cricket_core --test fec mfsk_held_out_table -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "long-running A/B table; run with --release -- --ignored --nocapture"]
+fn mfsk_held_out_table() {
+    let trials = env_trials();
+    let profiles = mfsk_profiles();
+    let results = run_table(&profiles, HELD_OUT, trials, HELD_OUT_SEED);
+    let false_total = print_delivery_table(&profiles, HELD_OUT, &results, trials);
+    println!("\nfalse messages (all cells): {false_total}");
+    assert_eq!(false_total, 0);
+}
+
 #[test]
 #[ignore = "long-running A/B table; run with --release -- --ignored --nocapture"]
 fn fec_ab_table() {
-    let trials: usize = std::env::var("FEC_AB_TRIALS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(400);
-    let profiles: Vec<(&str, PhyConfig)> = vec![
-        ("robust_repeat K2", PhyConfig::robust_repeat()),
+    let trials = env_trials();
+    let profiles: Vec<(String, PhyConfig)> = vec![
+        ("robust_repeat K2".into(), PhyConfig::robust_repeat()),
         (
-            "robust_repeat K1",
+            "robust_repeat K1".into(),
             PhyConfig {
                 repetition_k: 1,
                 ..PhyConfig::robust_repeat()
             },
         ),
-        ("robust (p4 K1)", PhyConfig::robust()),
-        ("fec p2 K1", fec_parity(2, 1)),
-        ("fec p4 K2", fec_parity(4, 2)),
+        ("robust (p4 K1)".into(), PhyConfig::robust()),
+        ("fec p2 K1".into(), fec_parity(2, 1)),
+        ("fec p4 K2".into(), fec_parity(4, 2)),
     ];
     let imps = [
         Impairment::Clean,
@@ -487,43 +797,8 @@ fn fec_ab_table() {
         );
     }
 
-    let results: Vec<Vec<Cell>> = std::thread::scope(|s| {
-        let handles: Vec<_> = profiles
-            .iter()
-            .map(|(_, c)| {
-                s.spawn(move || {
-                    imps.iter()
-                        .enumerate()
-                        .map(|(i, imp)| run_cell(c, *imp, trials, 0xFEC0 + i as u64))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    println!("\nDelivery rate % (mean start→delivery ms), {trials} trials per cell:");
-    print!("| {:<22} |", "channel");
-    for (name, _) in &profiles {
-        print!(" {name:>15} |");
-    }
-    println!();
-    print!("|{:-<24}|", "");
-    for _ in &profiles {
-        print!("{:->17}|", "");
-    }
-    println!();
-    let mut false_total = 0;
-    for (i, imp) in imps.iter().enumerate() {
-        print!("| {:<22} |", imp.label());
-        for r in &results {
-            let c = &r[i];
-            false_total += c.false_msgs;
-            let pct = 100.0 * c.ok as f64 / c.trials as f64;
-            print!(" {:>5.1} ({:>5.0} ms) |", pct, c.mean_latency_ms);
-        }
-        println!();
-    }
+    let results = run_table(&profiles, &imps, trials, 0xFEC0);
+    let false_total = print_delivery_table(&profiles, &imps, &results, trials);
     println!("\nfalse messages (all cells): {false_total}");
     assert_eq!(false_total, 0);
 }
@@ -539,9 +814,46 @@ fn fec_ab_table() {
 /// robust with first-symbol acquisition (`@first`, as before joint
 /// acquisition) and as specified, and fast.
 fn acq_profiles() -> Vec<(String, PhyConfig)> {
-    let names = std::env::var("ACQ_PROFILES").unwrap_or_else(|_| {
+    parse_profiles(&std::env::var("ACQ_PROFILES").unwrap_or_else(|_| {
         "robust_repeat@first,robust_repeat,robust@first,robust,fast".to_string()
-    });
+    }))
+}
+
+/// Receiver-threshold overrides for tuning runs (every MFSK profile of a
+/// table): `MFSK_PURITY` (min tone purity), `MFSK_CONFIDENCE` (dB),
+/// `MFSK_BAND` (`lo,hi` Hz, or `none` for no input band-pass), `MFSK_TRACK`
+/// (`0` disables body symbol clock tracking).
+fn apply_rx_overrides(config: &mut PhyConfig) {
+    if config.n_tones == 0 {
+        return;
+    }
+    if let Some(p) = std::env::var("MFSK_PURITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.min_tone_purity = p;
+    }
+    if let Some(c) = std::env::var("MFSK_CONFIDENCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.min_confidence_db = c;
+    }
+    if let Ok(t) = std::env::var("MFSK_TRACK") {
+        config.rx_track_timing = t != "0";
+    }
+    if let Ok(b) = std::env::var("MFSK_BAND") {
+        config.rx_band_hz = if b == "none" {
+            None
+        } else {
+            let (lo, hi) = b.split_once(',').expect("MFSK_BAND=lo,hi");
+            Some((lo.parse().unwrap(), hi.parse().unwrap()))
+        };
+    }
+}
+
+/// See [`acq_profiles`] for the syntax.
+fn parse_profiles(names: &str) -> Vec<(String, PhyConfig)> {
     names
         .split(',')
         .map(|n| {
@@ -563,6 +875,7 @@ fn acq_profiles() -> Vec<(String, PhyConfig)> {
                     misses: m.parse().expect("joint<misses>"),
                 };
             }
+            apply_rx_overrides(&mut config);
             (n.to_string(), config)
         })
         .collect()
@@ -577,10 +890,7 @@ fn acq_profiles() -> Vec<(String, PhyConfig)> {
 #[test]
 #[ignore = "long-running A/B table; run with --release -- --ignored --nocapture"]
 fn acquisition_ab_table() {
-    let trials: usize = std::env::var("FEC_AB_TRIALS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(400);
+    let trials = env_trials();
     let profiles = acq_profiles();
     let imps = [
         Impairment::Clean,
@@ -600,40 +910,8 @@ fn acquisition_ab_table() {
         Impairment::LowpassSnr(2500.0, 6.0),
         Impairment::DriftSnr(500.0, 0.0),
     ];
-    // One thread per (profile, impairment) cell.
-    let results: Vec<Vec<Cell>> = std::thread::scope(|s| {
-        let handles: Vec<Vec<_>> = profiles
-            .iter()
-            .map(|(_, c)| {
-                imps.iter()
-                    .enumerate()
-                    .map(|(i, imp)| s.spawn(move || run_cell(c, *imp, trials, 0xACC0 + i as u64)))
-                    .collect()
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|hs| hs.into_iter().map(|h| h.join().unwrap()).collect())
-            .collect()
-    });
-
-    println!("\nDelivery rate % (mean start→delivery ms), {trials} trials per cell:");
-    print!("| {:<22} |", "channel");
-    for (name, _) in &profiles {
-        print!(" {name:>15} |");
-    }
-    println!();
-    let mut false_total = 0;
-    for (i, imp) in imps.iter().enumerate() {
-        print!("| {:<22} |", imp.label());
-        for r in &results {
-            let c = &r[i];
-            false_total += c.false_msgs;
-            let pct = 100.0 * c.ok as f64 / c.trials as f64;
-            print!(" {:>5.1} ({:>5.0} ms) |", pct, c.mean_latency_ms);
-        }
-        println!();
-    }
+    let results = run_table(&profiles, &imps, trials, 0xACC0);
+    let false_total = print_delivery_table(&profiles, &imps, &results, trials);
     println!("\nDropout losses (dropout starts in first-copy preamble / in its body):");
     for (i, imp) in imps.iter().enumerate() {
         if let Impairment::Dropout(_) = imp {

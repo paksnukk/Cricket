@@ -52,11 +52,91 @@ impl XorShift64 {
     }
 }
 
+/// Program material that bleeds onto the AML channel (crosstalk, a badly
+/// routed bus): the speech-like and music-like generators of the
+/// false-accept harness ([`speech`], [`music`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Program {
+    Speech,
+    Music,
+}
+
+/// A noise gate on the bus: opens (over `attack_ms`) when the input peak
+/// exceeds `threshold_dbfs`, stays open `hold_ms` after it last did, then
+/// closes over `release_ms` (to silence).
+#[derive(Debug, Clone, Copy)]
+pub struct Gate {
+    pub threshold_dbfs: f32,
+    pub attack_ms: f32,
+    pub hold_ms: f32,
+    pub release_ms: f32,
+}
+
+/// A peak compressor (`ratio` finite) or limiter (`ratio` = ∞) on the bus:
+/// gain reduction `(level − threshold) · (1 − 1/ratio)` above
+/// `threshold_dbfs`, smoothed with `attack_ms` when it grows and
+/// `release_ms` when it recovers. No make-up gain (the receivers are
+/// level-independent).
+#[derive(Debug, Clone, Copy)]
+pub struct Dynamics {
+    pub threshold_dbfs: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+impl Dynamics {
+    pub fn compressor(threshold_dbfs: f32, ratio: f32, attack_ms: f32, release_ms: f32) -> Self {
+        Self {
+            threshold_dbfs,
+            ratio,
+            attack_ms,
+            release_ms,
+        }
+    }
+
+    /// A brick-wall limiter: 0.1 ms attack.
+    pub fn limiter(threshold_dbfs: f32, release_ms: f32) -> Self {
+        Self {
+            threshold_dbfs,
+            ratio: f32::INFINITY,
+            attack_ms: 0.1,
+            release_ms,
+        }
+    }
+}
+
+/// Network-audio style packet loss: the signal is cut into blocks of
+/// `block_ms` (Dante: 1 ms at 48 kHz, up to 5 ms over WAN-ish links); a
+/// burst starts at a block with probability `per_second · block_ms / 1000`
+/// and mutes `blocks` consecutive blocks.
+#[derive(Debug, Clone, Copy)]
+pub struct BurstLoss {
+    pub block_ms: f32,
+    pub blocks: usize,
+    pub per_second: f32,
+}
+
+/// A chain of `stages` AD/DA conversions. Each stage is a steep anti-alias
+/// low-pass (8th-order Butterworth at 20 kHz) or, with `slow_rolloff`, a
+/// gentle one (one pole at 10 kHz + 2nd order at 16 kHz: a "slow roll-off"
+/// converter filter, which tilts the top of the Fast band).
+#[derive(Debug, Clone, Copy)]
+pub struct Converters {
+    pub stages: usize,
+    pub slow_rolloff: bool,
+}
+
 /// Deterministic channel impairments applied to mono samples.
 ///
 /// Processing order: symbol corruption (on the clean, grid-aligned TX
-/// signal) → dropout → clock drift → low-pass(es) → high-pass → peaking EQ
-/// → soft clip → polarity → gain → hum → clicks → leading silence → AWGN.
+/// signal) → dropout → burst loss → clock drift → converter chain → 16 kHz
+/// codec brick wall → low-pass(es) → high-pass → peaking EQ → program
+/// bleed → soft clip → polarity → gain → gate → compressor → limiter → hum
+/// → clicks → leading silence → AWGN → pink noise. Impairments that were
+/// added later (burst loss, converters, codec, program bleed, dynamics,
+/// pink noise) draw their randomness from their own streams and sit in the
+/// chain so that a simulation without them is bit-identical to before.
 #[derive(Debug, Clone)]
 pub struct ChannelSim {
     pub config: PhyConfig,
@@ -92,6 +172,20 @@ pub struct ChannelSim {
     /// in dB relative to the signal peak). Each click is a 1-4 sample
     /// rectangular spike of random sign, added after the channel filters.
     pub clicks: Option<(f32, f32)>,
+    /// Bursty packet loss, see [`BurstLoss`].
+    pub burst_loss: Option<BurstLoss>,
+    /// Cascaded converters, see [`Converters`].
+    pub converters: Option<Converters>,
+    /// A codec-like 16 kHz brick wall (8th-order Butterworth at 7.2 kHz).
+    pub codec_16k: bool,
+    /// Program bleed: (kind, level in dB relative to the tone RMS, long-term
+    /// RMS of the material).
+    pub program: Option<(Program, f32)>,
+    pub gate: Option<Gate>,
+    pub compressor: Option<Dynamics>,
+    pub limiter: Option<Dynamics>,
+    /// Pink noise SNR in dB relative to the tone RMS (total pink power).
+    pub pink_snr_db: Option<f32>,
 }
 
 impl ChannelSim {
@@ -114,7 +208,74 @@ impl ChannelSim {
             hum: None,
             dropout_samples: 0,
             clicks: None,
+            burst_loss: None,
+            converters: None,
+            codec_16k: false,
+            program: None,
+            gate: None,
+            compressor: None,
+            limiter: None,
+            pink_snr_db: None,
         }
+    }
+
+    pub fn burst_loss(mut self, block_ms: f32, blocks: usize, per_second: f32) -> Self {
+        self.burst_loss = Some(BurstLoss {
+            block_ms,
+            blocks,
+            per_second,
+        });
+        self
+    }
+
+    pub fn converters(mut self, stages: usize, slow_rolloff: bool) -> Self {
+        self.converters = Some(Converters {
+            stages,
+            slow_rolloff,
+        });
+        self
+    }
+
+    pub fn codec_16k(mut self) -> Self {
+        self.codec_16k = true;
+        self
+    }
+
+    /// Program bleed at `rel_db` relative to the tone RMS.
+    pub fn program(mut self, kind: Program, rel_db: f32) -> Self {
+        self.program = Some((kind, rel_db));
+        self
+    }
+
+    pub fn gate(
+        mut self,
+        threshold_dbfs: f32,
+        attack_ms: f32,
+        hold_ms: f32,
+        release_ms: f32,
+    ) -> Self {
+        self.gate = Some(Gate {
+            threshold_dbfs,
+            attack_ms,
+            hold_ms,
+            release_ms,
+        });
+        self
+    }
+
+    pub fn compressor(mut self, d: Dynamics) -> Self {
+        self.compressor = Some(d);
+        self
+    }
+
+    pub fn limiter(mut self, d: Dynamics) -> Self {
+        self.limiter = Some(d);
+        self
+    }
+
+    pub fn pink_snr_db(mut self, snr_db: f32) -> Self {
+        self.pink_snr_db = Some(snr_db);
+        self
     }
 
     pub fn lowpass2_hz(mut self, cutoff_hz: f32) -> Self {
@@ -199,10 +360,20 @@ impl ChannelSim {
             let start = rng.below(samples.len() - self.dropout_samples);
             samples[start..start + self.dropout_samples].fill(0.0);
         }
+        let rate = self.config.sample_rate_hz;
+        if let Some(b) = self.burst_loss {
+            let mut burst_rng = XorShift64::new(self.seed ^ 0xB0B5_7105_5000_0001);
+            burst_loss(&mut samples, b, rate, &mut burst_rng);
+        }
         if self.drift_ppm != 0.0 {
             samples = resample_drift(&samples, self.drift_ppm);
         }
-        let rate = self.config.sample_rate_hz;
+        if let Some(c) = self.converters {
+            converter_chain(&mut samples, c, rate);
+        }
+        if self.codec_16k {
+            brick_wall(&mut samples, 7_200.0, rate);
+        }
         if let Some(cutoff) = self.lowpass_hz {
             one_pole_lowpass(&mut samples, cutoff, rate);
         }
@@ -215,6 +386,20 @@ impl ChannelSim {
         if let Some((f, db, q)) = self.peaking_eq {
             Biquad::peaking(f, db, q, rate).run(&mut samples);
         }
+        if let Some((kind, rel_db)) = self.program {
+            let tone_rms = self.config.amplitude / 2f32.sqrt();
+            let target = tone_rms * 10f32.powf(rel_db / 20.0);
+            let bleed = program_material(
+                kind,
+                rate,
+                samples.len(),
+                target,
+                self.seed ^ 0x9B0_6BA3_3D00_0002,
+            );
+            for (s, b) in samples.iter_mut().zip(bleed) {
+                *s += b;
+            }
+        }
         if let Some(drive) = self.soft_clip_drive {
             for s in samples.iter_mut() {
                 *s = (drive * *s).tanh() / drive;
@@ -225,6 +410,15 @@ impl ChannelSim {
             for s in samples.iter_mut() {
                 *s *= gain;
             }
+        }
+        if let Some(g) = self.gate {
+            noise_gate(&mut samples, g, rate);
+        }
+        if let Some(d) = self.compressor {
+            compress(&mut samples, d, rate);
+        }
+        if let Some(d) = self.limiter {
+            compress(&mut samples, d, rate);
         }
         if let Some((f, rel_db)) = self.hum {
             let tone_rms = self.config.amplitude * self.gain / 2f32.sqrt();
@@ -261,8 +455,273 @@ impl ChannelSim {
                 *s += (rng.gaussian() * sigma) as f32;
             }
         }
+        if let Some(snr_db) = self.pink_snr_db {
+            let tone_rms = self.config.amplitude * self.gain / 2f32.sqrt();
+            let sigma = tone_rms / 10f32.powf(snr_db / 20.0);
+            let mut pink_rng = XorShift64::new(self.seed ^ 0x9150_0000_0000_0003);
+            let pink = pink_noise(samples.len(), sigma, &mut pink_rng);
+            for (s, p) in samples.iter_mut().zip(pink) {
+                *s += p;
+            }
+        }
         samples
     }
+}
+
+/// Mute `b.blocks` consecutive blocks of `b.block_ms` at random block
+/// positions (see [`BurstLoss`]).
+pub fn burst_loss(samples: &mut [f32], b: BurstLoss, sample_rate_hz: u32, rng: &mut XorShift64) {
+    let block = ((b.block_ms / 1000.0) * sample_rate_hz as f32)
+        .round()
+        .max(1.0) as usize;
+    let p = (b.per_second * b.block_ms / 1000.0) as f64;
+    let mut i = 0;
+    while i < samples.len() {
+        if rng.next_f64() < p {
+            let end = (i + block * b.blocks.max(1)).min(samples.len());
+            samples[i..end].fill(0.0);
+            i = end;
+        } else {
+            i += block;
+        }
+    }
+}
+
+/// Section Q values of an 8th-order Butterworth low-pass.
+const BUTTERWORTH8_Q: [f32; 4] = [0.5098, 0.6013, 0.9000, 2.5629];
+
+/// In-place 8th-order Butterworth low-pass (four cascaded biquads).
+pub fn brick_wall(samples: &mut [f32], cutoff_hz: f32, sample_rate_hz: u32) {
+    for q in BUTTERWORTH8_Q {
+        Biquad::lowpass_q(cutoff_hz, q, sample_rate_hz).run(samples);
+    }
+}
+
+/// See [`Converters`].
+pub fn converter_chain(samples: &mut [f32], c: Converters, sample_rate_hz: u32) {
+    for _ in 0..c.stages {
+        if c.slow_rolloff {
+            one_pole_lowpass(samples, 10_000.0, sample_rate_hz);
+            Biquad::lowpass(16_000.0, sample_rate_hz).run(samples);
+        } else {
+            brick_wall(samples, 20_000.0, sample_rate_hz);
+        }
+    }
+}
+
+/// See [`Gate`]. The detector is a peak follower with a 0.5 ms decay.
+pub fn noise_gate(samples: &mut [f32], g: Gate, sample_rate_hz: u32) {
+    let rate = sample_rate_hz as f32;
+    let thr = 10f32.powf(g.threshold_dbfs / 20.0);
+    let coef = |ms: f32| {
+        if ms <= 0.0 {
+            1.0
+        } else {
+            1.0 - (-1000.0 / (ms * rate)).exp()
+        }
+    };
+    let (a_att, a_rel) = (coef(g.attack_ms), coef(g.release_ms));
+    let hold = (g.hold_ms / 1000.0 * rate) as usize;
+    let env_decay = (-1000.0 / (0.5 * rate)).exp();
+    let (mut env, mut gain, mut held) = (0.0f32, 0.0f32, 0usize);
+    for s in samples.iter_mut() {
+        env = s.abs().max(env * env_decay);
+        let open = if env >= thr {
+            held = hold;
+            true
+        } else if held > 0 {
+            held -= 1;
+            true
+        } else {
+            false
+        };
+        let target = if open { 1.0 } else { 0.0 };
+        gain += (target - gain) * if target > gain { a_att } else { a_rel };
+        *s *= gain;
+    }
+}
+
+/// See [`Dynamics`]: a feed-forward peak compressor / limiter in the log
+/// domain.
+pub fn compress(samples: &mut [f32], d: Dynamics, sample_rate_hz: u32) {
+    let rate = sample_rate_hz as f32;
+    let coef = |ms: f32| {
+        if ms <= 0.0 {
+            1.0
+        } else {
+            1.0 - (-1000.0 / (ms * rate)).exp()
+        }
+    };
+    let (a_att, a_rel) = (coef(d.attack_ms), coef(d.release_ms));
+    let slope = if d.ratio.is_finite() {
+        1.0 - 1.0 / d.ratio
+    } else {
+        1.0
+    };
+    let mut gain_db = 0.0f32;
+    for s in samples.iter_mut() {
+        let level_db = 20.0 * s.abs().max(1e-9).log10();
+        let target = -((level_db - d.threshold_dbfs).max(0.0)) * slope;
+        gain_db += (target - gain_db) * if target < gain_db { a_att } else { a_rel };
+        *s *= 10f32.powf(gain_db / 20.0);
+    }
+}
+
+/// Pink-ish noise (Paul Kellet's economy filter).
+pub struct Pink {
+    b: [f32; 3],
+}
+
+impl Pink {
+    pub fn new() -> Self {
+        Self { b: [0.0; 3] }
+    }
+
+    pub fn next(&mut self, white: f32) -> f32 {
+        self.b[0] = 0.99765 * self.b[0] + white * 0.0990460;
+        self.b[1] = 0.96300 * self.b[1] + white * 0.2965164;
+        self.b[2] = 0.57000 * self.b[2] + white * 1.0526913;
+        (self.b[0] + self.b[1] + self.b[2] + white * 0.1848) * 0.25
+    }
+}
+
+impl Default for Pink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `n` samples of pink noise scaled to RMS `rms`.
+pub fn pink_noise(n: usize, rms: f32, rng: &mut XorShift64) -> Vec<f32> {
+    let mut pink = Pink::new();
+    let mut out: Vec<f32> = (0..n).map(|_| pink.next(rng.gaussian() as f32)).collect();
+    scale_to_rms(&mut out, rms);
+    out
+}
+
+/// Scale `samples` so that their RMS is `rms` (no-op on silence).
+pub fn scale_to_rms(samples: &mut [f32], rms: f32) {
+    let energy: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let have = (energy / samples.len().max(1) as f64).sqrt() as f32;
+    if have > 0.0 {
+        let k = rms / have;
+        for s in samples.iter_mut() {
+            *s *= k;
+        }
+    }
+}
+
+/// `n` samples of program material of `kind` at long-term RMS `rms`.
+pub fn program_material(
+    kind: Program,
+    sample_rate_hz: u32,
+    n: usize,
+    rms: f32,
+    seed: u64,
+) -> Vec<f32> {
+    let rate = sample_rate_hz as usize;
+    let seconds = n as f32 / rate as f32 + 0.05;
+    let mut v = match kind {
+        Program::Speech => speech(rate, seconds, seed),
+        Program::Music => music(rate, seconds, seed),
+    };
+    v.truncate(n);
+    scale_to_rms(&mut v, rms);
+    v
+}
+
+/// Music-like: 1–3 voices of harmonic tones (random notes, ADSR envelopes,
+/// some square-ish timbres), drum-like noise hits and a pink-noise bed.
+pub fn music(rate: usize, seconds: f32, seed: u64) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    let n = (seconds * rate as f32) as usize;
+    let mut out = vec![0f32; n];
+    for voice in 0..3 {
+        let mut t = rng.below(rate / 4);
+        while t < n {
+            let dur = rate / 10 + rng.below(rate / 2);
+            let note = 36 + rng.below(60) as i32 + voice * 5;
+            let f0 = 440.0 * 2f32.powf((note - 69) as f32 / 12.0);
+            let square = rng.below(3) == 0;
+            let harmonics = 1 + rng.below(12);
+            let level = 0.05 + 0.15 * rng.next_f64() as f32;
+            for (k, s) in out.iter_mut().skip(t).take(dur).enumerate() {
+                let env = (k as f32 / 480.0).min(1.0) * (-(k as f32) / dur as f32 * 2.0).exp();
+                let ph = 2.0 * PI * f0 * k as f32 / rate as f32;
+                let mut v = 0.0;
+                for h in 1..=harmonics {
+                    if square && h % 2 == 0 {
+                        continue;
+                    }
+                    v += (ph * h as f32).sin() / h as f32;
+                }
+                *s += level * env * v;
+            }
+            t += dur + rng.below(rate / 8);
+        }
+    }
+    // Drum hits and a pink bed.
+    let mut pink = Pink::new();
+    let mut hit = 0usize;
+    let mut hit_level = 0.0f32;
+    for (i, s) in out.iter_mut().enumerate() {
+        if i >= hit {
+            hit = i + rate / 8 + rng.below(rate / 2);
+            hit_level = 0.1 + 0.3 * rng.next_f64() as f32;
+        }
+        let w = rng.gaussian() as f32;
+        let since = (i + rate / 2).saturating_sub(hit) as f32;
+        let drum = hit_level * (-since / 2400.0).exp() * w;
+        *s += 0.02 * pink.next(w) + drum * (since < 9600.0) as u8 as f32;
+    }
+    out
+}
+
+/// Speech-like: a pitch-varying glottal pulse train through three formant
+/// resonators, syllabic envelope with pauses, and fricative noise bursts.
+pub fn speech(rate: usize, seconds: f32, seed: u64) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    let n = (seconds * rate as f32) as usize;
+    let mut out = vec![0f32; n];
+    let mut t = 0usize;
+    let mut phase = 0.0f32;
+    while t < n {
+        let syll = rate / 8 + rng.below(rate / 4);
+        let voiced = rng.below(4) != 0;
+        let formants = [
+            300.0 + 500.0 * rng.next_f64() as f32,
+            900.0 + 1400.0 * rng.next_f64() as f32,
+            2300.0 + 900.0 * rng.next_f64() as f32,
+        ];
+        let mut res: Vec<Biquad> = formants
+            .iter()
+            .map(|&f| Biquad::peaking(f, 18.0, 6.0, rate as u32))
+            .collect();
+        let f0 = 90.0 + 140.0 * rng.next_f64() as f32;
+        let mut seg = vec![0f32; syll.min(n - t)];
+        for (k, s) in seg.iter_mut().enumerate() {
+            let x = if voiced {
+                let f = f0 * (1.0 + 0.1 * (k as f32 / syll as f32 - 0.5));
+                phase += f / rate as f32;
+                if phase >= 1.0 {
+                    phase -= 1.0;
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.3 * rng.gaussian() as f32
+            };
+            let env = (PI * k as f32 / syll as f32).sin();
+            *s = 0.3 * env * x;
+        }
+        for r in &mut res {
+            r.run(&mut seg);
+        }
+        out[t..t + seg.len()].copy_from_slice(&seg);
+        t += syll + if rng.below(3) == 0 { rate / 5 } else { 0 };
+    }
+    out
 }
 
 /// Replace whole symbol periods (assumed aligned to index 0, as produced by
@@ -351,8 +810,14 @@ pub struct Biquad {
 impl Biquad {
     /// Butterworth low-pass.
     pub fn lowpass(cutoff_hz: f32, sample_rate_hz: u32) -> Self {
+        Self::lowpass_q(cutoff_hz, std::f32::consts::FRAC_1_SQRT_2, sample_rate_hz)
+    }
+
+    /// Second-order low-pass with quality `q` (a section of a higher-order
+    /// Butterworth, see `brick_wall`).
+    pub fn lowpass_q(cutoff_hz: f32, q: f32, sample_rate_hz: u32) -> Self {
         let w0 = 2.0 * PI * cutoff_hz / sample_rate_hz as f32;
-        let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let alpha = w0.sin() / (2.0 * q);
         let c = w0.cos();
         let a0 = 1.0 + alpha;
         Self {
