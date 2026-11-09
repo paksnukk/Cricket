@@ -13,7 +13,9 @@ promises; the order is. Versioning: the whole workspace carries one version, the
 - Stage-safe defaults and user-facing profile names (review B1–B4, B8–B10, C7): unknown profile is an
   error, test scale opt-in, fail-safe on Stop, −12 dBFS default TX level, channel selection, alarm
   list, dBFS meter and link traffic light, CLI status line / `--json` / `cricket profiles`.
-- Bugs confirmed by the review (A1–A6), landed by the core work; see the Unreleased changelog.
+- Bugs confirmed by the review (A1–A7), landed by the core work: NaN-proof LTC receiver, bounded TX
+  queue, hard reset, `crc_fail` accounting, non-panicking constructors, fewer lock re-attempts on
+  preamble-like input; see the Unreleased changelog.
 
 ## Sprint 2 — protocol improvements → tag v0.2.0
 
@@ -26,8 +28,9 @@ release a revision bump is enough" (spec header). Each step is measured in the s
   other's packets (C3; wire change).
 - Chord / overload policy per profile (C4), fail-safe timing per profile (C6), best-guess decoding of
   uncoded packets (C8), MSC ahead of NoteOff (C9).
-- Receiver rate limit against preamble-like input (A7). Simulator realism: programme material, dynamics
-  processors, bursty loss, held-out test set (C10).
+- Simulator realism: programme material, dynamics processors, bursty loss, held-out test set (C10);
+  a hard per-second cap on lock attempts if the field test still shows CPU pressure on preamble-like
+  input (A7 follow-up).
 - Possibly orthogonal tone spacing 1/T (C5) — only with a measured gain, and before the tag.
 - Then: **tag v0.2.0**, first binaries on the Releases page, spec revision r4 with the wire changes.
 
