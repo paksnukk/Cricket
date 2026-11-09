@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Merged into the app bundle's Info.plist by the Tauri bundler. Without this
+       key macOS terminates the app the first time it opens an audio input. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Cricket listens to the audio input you select to decode MIDI carried as tones (AML v1).</string>
+</dict>
+</plist>
