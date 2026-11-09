@@ -1,4 +1,48 @@
-# AML v1 Specification (Bitstream Modem)
+# AML v1 — MIDI over audio (bitstream modem)
+
+| | |
+|---|---|
+| **Protocol** | AML (AudioMIDI Link) version **1**: header version nibble `1` (§4.1) |
+| **Document** | AML v1 — revision **r3**, 2026-11-09 |
+| **Status** | Pre-release draft. §3–§5 and §6.1–§6.4 are complete and tested in software; §6.5 is **provisional**. Nothing has been proven on a real show chain yet (see §7). The first tagged release of the reference implementation (Cricket **v0.2.0**) freezes the wire format of the stable sections under the policy below. |
+| **Reference implementation** | Cricket (`cricket_core`), <https://github.com/paksnukk/Cricket>; test vectors in §9 are asserted by its test suite |
+| **Informative material** | `docs/proposals/fec.md`, `docs/proposals/ltc-bmc.md` (adopted), `docs/proposals/digital-transparent.md` (experimental, not part of v1) |
+
+### Revision log
+
+| Revision | Date | Changes |
+|---|---|---|
+| r1 | 2026-10-14 | First text under the name AML v1 (the project's "V2" bitstream-modem draft of 2026-07-29, with level-independent detection, rewind-and-resync, single link-dead authority, windowed duplicate suppression and the TX scheduler folded in). MFSK-16 phy, packet format, Robust / Robust repeat / Fast, fail-safe, observability. |
+| r2 | 2026-10-15 | **Wire changes:** body FEC (Reed–Solomon over GF(16), whitening) and the packet validation rules (§4.6–§4.7); joint preamble acquisition (§3.2.2); all MIDI 1.0 channel messages and full MSC (§5.1–§5.4); `SEQ` as a 2-bit counter; controller coalescing and scheduler priorities (§5.5); Robust becomes the coded single-copy profile, Robust repeat the two-copy one (§6); LTC biphase-mark profiles as provisional (§6.5); test vectors (§9). |
+| r3 | 2026-11-09 | This header (status, revision log, errata, versioning policy); §7 renamed from "Release assumptions (v1.0)" to "Release assumptions"; title aligned with the README. No wire change. |
+
+Revisions are numbered r1, r2, … per document; a revision id and date identify the text an
+implementation or a measurement refers to. The crate version of the reference implementation is
+independent of the revision number.
+
+### Versioning policy
+
+1. **Before the first tagged release** (Cricket v0.2.0) wire-affecting changes may land with a
+   revision bump only; the version nibble stays `1`.
+2. **After the first tagged release**, any wire-incompatible change to a stable section (§3–§5,
+   §6.1–§6.4) bumps the header version nibble (§4.1) and starts a new document (AML v2); the v1
+   document is then frozen except for errata. A receiver MUST NOT deliver packets whose version
+   nibble it does not implement (§4.7).
+3. **Provisional and experimental sections** (today §6.5; the `ltc14400*` and `digital` profiles are
+   not in the spec) may change with a spec revision and a **minor** bump of the crates. Such a change
+   is a wire change for those profiles only; both ends must run the same revision.
+4. **Errata are appended** to the *Errata* list below with a date and the affected section, never
+   silently edited into the text. The next revision that folds an erratum into the text references
+   it in the revision log.
+5. A revision that changes no wire behaviour (editorial, clarifications, measurements) does not
+   require a crate release.
+
+### Errata
+
+None yet. Format: `E1 (YYYY-MM-DD) — §x.y: what the text said, what it must say, which revision
+introduced it, which revision fixes it.`
+
+---
 
 ## 1. Overview
 
@@ -21,7 +65,7 @@ configured for one profile never decodes another profile's audio (the bodies dif
 or modulation, and every packet is validated, §4.7).
 
 AML v1 is the first official protocol version. The earlier prototype phy (semantic tone symbols, see
-`aml-prototype-protocol.md`) remains available as a legacy debug phy only; it is not part of AML v1.
+`docs/history/aml-prototype-protocol.md`) remains available as a legacy debug phy only; it is not part of AML v1.
 
 ## 2. Layering and conventions
 
@@ -703,7 +747,7 @@ Measured with the reference receiver (`docs/proposals/ltc-bmc.md` §4, §9): ≥
 22 % / 0 %); MIDI-in → MIDI-out NoteOn latency in loopback ~22 ms (`ltc`) and ~26 ms (`ltc_fec`).
 The MFSK and BMC receivers never decode each other's audio, so a receiver MAY run both in parallel.
 
-## 7. Release assumptions (v1.0)
+## 7. Release assumptions
 
 - Dedicated mono path (analog XLR, Dante, MADI, virtual loop) treated like LTC
 - Operators do not EQ/compress/limit the AML channel
