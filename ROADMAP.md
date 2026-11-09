@@ -56,12 +56,16 @@ As soon as hardware is available. Logging per symbol and per packet to CSV first
 
 ## Structure refactor (parallel, 1–2 weeks)
 
-- Phy boundary: `PhyTx` / `PhyRx` traits, `Modulation::Custom`, per-phy parameters, builder,
-  `PhyConfig::from_name → Result`, `BodyCoding` declared by the phy; `#[non_exhaustive]` on public enums.
-- `cricket_sim` crate for the channel simulator; `pathcheck` behind a feature so firmware does not
+- [x] Phy boundary: `PhyFactory` / `PhyTx` / `PhyRx` traits, `Modulation::Custom`, per-phy
+  parameters, builder, `BodyCoding` declared by the phy; `#[non_exhaustive]` on public enums
+  (`docs/architecture.md`). `PhyConfig::from_name` stays `Option` (an unknown name is already an
+  error at every call site); a `Result` with a reason is open.
+- [x] `cricket_sim` crate for the channel simulator; `pathcheck` behind a feature so firmware does not
   carry its formatting code.
-- Engine pass-through node (audio in → process → audio out).
-- Fuzz targets for packet parsing, Reed–Solomon, MSC and the receiver streams.
+- [x] Engine pass-through node (audio in → process → audio out): `cricket_engine::passthrough`,
+  `cricket passthrough`.
+- [x] Fuzz targets for packet parsing, Reed–Solomon, FEC, MSC, MIDI input, profile names and the
+  receiver streams (`cricket_core/fuzz`; nightly, not in the default CI).
 - Spec move to `docs/spec/aml-v1.md` once all links can be updated in one change.
 - GUI: a MIDI monitor, counters for dropped / rejected messages, a non-null CSP once verified in
   `tauri dev` (profile names, traffic light, honest latency figures and the alarm list landed in

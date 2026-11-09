@@ -30,6 +30,12 @@ Status words: **adopted** = normative text exists and is frozen under the spec's
 **provisional** = in the spec but may change with a revision; **experimental** = code and
 measurements exist, no spec text, no compatibility promise.
 
+## Code
+
+| Document | What it is |
+|---|---|
+| [`architecture.md`](architecture.md) | The crates and their layers, the engine's threads, the phy boundary (`PhyFactory` / `PhyTx` / `PhyRx`, `Modulation::Custom`), how another crate adds a modulation, and what of the API is meant to stay stable. |
+
 ## Process
 
 | Document | What it is |

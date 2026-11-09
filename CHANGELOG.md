@@ -11,8 +11,70 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 
 ## [Unreleased]
 
+### Changed
+
+The structural changes below are **API changes without a wire-format or behaviour change** (spec
+vectors, all 256 tests, the A/B tables at fixed seeds, `cricket test` and `cricket loopback` give
+identical results); together they are a **minor bump for the crates, 0.3.0 when released**. Overview
+and the rules in [`docs/architecture.md`](docs/architecture.md).
+
+- **Phy trait boundary** (`cricket_core::phy::traits`): the modem talks to a physical layer only
+  through `PhyFactory` (the parameters of a plan: build the ends, declare the frame length, the
+  `BodyCoding` — `Padded16` / `Fec(mode)` / `Raw` — and the TX scheduler's `RefreshPolicy`), `PhyTx`
+  (one burst per body) and `PhyRx` (samples in, `RxEvent`s out). `Modulation` moves to
+  `phy::modulation` with per-phy parameters in its variants — `Mfsk(MfskParams)`, `Bmc(BmcParams)`,
+  `Digital(DigitalParams)` — and a `Custom(Box<dyn PhyFactory>)` variant through which another crate
+  plugs in a modulation (no `Arc`, so it builds on Cortex-M0+). `modem.rs` no longer special-cases
+  the digital phy. **Migration:** `Modulation::Mfsk` / `Digital` patterns become `Mfsk(_)` /
+  `Digital(_)`; the MFSK-only fields of `PhyConfig` (`symbol_duration_ms`, `preamble`, `n_tones`,
+  `rx_band_hz`, `acquisition`, …) live in `MfskParams`, reached through `config.mfsk()` /
+  `mfsk_mut()` / `map_mfsk(|p| …)` or the accessors `config.symbol_duration_ms()`,
+  `config.preamble()`, `config.rx_band_hz()` …, which answer for any phy; the common fields stay
+  public. Direct constructors of a phy (`ModemRx::new`, `BmcRx::new`, …) still take a `PhyConfig`
+  and now panic if it selects another modulation (the modem goes through the factory).
+- **`PhyConfig` is `#[non_exhaustive]`** (so are `MfskParams`, `BmcParams`, `DigitalParams`): build
+  one from a constructor, `from_name`, `PhyConfig::builder()` or the `with_*` adjusters
+  (`with_fec`, `with_repetition_k`, `with_modulation`, `with_link_dead_ms`, …) instead of a struct
+  literal. Constructors, `from_name` and the `PROFILES` catalog (names, aliases, tiers) are unchanged.
+- **`#[non_exhaustive]`** on the public enums that will grow: `TransportMessage`, `MessageType`,
+  `Modulation`, `RxEvent`, `ModemOutput`, `FecMode`, `MscCommand`, `MscError`, `PacketDecodeError`,
+  `EngineEvent`, `AlarmKind`. A `match` outside the crate needs a wildcard arm. `TxScheduler`'s drop
+  counters are read through `note_ons_dropped()`, `queue_dropped()` and `take_dropped()`.
+- **`cricket_sim` crate**: the channel simulator (impairments, instrument and program sources,
+  converter and link models, gate / compressor / limiter, pink noise, bursty loss, hiss and spurs,
+  drift, IMD helpers, chunked decoding) moves out of `cricket_core/tests/support` into a workspace
+  crate of its own (`std`, publishable), together with the bit-transparency path models
+  `PathImpairment` / `simulate` (formerly `cricket_core::pathcheck`). The core's tests use it as a
+  dev-dependency (`support` re-exports it); the CLI's `pathcheck sim` uses it directly.
+- **`pathcheck` feature** of `cricket_core` (on with `std`): a `--no-default-features` firmware build
+  leaves out the bit-transparency analyzer and its report formatting. thumbv8m release object code
+  183.5 KB (0.2.0) → 174.6 KB without it (192.9 KB with it).
+
 ### Added
 
+- **Engine pass-through node** (`cricket_engine::passthrough`, CLI `cricket passthrough`): audio in →
+  a pluggable `AudioProcessor` → audio out on one input and one output stream, the duplex path a
+  hardware box needs. `Passthrough` is the identity (bit-exact; 0 samples of added delay and a
+  turnaround of ~40–90 µs per block in-process, measured with the in-memory endpoints by
+  `measure_passthrough_latency`); `TapDecoder` passes the audio unchanged while a copy is decoded with
+  the chosen profile, emitting the decoder worker's events and sending its MIDI, with an optional
+  **strip** stage (`--strip`) that removes the profile's receiver band from the output: a 129-tap
+  linear-phase FIR for the instrument profiles (≤ 0.04 dB ripple below 17 kHz, −46.7 dB at 18 kHz,
+  56 dB of attenuation of a burst, 64 samples = 1.33 ms of group delay on that output). The output
+  ring is bounded (oldest audio dropped, counted) so a slow output cannot grow the delay.
+- **Fuzz targets** (`cricket_core/fuzz`, cargo-fuzz, nightly): packet bytes, FEC body decode, RS16,
+  MSC SysEx, MIDI input, profile names, and sample-stream fuzzers for the MFSK, BMC, digital and
+  whole-modem receivers (no panic on any input, NaN included; bounded buffers; consistent counters).
+  A weekly CI job runs each for ten minutes; see `CONTRIBUTING.md` for the local recipe.
+
+### Fixed
+
+- `MscMessage::parse_sysex` panicked on a 6-byte SysEx with the MSC header (`F0 7F id 02 fmt F7`,
+  no command byte), reachable from the encoder's MIDI input; it is `MscError::Malformed` now. Found
+  by the `msc_parse_sysex` and `midi_input` fuzz targets.
+- `PhyConfig::from_name` accepted whitespace between a profile name and the `+digital` suffix
+  (`"digital \n+digital"`) that `canonical_name` and `profile_info` rejected; the three agree now.
+  Found by the `from_name` fuzz target. Well-formed names are unaffected.
 - **HF (instrument-audio) profiles** `instrument` (= `hf_robust`) and `instrument-fast`
   (= `hf_fast`), spec **§6.6 (provisional, revision r6)**: MIDI embedded on an instrument's own
   signal above the music and extracted by a box that passes the audio through. `instrument` is

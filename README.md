@@ -386,8 +386,9 @@ Follow [`ROADMAP.md`](ROADMAP.md) for the product track.
 
 | Crate | What lives there |
 |---|---|
-| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, the LTC phy, packets, CRC, Reed–Solomon FEC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy prototype phy. |
-| [`cricket_engine`](cricket_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
+| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, the LTC phy, packets, CRC, Reed–Solomon FEC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O, the legacy prototype phy and the `pathcheck` analyzer. The phy boundary (`PhyFactory` / `PhyTx` / `PhyRx`, `Modulation::Custom`) lets another crate add a modulation; see [`docs/architecture.md`](docs/architecture.md). |
+| [`cricket_sim`](cricket_sim) | The channel simulator the tests and measurement harnesses run on: impairments, instrument and program sources, converter and link models, bit-transparency path models, chunked decoding. `std` only. |
+| [`cricket_engine`](cricket_engine) | The real-time part: audio/MIDI devices, encoder, decoder and pass-through workers, events, loopback latency measurement. |
 | [`cricket_cli`](cricket_cli) | Command-line front end. |
 | [`cricket_gui`](cricket_gui) | Tauri 2 desktop app (TypeScript + Rust). |
 
@@ -399,9 +400,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-The tests don't need hardware. A channel simulator in [`cricket_core/tests/support`](cricket_core/tests/support)
-puts packets through offsets, odd chunk sizes, gain changes, noise, clock drift, low-pass filtering and
-random symbol corruption. In [`stuck_notes.rs`](cricket_core/tests/stuck_notes.rs), a thousand NoteOn/NoteOff
+The tests don't need hardware. The channel simulator in [`cricket_sim`](cricket_sim) (re-exported by
+the tests' `support` module) puts packets through offsets, odd chunk sizes, gain changes, noise, clock
+drift, low-pass filtering and random symbol corruption. In [`stuck_notes.rs`](cricket_core/tests/stuck_notes.rs), a thousand NoteOn/NoteOff
 pairs go through a corrupted channel, and every note must be released. CI runs all of the above on
 every push, on Linux, macOS and Windows, and the long measurement harnesses weekly
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -410,6 +411,7 @@ every push, on Linux, macOS and Windows, and the long measurement harnesses week
 
 - [`docs/README.md`](docs/README.md): index of all documents and the status of each proposal.
 - [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol, all profiles and test vectors.
+- [`docs/architecture.md`](docs/architecture.md): crates, threads, the phy boundary, adding a modulation, what is stable.
 - [`docs/proposals/`](docs/proposals): the measurements behind FEC, the LTC profiles and the digital profile.
 - [`ROADMAP.md`](ROADMAP.md): what comes next, and what 1.0 means.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed.

@@ -81,17 +81,58 @@ A profile fixes the physical layer and the body coding; the packet format and th
 shared. To add one:
 
 1. Parameters: add a constructor in `cricket_core/src/phy/config.rs` (next to `PhyConfig::robust()`
-   and friends) and a name in `PhyConfig::from_name`. Use the existing modulation types where you can
-   (MFSK-16 or biphase-mark); a new modulation means a new module under `cricket_core/src/phy/`
-   plus its selection in `cricket_core/src/phy/select.rs` and the modem.
+   and friends) and a catalog entry in `PROFILES` (name, aliases, tier, hint text; `from_name` reads
+   the catalog). Use the existing modulations where you can (`Modulation::Mfsk(MfskParams)` or
+   `Modulation::Bmc(BmcParams)`, adjusted with `map_mfsk` / `map_bmc`).
 2. Body coding: choose uncoded (interleaved) or Reed–Solomon (`FecMode`); the `_fec` naming convention
    marks coded variants.
-3. Tests: a round-trip through `cricket_core/tests/support` (offsets, chunk sizes, gain, noise,
-   drift, low-pass, corruption), the stuck-note test, and a false-accept measurement if the profile
-   changes what a receiver can mistake for a packet.
+3. Tests: a round-trip through the channel simulator (`cricket_sim`, re-exported by the tests'
+   `support` module: offsets, chunk sizes, gain, noise, drift, low-pass, corruption), the stuck-note
+   test, and a false-accept measurement if the profile changes what a receiver can mistake for a
+   packet.
 4. Expose it: the CLI help and the GUI profile selector list profiles by name; add the hint text.
 5. Document it: a proposal with the measurements, a README row with **measured** loopback latency
    (`cricket loopback --profiles <name>`), and a spec section only once it is at least provisional.
+
+## Adding a modulation
+
+A modulation is a physical layer: how a body of nibbles becomes samples and back. The modem talks to
+it only through the three traits of `cricket_core::phy::traits` — `PhyFactory` (the parameters: build
+the ends, declare the frame length, the body coding and the repeat policy), `PhyTx` (one burst per
+body) and `PhyRx` (samples in, `RxEvent`s out). [`docs/architecture.md`](docs/architecture.md) has
+the contract and a code sketch.
+
+- **From another crate** (a product phy, an experiment): implement the traits on your parameter
+  struct and select it with `Modulation::Custom(Box::new(params))` on any `PhyConfig`; nothing in
+  this repository changes. Keep the rules: a non-finite sample is silence, buffers stay bounded by one
+  packet plus the chunk, `frame_samples` matches `synthesize_framed`.
+- **Into this repository**: a module under `cricket_core/src/phy/` with the parameter struct
+  (`#[non_exhaustive]`, public fields, a constructor) implementing the traits, a `Modulation` variant,
+  a constructor and catalog entry as for a profile, a spec section (it is wire format), a fuzz target
+  for the receiver stream (`cricket_core/fuzz/`), and the A/B tables it should be measured against.
+  The wire format of the existing phys must not move: `tests/spec_vectors.rs` and the A/B tables at
+  fixed seeds are the check.
+
+## Fuzzing
+
+`cricket_core/fuzz` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for
+everything that parses untrusted input: `decode_packet_bytes`, `fec_decode_body`, `rs16_decode`,
+`msc_parse_sysex`, `midi_input`, `from_name`, and the sample-stream fuzzers `rx_mfsk_stream`,
+`rx_bmc_stream`, `rx_digital_stream` and `modem_rx_stream` (arbitrary samples — NaN and infinities
+included — in arbitrary chunks; they assert no panic, bounded buffers and consistent counters). They
+need a nightly toolchain, so they are not part of the default CI; run them locally:
+
+```sh
+rustup toolchain install nightly && cargo install cargo-fuzz
+cd cricket_core/fuzz
+cargo +nightly fuzz list
+cargo +nightly fuzz run rx_mfsk_stream -- -max_total_time=600     # ten minutes
+cargo +nightly fuzz run decode_packet_bytes -- -max_total_time=60
+```
+
+A crash lands in `cricket_core/fuzz/artifacts/<target>/`; reproduce it with
+`cargo +nightly fuzz run <target> artifacts/<target>/<file>`. A panic on garbage input in a decoder is
+a real bug: fix it and add the input as a regression test. A new phy or parser gets a target here.
 
 ## Reporting security issues
 
